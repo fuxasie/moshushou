@@ -106,6 +106,9 @@ namespace moshushou
 
         // MainWindow.xaml.cs
 
+        [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+        static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
+
         [DllImport("user32.dll", SetLastError = true)]
         private static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
 
@@ -252,7 +255,15 @@ namespace moshushou
                 _source = null;
             }
         }
+ 
 
+        private string GetWindowClass(IntPtr hwnd)
+        {
+            if (hwnd == IntPtr.Zero) return string.Empty;
+            StringBuilder sb = new StringBuilder(256);
+            GetClassName(hwnd, sb, sb.Capacity);
+            return sb.ToString();
+        }
 
         private bool CheckWindowReady(IntPtr targetHwnd, string actionName)
         {
@@ -496,42 +507,37 @@ namespace moshushou
 
                 if (id == HOTKEY_UP)
                 {
-                    // 向上导航
+                    // 向上导航 (保持原样)
                     Application.Current.Dispatcher.Invoke(() => NavigateTreeView(-1));
                     shouldHandle = true;
                 }
                 else if (id == HOTKEY_DOWN)
                 {
-                    // 向下导航
+                    // 向下导航 (保持原样)
                     Application.Current.Dispatcher.Invoke(() => NavigateTreeView(1));
                     shouldHandle = true;
                 }
                 else if (id == HOTKEY_LEFT)
                 {
-                    // 粘贴名称
+                    // Ctrl+Left: 仅粘贴名称 (保持原样)
                     Application.Current.Dispatcher.Invoke(() => PasteCurrentStoreName());
                     shouldHandle = true;
                 }
                 else if (id == HOTKEY_RIGHT || id == HOTKEY_QUOTE)
                 {
-                    // ✅ [修复] 粘贴完整信息：增加 isWework 参数传递
+                    // ✅ Ctrl+Right / Ctrl+;: 调用新的独立粘贴流程
+                    // (写入剪贴板 -> 盲粘贴 -> 自动发送 -> 后置补全群名)
                     Application.Current.Dispatcher.InvokeAsync(async () =>
                     {
-                        if (_currentSelectedNode != null)
-                        {
-                            // 获取当前节点的来源属性，判断是否为企业微信
-                            bool isWework = "企业微信".Equals(_currentSelectedNode.Source);
-
-                            // 调用带参数的新粘贴方法
-                            await PasteFullStoreInfoAsync(_currentSelectedNode.StoreName, isWework);
-                        }
+                        await ManualPasteProcessAsync();
                     });
                     shouldHandle = true;
                 }
                 else if (id == HOTKEY_ENTER)
                 {
-                    // 智能处理 (搜索或下一步)
-                    // ✅ 保留之前添加的按键释放逻辑
+                    // ✅ Ctrl+Enter: 手动搜索/前进
+
+                    // 关键：强制释放物理按住的 Ctrl 键，防止干扰后续的搜索指令
                     try
                     {
                         _inputSimulator.Keyboard.KeyUp(VirtualKeyCode.CONTROL);
@@ -540,12 +546,14 @@ namespace moshushou
 
                     Application.Current.Dispatcher.InvokeAsync(async () =>
                     {
+                        // 如果正在自动跑，Enter键作为暂停键
                         if (_isAutoRunning)
                         {
                             StopAutoSending();
                         }
                         else
                         {
+                            // 否则执行手动搜索逻辑 (复用自动化核心)
                             await SmartAdvanceOrSearchAsync();
                         }
                     });
@@ -574,7 +582,6 @@ namespace moshushou
             }
             return IntPtr.Zero;
         }
-
 
         #region 自动化发送控制逻辑 (F1/F2)
 
@@ -833,130 +840,373 @@ namespace moshushou
 
 
 
-
-        // MainWindow.xaml.cs
-
         private async Task ManualSmartProcessAsync()
         {
-            // 1. 基础数据检查
+            // 1. 基础检查
             if (_currentSelectedNode == null) return;
-            string storeName = _currentSelectedNode.StoreName;
-            string groupName = _currentSelectedNode.GroupName;
-            string source = _currentSelectedNode.Source;
-            bool isFileNode = _currentSelectedNode.IsFileNode;
 
-            // 2. 🛡️ 净化环境：释放按键 & 稍作等待
+            // 2. 🛡️ 净化环境：释放按键
+            // 这是手动模式成功的关键，防止物理按键（Ctrl/Enter）干扰自动化的 SearchCurrentItemAsync
             try
             {
                 _inputSimulator.Keyboard.KeyUp(VirtualKeyCode.CONTROL);
                 _inputSimulator.Keyboard.KeyUp(VirtualKeyCode.RETURN);
             }
             catch { }
-            // 缩短等待，提升手感，但保留一点缓冲
-            await Task.Delay(200);
 
-            // 3. 确定目标 APP
-            bool isWework;
-            string searchText;
-            if (string.IsNullOrEmpty(groupName))
+
+            // 3. ♻️ 直接复用自动化的核心逻辑！
+            // 核心优势：F1 怎么跑，这里就怎么跑。包含完整的：
+            // 找窗口 -> 激活 -> 搜索(含防抖) -> OCR验证列表 -> 回车 -> OCR验证标题 -> 粘贴
+            bool success = await SearchCurrentItemAsync(false); // isAutoMode = false
+
+            // 4. 轮询逻辑后置处理
+            // 如果没有群名（处于轮询模式），且本次搜索结束（无论成败），
+            // 都切换一下轮次，以便下次 Ctrl+Enter 搜另一个 APP
+            if (string.IsNullOrEmpty(_currentSelectedNode.GroupName))
             {
-                isWework = _isWeworkTurn;
-                searchText = storeName;
                 _isWeworkTurn = !_isWeworkTurn;
-                StatusTextBlock.Text = $"🔎 [手动] 正在 {(isWework ? "企微" : "微信")} 搜索...";
+
+                // 更新 UI 提示下一次搜谁
+                string nextApp = _isWeworkTurn ? "企业微信" : "微信";
+                StatusTextBlock.Text = $"⏳ 下次轮询: {nextApp}";
+            }
+        }
+
+        // MainWindow.xaml.cs
+
+        /// <summary>
+        /// ✅ [粘贴键专属] 动态识别版
+        /// 逻辑：识别窗口身份(读配置) -> 写入剪贴板 -> 盲粘贴 -> (自动发送) -> [无群名则补全]
+        /// </summary>
+        private async Task ManualPasteProcessAsync()
+        {
+            // 1. 基础检查
+            if (_currentSelectedNode == null)
+            {
+                StatusTextBlock.Text = "⚠️ 请先选择一个商家";
+                return;
+            }
+
+            string storeName = _currentSelectedNode.StoreName;
+            string originalGroupName = _currentSelectedNode.GroupName;
+            bool isFileNode = _currentSelectedNode.IsFileNode;
+
+            // ============================================================
+            // 2. 🤖 自动识别窗口身份 (兼容 search_config.json)
+            // ============================================================
+            IntPtr currentHwnd = GetForegroundWindow();
+            string currentClassName = GetWindowClass(currentHwnd);
+
+            // 默认为微信 (false)
+            bool isWework = false;
+
+            // 动态对比配置中的类名
+            if (currentClassName == _searchConfig.WeworkWindowClassName)
+            {
+                isWework = true;
+                StatusTextBlock.Text = "🤖 检测到：企业微信";
+            }
+            else if (currentClassName == _searchConfig.WechatWindowClassName)
+            {
+                isWework = false;
+                StatusTextBlock.Text = "🤖 检测到：微信";
             }
             else
             {
-                isWework = "企业微信".Equals(source);
-                searchText = groupName;
-                StatusTextBlock.Text = $"🔎 [手动] 正在 {(isWework ? "企微" : "微信")} 搜群名...";
+                // 兜底：如果类名既不像微信也不像企微，尝试用模糊匹配兜底
+                // (防止配置填错导致完全无法识别)
+                if (currentClassName.Contains("WeWork") || currentClassName.Contains("WXWork"))
+                {
+                    isWework = true;
+                    StatusTextBlock.Text = "🤖 检测到：企业微信 (模糊匹配)";
+                }
+                else
+                {
+                    // 实在认不出来，就沿用当前轮询的状态或者默认为微信
+                    // 这里选择不做改变，仅提示
+                    // StatusTextBlock.Text = $"⚠️ 未知窗口类名: {currentClassName}";
+                }
             }
 
-            // 4. 🎯 找窗口 (读取配置)
-            string targetClass = isWework ? _searchConfig.WeworkWindowClassName : _searchConfig.WechatWindowClassName;
-            IntPtr targetHwnd = FindWindow(targetClass, null);
-
-            if (targetHwnd == IntPtr.Zero)
+            // ============================================================
+            // 3. 执行核心动作 (传入识别到的 isWework)
+            // ============================================================
+            bool actionSuccess = false;
+            if (isFileNode)
             {
-                StatusTextBlock.Text = $"❌ 未找到窗口: {targetClass}";
-                return;
+                // 传入 isWework 确保点击坐标正确 (企微宽，微信窄)
+                actionSuccess = await PasteExcelFileAsync(storeName, isWework);
+            }
+            else
+            {
+                actionSuccess = await PasteFullStoreInfoAsync(storeName, isWework);
             }
 
-            // 🛑 🛑 🛑 【核心修复：死磕激活】 🛑 🛑 🛑
-            // 企业微信如果不激活，搜索框绝对不弹。这里循环检查是否真的激活了。
-            bool activated = false;
-            for (int i = 0; i < 5; i++) // 尝试 5 次
-            {
-                RobustActivateWindow(targetHwnd); // 您的强力激活方法
-                await Task.Delay(100); // 给系统一点反应时间
+            if (!actionSuccess) return;
 
+            // ============================================================
+            // 4. 后置智能补全 (仅当原先没有群名时触发)
+            // ============================================================
+            if (string.IsNullOrEmpty(originalGroupName))
+            {
+                StatusTextBlock.Text = "👁️ 正在识别群名以补全...";
+                try
+                {
+                    // 等待发送动画
+                    await Task.Delay(200);
+
+                    // OCR 获取标题 (传入刚才识别到的身份 isWework)
+                    string recognizedTitle = await _screenshotHelper.GetWeChatWindowTitleTextAsync(currentHwnd, isWework);
+
+                    // 如果第一次没识别到，尝试反向识别一次 (以防万一)
+                    if (string.IsNullOrWhiteSpace(recognizedTitle))
+                    {
+                        recognizedTitle = await _screenshotHelper.GetWeChatWindowTitleTextAsync(currentHwnd, !isWework);
+                    }
+
+                    if (!string.IsNullOrWhiteSpace(recognizedTitle) && recognizedTitle.Length > 1)
+                    {
+                        // ✅ 识别成功：保存并更新
+                        string sourceToSave = isWework ? "企业微信" : "微信";
+
+                        UpdateBusInfo(storeName, recognizedTitle, sourceToSave);
+                        StatusTextBlock.Text = $"✅ [补全] 已保存为[{sourceToSave}]: {recognizedTitle}";
+                    }
+                    else
+                    {
+                        StatusTextBlock.Text = "⚠️ 未识别到有效标题，跳过补全";
+                    }
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine($"补全失败: {ex.Message}");
+                }
+            }
+        }
+
+
+        private async Task<bool> PasteFullStoreInfoBlindAsync(string storeName)
+        {
+            // 1. 准备数据
+            List<string> trackingNumbers;
+            lock (_dataLock)
+            {
+                if (!_storeData.TryGetValue(storeName, out trackingNumbers))
+                {
+                    StatusTextBlock.Text = "❌ 未找到商家数据";
+                    return false;
+                }
+                trackingNumbers = trackingNumbers.ToList();
+            }
+
+            var sb = new StringBuilder();
+            sb.AppendLine(storeName);
+            foreach (var num in trackingNumbers) sb.AppendLine(num);
+            sb.AppendLine(FIXED_MESSAGE);
+
+            // 2. 核心：主动写入剪贴板 (这是“粘贴商家信息”的关键)
+            if (!await SetClipboardWithRetryAsync(sb.ToString()))
+            {
+                StatusTextBlock.Text = "❌ 剪贴板被占用";
+                return false;
+            }
+
+            // 稍作等待确保剪贴板生效
+            await Task.Delay(50);
+
+            // 3. 盲粘贴 (不移动鼠标，直接 Ctrl+V)
+            SimulatePaste();
+
+            // 4. 处理自动发送
+            if (AutoSendCheckBox.IsChecked == true)
+            {
+                // 稍等渲染
+                await Task.Delay(200);
+
+                // 发送动作
+                SimulateAltS();
+                await Task.Delay(50);
+                SimulateEnter(); // 补刀
+
+                StatusTextBlock.Text = $"✅ [快捷] 已发送: {storeName}";
+            }
+            else
+            {
+                StatusTextBlock.Text = $"📋 [快捷] 已粘贴: {storeName}";
+            }
+
+            // 更新状态，方便 Ctrl+Enter 跳转
+            _currentItemPasted = true;
+            _lastPastedStoreName = storeName;
+
+            return true;
+        }
+        // MainWindow.xaml.cs
+
+        // MainWindow.xaml.cs
+
+        /// <summary>
+        /// ✅ [新增辅助方法] 统一处理：更新内存 -> 保存文件 -> 刷新界面
+        /// </summary>
+        private void UpdateBusInfo(string storeName, string newGroupName, string source)
+        {
+            // 1. 更新内存列表 (_businessInfoList)
+            var info = _businessInfoList.FirstOrDefault(b => b.StoreName == storeName);
+            if (info == null)
+            {
+                info = new BusinessInfo { StoreName = storeName };
+                _businessInfoList.Add(info);
+            }
+
+            // 更新属性
+            info.GroupName = newGroupName;
+            info.Source = source;
+
+            // 2. 保存到本地 JSON 文件
+            // (调用你原有的 SaveBusinessInfo 方法)
+            SaveBusinessInfo();
+
+            // 3. 刷新 TreeView 界面显示
+            // (调用你原有的 UpdateNodeGroupInfo 方法)
+            UpdateNodeGroupInfo(storeName, newGroupName, source);
+        }
+
+        private async Task<bool> PasteExcelFileBlindAsync(string storeName)
+        {
+            // 1. 准备文件路径
+            string filePath;
+            lock (_dataLock) { if (!_exportedFilePaths.TryGetValue(storeName, out filePath)) return false; }
+
+            if (!File.Exists(filePath))
+            {
+                StatusTextBlock.Text = "❌ 文件不存在";
+                return false;
+            }
+
+            // 2. 核心：主动写入剪贴板
+            bool clipboardSuccess = await Application.Current.Dispatcher.InvokeAsync(() =>
+            {
+                try
+                {
+                    var data = new DataObject();
+                    data.SetData(DataFormats.FileDrop, new string[] { filePath });
+                    Clipboard.SetDataObject(data, true);
+                    return true;
+                }
+                catch { return false; }
+            });
+
+            if (!clipboardSuccess)
+            {
+                StatusTextBlock.Text = "❌ 文件剪贴板写入失败";
+                return false;
+            }
+            await Task.Delay(50);
+
+            // 3. 盲粘贴
+            SimulatePaste();
+
+            // 4. 处理自动发送
+            if (AutoSendCheckBox.IsChecked == true)
+            {
+                StatusTextBlock.Text = "🚀 正在发送文件...";
+                await Task.Delay(500); // 文件加载稍慢
+                SimulateAltS();
+                await Task.Delay(50);
+                SimulateEnter();
+                StatusTextBlock.Text = $"✅ [快捷] 文件已发送: {storeName}";
+            }
+            else
+            {
+                StatusTextBlock.Text = $"📋 [快捷] 文件已粘贴: {storeName}";
+            }
+
+            _currentItemPasted = true;
+            _lastPastedStoreName = storeName;
+
+            return true;
+        }
+
+        /// <summary>
+        /// 🔥 专门为搜索操作设计的窗口激活方法
+        /// </summary>
+        private async Task<bool> ActivateWindowForSearchAsync(IntPtr targetHwnd, bool isWework)
+        {
+            const int MAX_ATTEMPTS = 5;
+
+            for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++)
+            {
+                System.Diagnostics.Debug.WriteLine($"[激活] 第 {attempt} 次尝试...");
+
+                // 步骤1：基础激活
+                RobustActivateWindow(targetHwnd);
+                await Task.Delay(100);
+
+                // 步骤2：检查是否真的激活了
+                if (GetForegroundWindow() != targetHwnd)
+                {
+                    System.Diagnostics.Debug.WriteLine($"[激活] SetForegroundWindow 未生效，尝试点击激活");
+
+                    // 点击窗口标题栏区域强制激活
+                    if (GetWindowRect(targetHwnd, out RECT rect))
+                    {
+                        int clickX = (rect.Left + rect.Right) / 2;
+                        int clickY = rect.Top + 30; // 标题栏位置
+
+                        SetCursorPos(clickX, clickY);
+                        await Task.Delay(30);
+                        mouse_event(MOUSEEVENTF_LEFTDOWN, clickX, clickY, 0, 0);
+                        await Task.Delay(30);
+                        mouse_event(MOUSEEVENTF_LEFTUP, clickX, clickY, 0, 0);
+                        await Task.Delay(150);
+                    }
+                }
+
+                // 步骤3：企业微信专用 - 额外点击主内容区确保焦点到位
+                if (isWework && GetForegroundWindow() == targetHwnd)
+                {
+                    System.Diagnostics.Debug.WriteLine($"[激活] 企微专用：点击内容区域获取内部焦点");
+
+                    if (GetWindowRect(targetHwnd, out RECT rect))
+                    {
+                        // 点击窗口中央偏左的位置（通常是聊天列表区域）
+                        int contentX = rect.Left + 150;
+                        int contentY = (rect.Top + rect.Bottom) / 2;
+
+                        SetCursorPos(contentX, contentY);
+                        await Task.Delay(30);
+                        mouse_event(MOUSEEVENTF_LEFTDOWN, contentX, contentY, 0, 0);
+                        await Task.Delay(30);
+                        mouse_event(MOUSEEVENTF_LEFTUP, contentX, contentY, 0, 0);
+
+                        // 🔥 关键：企微需要更长的焦点稳定时间
+                        await Task.Delay(300);
+                    }
+                }
+
+                // 步骤4：最终验证
                 if (GetForegroundWindow() == targetHwnd)
                 {
-                    activated = true;
-                    break;
+                    System.Diagnostics.Debug.WriteLine($"[激活] ✅ 第 {attempt} 次尝试成功");
+
+                    // 企微额外等待，确保内部状态就绪
+                    if (isWework)
+                    {
+                        await Task.Delay(200);
+                    }
+
+                    return true;
                 }
+
+                await Task.Delay(100);
             }
 
-            if (!activated)
-            {
-                // 如果激活失败，尝试最后一次补救：点击一下窗口中心
-                // (有时候 SetForegroundWindow 被系统拦截，点击可以强制抢焦点)
-                if (GetWindowRect(targetHwnd, out RECT r))
-                {
-                    int cx = (r.Left + r.Right) / 2;
-                    int cy = (r.Top + r.Bottom) / 2;
-                    SetCursorPos(cx, cy);
-                    mouse_event(MOUSEEVENTF_LEFTDOWN, cx, cy, 0, 0);
-                    mouse_event(MOUSEEVENTF_LEFTUP, cx, cy, 0, 0);
-                    await Task.Delay(100);
-                }
-            }
-
-            // 再次检查，如果还是不行，那就真的没办法搜了
-            if (GetForegroundWindow() != targetHwnd)
-            {
-                StatusTextBlock.Text = "❌ 窗口激活失败，无法搜索";
-                return;
-            }
-
-            // 5. 执行搜索 (调用 SearchHelper)
-            // 此时窗口一定是前台的，Ctrl+F 才能生效
-            bool searchLaunched = await Task.Run(() => _searchHelper.SearchInApp(searchText, isWework));
-            if (!searchLaunched)
-            {
-                StatusTextBlock.Text = "❌ [手动] 搜索操作未执行";
-                return;
-            }
-
-            // 6. OCR 验证
-            bool isMatch = false;
-            StatusTextBlock.Text = "👀 验证搜索结果...";
-
-            // 搜索指令发出后，给框弹出的时间 (500ms)
-            await Task.Delay(500);
-
-            for (int i = 0; i < 4; i++)
-            {
-                isMatch = await _screenshotHelper.CheckSearchResultAsync(targetHwnd, searchText, isWework);
-                if (isMatch) break;
-                await Task.Delay(300);
-            }
-
-            if (!isMatch)
-            {
-                StatusTextBlock.Text = $"❌ 未找到匹配: {searchText}";
-                return;
-            }
-
-            // 7. 进群 & 粘贴
-            StatusTextBlock.Text = "✅ 匹配成功，进入...";
-            await Task.Delay(50);
-            _inputSimulator.Keyboard.KeyPress(VirtualKeyCode.RETURN);
-            await Task.Delay(400);
-
-            if (isFileNode) await PasteExcelFileAsync(storeName, isWework);
-            else await PasteFullStoreInfoAsync(storeName, isWework);
+            System.Diagnostics.Debug.WriteLine($"[激活] ❌ {MAX_ATTEMPTS} 次尝试均失败");
+            return false;
         }
+
+
 
 
 

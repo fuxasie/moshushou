@@ -149,29 +149,37 @@ namespace moshushou
         {
             // 1. 激活搜索框
             _inputSimulator.Keyboard.ModifiedKeyStroke(VirtualKeyCode.CONTROL, VirtualKeyCode.VK_F);
-            Thread.Sleep(Math.Max(_config.DelayAfterCtrlF, 100)); // ⏳ 稍微加大等待
+            // 💡 必须有足够的延迟让焦点进去
+            Thread.Sleep(Math.Max(_config.DelayAfterCtrlF, 200));
 
-            // 2. 🛡️ 防御性清空：先发一个 Backspace，防止 Ctrl+A 没选中
-            // 如果焦点在输入框，这会删掉一个字；如果焦点在列表，这没副作用
+            // 2. 防御性清空
             _inputSimulator.Keyboard.KeyPress(VirtualKeyCode.BACK);
             Thread.Sleep(30);
 
-            // 3. 全选并清空
+            // 3. 全选并删除
             _inputSimulator.Keyboard.ModifiedKeyStroke(VirtualKeyCode.CONTROL, VirtualKeyCode.VK_A);
             Thread.Sleep(50);
-            _inputSimulator.Keyboard.KeyPress(VirtualKeyCode.BACK); // 🔥 显式删除，比直接粘贴更稳
+            _inputSimulator.Keyboard.KeyPress(VirtualKeyCode.BACK);
             Thread.Sleep(50);
 
             // 4. 粘贴新内容
             _inputSimulator.Keyboard.ModifiedKeyStroke(VirtualKeyCode.CONTROL, VirtualKeyCode.VK_V);
-            Thread.Sleep(100);
 
-            // 5. ⚡ 触发搜索列表 (空格+退格大法)
+            // ⏳ 关键：粘贴后等待上屏
+            Thread.Sleep(200);
+
+            // ============================================================
+            // 🔥 核心唤醒：空格 + 退格
+            // 这能强行覆盖掉物理 Ctrl 键带来的信号干扰，强制触发搜索
+            // ============================================================
             _inputSimulator.Keyboard.KeyPress(VirtualKeyCode.SPACE);
             Thread.Sleep(50);
             _inputSimulator.Keyboard.KeyPress(VirtualKeyCode.BACK);
-            Thread.Sleep(150); // 等待列表渲染
+
+            // 再次等待列表渲染
+            Thread.Sleep(200);
         }
+
 
 
         private bool SetClipboardWithRetry(string text)
