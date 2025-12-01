@@ -1,0 +1,110 @@
+﻿<Window x:Class="moshushou.EditBusInfoWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        xmlns:local="clr-namespace:moshushou"
+        mc:Ignorable="d"
+        Title="编辑商家群聊信息" Height="280" Width="400"
+        WindowStartupLocation="CenterOwner"
+        ResizeMode="NoResize"
+        Background="#F5F7FA">
+    <Grid Margin="15">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <!-- Row 0: Merchant Name -->
+        <StackPanel Grid.Row="0">
+            <TextBlock Text="商家名称" FontWeight="Bold" Foreground="#4A5568"/>
+            <Border BorderBrush="#E2E8F0" BorderThickness="1" CornerRadius="4" Padding="8,6" Margin="0,5,0,0" Background="#EDF2F7">
+                <TextBlock x:Name="StoreNameTextBlock" Text="123456789" Foreground="#718096"/>
+            </Border>
+        </StackPanel>
+
+        <!-- Row 1: Group Name -->
+        <StackPanel Grid.Row="1" Margin="0,15,0,0">
+            <TextBlock Text="群聊名称" FontWeight="Bold" Foreground="#4A5568"/>
+            <Border BorderBrush="#CBD5E0" BorderThickness="1" CornerRadius="4" Margin="0,5,0,0" Background="White">
+                <TextBox x:Name="GroupNameTextBox" Padding="6,5" BorderThickness="0" Background="Transparent"/>
+            </Border>
+        </StackPanel>
+
+        <!-- Row 2: Source Selection -->
+        <StackPanel Grid.Row="2" Margin="0,15,0,0">
+            <TextBlock Text="来源平台" FontWeight="Bold" Foreground="#4A5568"/>
+            <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
+                <RadioButton x:Name="WeworkRadioButton" GroupName="Source" Content="企业微信" VerticalContentAlignment="Center"/>
+                <RadioButton x:Name="WechatRadioButton" GroupName="Source" Content="微信" Margin="20,0,0,0" VerticalContentAlignment="Center"/>
+            </StackPanel>
+        </StackPanel>
+
+        <!-- Row 4: Action Buttons -->
+        <StackPanel Grid.Row="4" Orientation="Horizontal" HorizontalAlignment="Right">
+            <Button x:Name="DeleteButton" Content="清除并保存" Padding="12,7" Background="#E53E3E" Foreground="White" BorderThickness="0" Cursor="Hand" Click="DeleteButton_Click">
+                <Button.Style>
+                    <Style TargetType="Button">
+                        <Setter Property="Template">
+                            <Setter.Value>
+                                <ControlTemplate TargetType="Button">
+                                    <Border Background="{TemplateBinding Background}" CornerRadius="4">
+                                        <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                                    </Border>
+                                </ControlTemplate>
+                            </Setter.Value>
+                        </Setter>
+                        <Style.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter Property="Opacity" Value="0.9"/>
+                            </Trigger>
+                        </Style.Triggers>
+                    </Style>
+                </Button.Style>
+            </Button>
+            <Button x:Name="SaveButton" Content="保存更改" Padding="12,7" Background="#3B82F6" Foreground="White" BorderThickness="0" Cursor="Hand" Margin="10,0,0,0" Click="SaveButton_Click">
+                <Button.Style>
+                    <Style TargetType="Button">
+                        <Setter Property="Template">
+                            <Setter.Value>
+                                <ControlTemplate TargetType="Button">
+                                    <Border Background="{TemplateBinding Background}" CornerRadius="4">
+                                        <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                                    </Border>
+                                </ControlTemplate>
+                            </Setter.Value>
+                        </Setter>
+                        <Style.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter Property="Opacity" Value="0.9"/>
+                            </Trigger>
+                        </Style.Triggers>
+                    </Style>
+                </Button.Style>
+            </Button>
+            <Button x:Name="CancelButton" Content="取消" IsCancel="True" Padding="12,7" Background="#A0AEC0" Foreground="White" BorderThickness="0" Cursor="Hand" Margin="10,0,0,0">
+                <Button.Style>
+                    <Style TargetType="Button">
+                        <Setter Property="Template">
+                            <Setter.Value>
+                                <ControlTemplate TargetType="Button">
+                                    <Border Background="{TemplateBinding Background}" CornerRadius="4">
+                                        <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                                    </Border>
+                                </ControlTemplate>
+                            </Setter.Value>
+                        </Setter>
+                        <Style.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter Property="Opacity" Value="0.9"/>
+                            </Trigger>
+                        </Style.Triggers>
+                    </Style>
+                </Button.Style>
+            </Button>
+        </StackPanel>
+    </Grid>
+</Window>
