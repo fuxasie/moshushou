@@ -82,6 +82,52 @@ namespace moshushou
         }
 
 
+
+
+
+        // ✅ [新增] 专门计算输入框点击坐标的方法
+        public bool GetInputBoxClickCoordinates(IntPtr hwnd, bool isWework, out int x, out int y)
+        {
+            x = 0; y = 0;
+            if (hwnd == IntPtr.Zero) return false;
+
+            if (!GetWindowRect(hwnd, out RECT rect)) return false;
+
+            // ---------------------------------------------------------
+            // 📐 坐标计算核心逻辑
+            // ---------------------------------------------------------
+            // 微信 PC 版：
+            //   侧边栏(图标+列表) 约 250~300px
+            //   偏移 310px 比较稳健 (270 + 40)
+            //
+            // 企业微信：
+            //   侧边栏通常更宽
+            //   偏移 380px 比较稳健 (310 + 70)
+            // ---------------------------------------------------------
+
+            int xOffset = isWework ? 380 : 310;
+            int yOffset = 70; // 距离底部的高度
+
+            x = rect.Left + xOffset;
+            y = rect.Bottom - yOffset;
+
+            // 简单的越界检查 (防止窗口被缩得太小)
+            if (x >= rect.Right) x = rect.Right - 50;
+            if (y >= rect.Bottom) y = rect.Bottom - 20;
+
+            return true;
+        }
+
+
+
+
+
+
+
+
+
+
+
         /// <summary>
         /// ✅ [智能优化版] 模糊匹配
         /// 针对 OCR 误差、长文本截断、包含关系进行了专门优化

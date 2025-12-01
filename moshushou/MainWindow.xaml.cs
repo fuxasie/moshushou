@@ -103,6 +103,12 @@ namespace moshushou
 
 
 
+
+        // MainWindow.xaml.cs
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
+
         // 核心：线程挂接 API
         [DllImport("user32.dll")]
         private static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
@@ -479,6 +485,8 @@ namespace moshushou
             }
         }
 
+        // MainWindow.xaml.cs
+
         private IntPtr HwndHook(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
         {
             if (msg == WM_HOTKEY)
@@ -506,19 +514,32 @@ namespace moshushou
                 }
                 else if (id == HOTKEY_RIGHT || id == HOTKEY_QUOTE)
                 {
-                    // 粘贴完整信息
+                    // ✅ [修复] 粘贴完整信息：增加 isWework 参数传递
                     Application.Current.Dispatcher.InvokeAsync(async () =>
                     {
-                        await PasteFullStoreInfoAsync(_currentSelectedNode?.StoreName);
+                        if (_currentSelectedNode != null)
+                        {
+                            // 获取当前节点的来源属性，判断是否为企业微信
+                            bool isWework = "企业微信".Equals(_currentSelectedNode.Source);
+
+                            // 调用带参数的新粘贴方法
+                            await PasteFullStoreInfoAsync(_currentSelectedNode.StoreName, isWework);
+                        }
                     });
                     shouldHandle = true;
                 }
                 else if (id == HOTKEY_ENTER)
                 {
                     // 智能处理 (搜索或下一步)
+                    // ✅ 保留之前添加的按键释放逻辑
+                    try
+                    {
+                        _inputSimulator.Keyboard.KeyUp(VirtualKeyCode.CONTROL);
+                    }
+                    catch { }
+
                     Application.Current.Dispatcher.InvokeAsync(async () =>
                     {
-                        // 如果正在自动运行，Enter键暂停
                         if (_isAutoRunning)
                         {
                             StopAutoSending();
@@ -532,7 +553,7 @@ namespace moshushou
                 }
                 else if (id == HOTKEY_F1)
                 {
-                    // ✅ F1: 启动自动化发送
+                    // F1: 启动自动化发送
                     if (!_isAutoRunning)
                     {
                         StartAutoSending();
@@ -541,7 +562,7 @@ namespace moshushou
                 }
                 else if (id == HOTKEY_F2)
                 {
-                    // ✅ F2: 停止自动化发送
+                    // F2: 停止自动化发送
                     if (_isAutoRunning)
                     {
                         StopAutoSending();
@@ -553,7 +574,6 @@ namespace moshushou
             }
             return IntPtr.Zero;
         }
-
 
 
         #region 自动化发送控制逻辑 (F1/F2)
@@ -748,66 +768,203 @@ namespace moshushou
 
         #endregion
 
-        /// <summary>
-        /// ✅ [手动模式] Ctrl+Enter 触发
-        /// 特点：无视是否有群名，直接尝试搜索（无群名则搜商家名），不自动停止
-        /// </summary>
+
+
+
+        // MainWindow.xaml.cs
+
+        // 增加一个静态锁对象 (或者使用类成员变量)
+        private static readonly SemaphoreSlim _manualLock = new SemaphoreSlim(1, 1);
+
         private async Task SmartAdvanceOrSearchAsync()
         {
-            await Application.Current.Dispatcher.InvokeAsync(async () =>
+            // 1. 🔒 立即尝试获取锁，如果正在处理中，直接忽略本次按键
+            if (!await _manualLock.WaitAsync(0))
             {
-                // 1. 基础检查
-                if (_currentSelectedNode == null || string.IsNullOrEmpty(_currentSelectedNode.StoreName))
+                System.Diagnostics.Debug.WriteLine("⚠️ 操作太快，忽略本次 Ctrl+Enter");
+                return;
+            }
+
+            try
+            {
+                await Application.Current.Dispatcher.InvokeAsync(async () =>
                 {
-                    StatusTextBlock.Text = "⚠️ 请先选择一个商家";
-                    return;
-                }
-
-                string currentStoreName = _currentSelectedNode.StoreName;
-
-                // 2. 判断逻辑：是“下一条”还是“当前条”
-                // 如果当前项已经被标记为已粘贴（且名字匹配），则认为是用户想跳到下一条继续
-                if (_currentItemPasted && _lastPastedStoreName == currentStoreName)
-                {
-                    StatusTextBlock.Text = "⏭️ [手动] 前进到下一项...";
-
-                    // 稍微一点延迟让 UI 反应，但比自动模式快
-                    await Task.Delay(50);
-
-                    NavigateTreeView(1);
-
-                    // 检查是否到了末尾
+                    // ... 这里的逻辑保持不变 ...
                     if (_currentSelectedNode == null || string.IsNullOrEmpty(_currentSelectedNode.StoreName))
                     {
-                        StatusTextBlock.Text = "✅ 列表到底了！";
+                        StatusTextBlock.Text = "⚠️ 请先选择一个商家";
                         return;
                     }
 
-                    // 重置状态
-                    _currentItemPasted = false;
-                    _lastPastedStoreName = null;
+                    // 智能前进判断逻辑 (保持不变)
+                    string currentStoreName = _currentSelectedNode.StoreName;
+                    if (_currentItemPasted && _lastPastedStoreName == currentStoreName)
+                    {
+                        StatusTextBlock.Text = "⏭️ [手动] 前进到下一项...";
+                        await Task.Delay(50);
+                        NavigateTreeView(1);
 
-                    // 等待选中生效后，立即开始搜索新的一项
-                    await Task.Delay(100);
-                    await SearchCurrentItemAsync(false);
-                }
-                else
-                {
-                    // 如果还没粘贴，或者用户强行按 Ctrl+Enter，说明想重试当前项
-                    StatusTextBlock.Text = "▶️ [手动] 启动当前项发送...";
+                        if (_currentSelectedNode == null || string.IsNullOrEmpty(_currentSelectedNode.StoreName))
+                        {
+                            StatusTextBlock.Text = "✅ 列表到底了！";
+                            return;
+                        }
+                        _currentItemPasted = false;
+                        _lastPastedStoreName = null;
+                        await Task.Delay(100);
+                    }
+                    else
+                    {
+                        StatusTextBlock.Text = "▶️ [手动] 启动处理...";
+                        _currentItemPasted = false;
+                        _lastPastedStoreName = null;
+                    }
 
-                    // 重置状态防止误判
-                    _currentItemPasted = false;
-                    _lastPastedStoreName = null;
-
-                    // 🛑 这里没有群名检查！直接由 SearchCurrentItemAsync 内部决定是用群名还是商家名
-                    await SearchCurrentItemAsync();
-                }
-            });
+                    // 调用核心方法
+                    await ManualSmartProcessAsync();
+                });
+            }
+            finally
+            {
+                // 🔓 释放锁，允许下一次操作
+                _manualLock.Release();
+            }
         }
 
+
+
+
+        // MainWindow.xaml.cs
+
+        private async Task ManualSmartProcessAsync()
+        {
+            // 1. 基础数据检查
+            if (_currentSelectedNode == null) return;
+            string storeName = _currentSelectedNode.StoreName;
+            string groupName = _currentSelectedNode.GroupName;
+            string source = _currentSelectedNode.Source;
+            bool isFileNode = _currentSelectedNode.IsFileNode;
+
+            // 2. 🛡️ 净化环境：释放按键 & 稍作等待
+            try
+            {
+                _inputSimulator.Keyboard.KeyUp(VirtualKeyCode.CONTROL);
+                _inputSimulator.Keyboard.KeyUp(VirtualKeyCode.RETURN);
+            }
+            catch { }
+            // 缩短等待，提升手感，但保留一点缓冲
+            await Task.Delay(200);
+
+            // 3. 确定目标 APP
+            bool isWework;
+            string searchText;
+            if (string.IsNullOrEmpty(groupName))
+            {
+                isWework = _isWeworkTurn;
+                searchText = storeName;
+                _isWeworkTurn = !_isWeworkTurn;
+                StatusTextBlock.Text = $"🔎 [手动] 正在 {(isWework ? "企微" : "微信")} 搜索...";
+            }
+            else
+            {
+                isWework = "企业微信".Equals(source);
+                searchText = groupName;
+                StatusTextBlock.Text = $"🔎 [手动] 正在 {(isWework ? "企微" : "微信")} 搜群名...";
+            }
+
+            // 4. 🎯 找窗口 (读取配置)
+            string targetClass = isWework ? _searchConfig.WeworkWindowClassName : _searchConfig.WechatWindowClassName;
+            IntPtr targetHwnd = FindWindow(targetClass, null);
+
+            if (targetHwnd == IntPtr.Zero)
+            {
+                StatusTextBlock.Text = $"❌ 未找到窗口: {targetClass}";
+                return;
+            }
+
+            // 🛑 🛑 🛑 【核心修复：死磕激活】 🛑 🛑 🛑
+            // 企业微信如果不激活，搜索框绝对不弹。这里循环检查是否真的激活了。
+            bool activated = false;
+            for (int i = 0; i < 5; i++) // 尝试 5 次
+            {
+                RobustActivateWindow(targetHwnd); // 您的强力激活方法
+                await Task.Delay(100); // 给系统一点反应时间
+
+                if (GetForegroundWindow() == targetHwnd)
+                {
+                    activated = true;
+                    break;
+                }
+            }
+
+            if (!activated)
+            {
+                // 如果激活失败，尝试最后一次补救：点击一下窗口中心
+                // (有时候 SetForegroundWindow 被系统拦截，点击可以强制抢焦点)
+                if (GetWindowRect(targetHwnd, out RECT r))
+                {
+                    int cx = (r.Left + r.Right) / 2;
+                    int cy = (r.Top + r.Bottom) / 2;
+                    SetCursorPos(cx, cy);
+                    mouse_event(MOUSEEVENTF_LEFTDOWN, cx, cy, 0, 0);
+                    mouse_event(MOUSEEVENTF_LEFTUP, cx, cy, 0, 0);
+                    await Task.Delay(100);
+                }
+            }
+
+            // 再次检查，如果还是不行，那就真的没办法搜了
+            if (GetForegroundWindow() != targetHwnd)
+            {
+                StatusTextBlock.Text = "❌ 窗口激活失败，无法搜索";
+                return;
+            }
+
+            // 5. 执行搜索 (调用 SearchHelper)
+            // 此时窗口一定是前台的，Ctrl+F 才能生效
+            bool searchLaunched = await Task.Run(() => _searchHelper.SearchInApp(searchText, isWework));
+            if (!searchLaunched)
+            {
+                StatusTextBlock.Text = "❌ [手动] 搜索操作未执行";
+                return;
+            }
+
+            // 6. OCR 验证
+            bool isMatch = false;
+            StatusTextBlock.Text = "👀 验证搜索结果...";
+
+            // 搜索指令发出后，给框弹出的时间 (500ms)
+            await Task.Delay(500);
+
+            for (int i = 0; i < 4; i++)
+            {
+                isMatch = await _screenshotHelper.CheckSearchResultAsync(targetHwnd, searchText, isWework);
+                if (isMatch) break;
+                await Task.Delay(300);
+            }
+
+            if (!isMatch)
+            {
+                StatusTextBlock.Text = $"❌ 未找到匹配: {searchText}";
+                return;
+            }
+
+            // 7. 进群 & 粘贴
+            StatusTextBlock.Text = "✅ 匹配成功，进入...";
+            await Task.Delay(50);
+            _inputSimulator.Keyboard.KeyPress(VirtualKeyCode.RETURN);
+            await Task.Delay(400);
+
+            if (isFileNode) await PasteExcelFileAsync(storeName, isWework);
+            else await PasteFullStoreInfoAsync(storeName, isWework);
+        }
+
+
+
+
+        // MainWindow.xaml.cs
+
         /// <summary>
-        /// ✅ [乱序匹配增强版 + 详细日志 + 强力激活修复]
+        /// ✅ [自动模式核心] 乱序匹配增强版 + 详细日志 + 强力激活修复
         /// </summary>
         private async Task<bool> SearchCurrentItemAsync(bool isAutoMode = false)
         {
@@ -843,6 +1000,7 @@ namespace moshushou
                 GroupName = groupName?.Trim(),
                 SearchText = !string.IsNullOrEmpty(groupName) ? groupName.Trim() : storeName.Trim(),
                 HasGroupName = !string.IsNullOrEmpty(groupName),
+                // 判断目标是企微还是微信
                 IsWework = !string.IsNullOrEmpty(groupName) ? "企业微信".Equals(source) : _isWeworkTurn
             };
 
@@ -851,11 +1009,16 @@ namespace moshushou
             System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [快照] 目标应用:{appName}, 搜索词:{snapshot.SearchText}, 有群名:{snapshot.HasGroupName}, 上次群名:{_lastEnteredGroupName ?? "无"}");
             Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = $"🔍 正在 [{appName}] 搜索: {snapshot.SearchText}...");
 
+            // ✅ 定义执行粘贴的动作 (这里修复了参数缺失报错)
             Func<Task<bool>> performPasteAsync = async () =>
             {
                 System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [动作] 准备执行粘贴/发送任务...");
-                if (isFileNode) return await PasteExcelFileAsync(snapshot.StoreName);
-                else return await PasteFullStoreInfoAsync(snapshot.StoreName);
+
+                // 关键修复：传入 snapshot.IsWework 参数
+                if (isFileNode)
+                    return await PasteExcelFileAsync(snapshot.StoreName, snapshot.IsWework);
+                else
+                    return await PasteFullStoreInfoAsync(snapshot.StoreName, snapshot.IsWework);
             };
 
             try
@@ -863,34 +1026,26 @@ namespace moshushou
                 // --------------------------------------------------------
                 // 🚀 1. 极速模式
                 // --------------------------------------------------------
-                // 只有配置了群名，且群名与上次一致时才触发（保留原逻辑限制）
                 if (snapshot.HasGroupName && snapshot.SearchText == _lastEnteredGroupName)
                 {
                     System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [极速] 命中同名群条件，开始视觉验证...");
                     Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = "👀 [极速] 检测同名群...");
 
-                    // ✅ [修复点1]：视觉保障 - 强力激活窗口确保能OCR到
                     bool activateResult = false;
                     if (_lastChatWindowHandle != IntPtr.Zero)
                     {
                         activateResult = RobustActivateWindow(_lastChatWindowHandle);
-                        System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [极速] 激活上次窗口句柄({_lastChatWindowHandle}): {activateResult}");
                     }
                     else
                     {
                         activateResult = RobustActivateWindow(GetForegroundWindow());
-                        System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [极速] 激活当前前台窗口: {activateResult}");
                     }
 
-                    // 给一点时间让窗口重绘，防止截到残影
                     await Task.Delay(100);
 
                     IntPtr checkHwnd = GetForegroundWindow();
                     string titleText = await _screenshotHelper.GetWeChatWindowTitleTextAsync(checkHwnd, snapshot.IsWework);
 
-                    System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [极速] OCR标题结果: '{titleText}'");
-
-                    // 极速模式下也使用 IsFuzzyMatch (已包含基础弹性)
                     if (_screenshotHelper.IsFuzzyMatch(snapshot.SearchText, titleText))
                     {
                         System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [极速] ✅ 验证通过，跳过搜索步骤。");
@@ -905,72 +1060,42 @@ namespace moshushou
                         _lastChatWindowHandle = IntPtr.Zero;
                     }
                 }
-                else
-                {
-                    System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [常规] 不满足极速模式条件，开始常规流程。");
-                }
 
                 // ============================================================
                 // 🔍 2. 常规搜索模式
                 // ============================================================
 
-                // 此时需要先确保焦点在微信上，才能进行 Ctrl+F
                 IntPtr mainHwnd = GetForegroundWindow();
-                if (!RobustActivateWindow(mainHwnd)) // 使用强力激活替代 CheckWindowReady
+                if (!RobustActivateWindow(mainHwnd))
                 {
-                    System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [错误] 初始激活窗口失败。");
                     return false;
                 }
 
-                if (!await SetClipboardWithRetryAsync(snapshot.SearchText))
-                {
-                    System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [错误] 剪贴板设置失败。");
-                    return false;
-                }
-                await Task.Delay(50);
-
-                System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [动作] 执行 Ctrl+F 搜索逻辑...");
+                // 搜索 (SearchHelper 已包含空格退格修复)
                 bool autoSearchSuccess = await Task.Run(() => _searchHelper.SearchInApp(snapshot.SearchText, snapshot.IsWework));
                 if (!autoSearchSuccess)
                 {
-                    System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [错误] SearchHelper 返回失败。");
                     return false;
                 }
 
                 Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = "👀 [自动] 验证搜索列表...");
-                // 原来的死等 800ms 可以适当保留或减小，因为下面有循环重试
                 await Task.Delay(200);
 
                 // --------------------------------------------------------
-                // 🔥 步骤 A: 搜索列表 OCR 验证 (增强重试版)
+                // 🔥 步骤 A: 搜索列表 OCR 验证
                 // --------------------------------------------------------
                 IntPtr searchHwnd = GetForegroundWindow();
                 bool isListMatch = false;
 
-                // ✅ [修复点2]：循环重试，解决“搜太快结果没出来就判死刑”的问题
                 for (int i = 0; i < 3; i++)
                 {
-                    System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [验证] 检查搜索结果列表 (第 {i + 1}/3 次)...");
-
                     isListMatch = await _screenshotHelper.CheckSearchResultAsync(searchHwnd, snapshot.SearchText, snapshot.IsWework);
-
-                    if (isListMatch)
-                    {
-                        System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [验证] ✅ 列表匹配成功！");
-                        break;
-                    }
-
-                    if (i < 2) // 如果不是最后一次，就等待重试
-                    {
-                        System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [验证] 列表OCR未通过，等待800ms结果渲染...");
-                        Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = $"⏳ 结果未显示，重试 {i + 1}/3...");
-                        await Task.Delay(800); // 给微信反应时间
-                    }
+                    if (isListMatch) break;
+                    if (i < 2) await Task.Delay(800);
                 }
 
                 if (!isListMatch)
                 {
-                    System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [错误] ❌ 3次尝试后列表验证均失败，流程停止。");
                     Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = "❌ 搜索列表超时或未找到目标，停止。");
                     return false;
                 }
@@ -978,79 +1103,37 @@ namespace moshushou
                 // --------------------------------------------------------
                 // 🔥 步骤 B: 直接回车
                 // --------------------------------------------------------
-                System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [动作] 列表验证通过，准备回车进入...");
-
-                // ✅ [修复点3]：强力激活，防止回车键被遮挡吞掉
-                if (!RobustActivateWindow(searchHwnd))
-                {
-                    System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [警告] 回车前无法强力激活窗口，可能会漏发。");
-                }
-                else
-                {
-                    System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [状态] 窗口已强力激活，发送回车。");
-                }
-
+                RobustActivateWindow(searchHwnd);
                 await Task.Delay(50);
                 _inputSimulator.Keyboard.KeyPress(VirtualKeyCode.RETURN);
-                await Task.Delay(100); // 进群需要一点时间
+                await Task.Delay(100);
 
                 // --------------------------------------------------------
-                // 🔥 步骤 C: 进群后的二次标题验证 (抗乱序增强版)
+                // 🔥 步骤 C: 进群验证
                 // --------------------------------------------------------
 
                 IntPtr chatHwnd = GetForegroundWindow();
-                if (!CheckWindowReady(chatHwnd, "进群验证")) return false; // 这里也可以换成 RobustActivateWindow，看需求
+                // 简单检查窗口
+                if (chatHwnd == IntPtr.Zero) return false;
 
                 bool enteredSuccess = false;
-                string lastTitleSeen = "";
-
-                // 预处理目标词：去掉空格，转小写
                 string cleanTarget = snapshot.SearchText.Replace(" ", "").ToLower();
-                System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [验证] 开始进群标题验证，目标清洗后: '{cleanTarget}'");
 
                 for (int i = 0; i < 6; i++)
                 {
                     string rawTitle = await _screenshotHelper.GetWeChatWindowTitleTextAsync(chatHwnd, snapshot.IsWework);
-                    lastTitleSeen = rawTitle;
-
-                    // 1. 基础去噪
                     string cleanTitle = System.Text.RegularExpressions.Regex.Replace(rawTitle, @"\(\d+.*?\)|（\d+.*?）|\(外部\)|（外部）|\s+", "").ToLower();
-
-                    System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [调试] 标题验证 ({i + 1}/6): 原文='{rawTitle}' -> 清洗='{cleanTitle}'");
 
                     bool isMatch = false;
 
-                    // 规则1: 智能模糊匹配 (原有逻辑)
-                    if (_screenshotHelper.IsFuzzyMatch(snapshot.SearchText, rawTitle))
-                    {
-                        isMatch = true;
-                        System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [匹配] 规则1(模糊) 命中。");
-                    }
-                    // 规则2: 包含关系 (原有逻辑)
-                    else if (cleanTitle.Contains(cleanTarget) || (cleanTarget.Contains(cleanTitle) && cleanTitle.Length > 2))
-                    {
-                        isMatch = true;
-                        System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [匹配] 规则2(包含) 命中。");
-                    }
-                    // 🔥 规则3: 字符乱序重合度检查
+                    if (_screenshotHelper.IsFuzzyMatch(snapshot.SearchText, rawTitle)) isMatch = true;
+                    else if (cleanTitle.Contains(cleanTarget) || (cleanTarget.Contains(cleanTitle) && cleanTitle.Length > 2)) isMatch = true;
                     else
                     {
                         int matchCount = 0;
-                        foreach (char c in cleanTarget)
-                        {
-                            if (cleanTitle.Contains(c)) matchCount++;
-                        }
-
-                        double overlapRate = 0;
-                        if (cleanTarget.Length > 0) overlapRate = (double)matchCount / cleanTarget.Length;
-
-                        System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [调试] 乱序重合度: {overlapRate:P2} ({matchCount}/{cleanTarget.Length})");
-
-                        if (overlapRate > 0.8)
-                        {
-                            isMatch = true;
-                            System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [匹配] ✅ 触发乱序重合匹配！");
-                        }
+                        foreach (char c in cleanTarget) if (cleanTitle.Contains(c)) matchCount++;
+                        double overlapRate = cleanTarget.Length > 0 ? (double)matchCount / cleanTarget.Length : 0;
+                        if (overlapRate > 0.8) isMatch = true;
                     }
 
                     if (isMatch)
@@ -1061,7 +1144,6 @@ namespace moshushou
                         {
                             _lastEnteredGroupName = snapshot.SearchText;
                             _lastChatWindowHandle = chatHwnd;
-                            System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [记录] 更新极速模式记录: {_lastEnteredGroupName}");
                         }
                         break;
                     }
@@ -1070,20 +1152,17 @@ namespace moshushou
 
                 if (enteredSuccess)
                 {
-                    System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [成功] 标题验证通过，调用发送逻辑。");
                     return await performPasteAsync();
                 }
                 else
                 {
-                    System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [失败] ❌ 标题验证未通过，最后看到的标题: {lastTitleSeen}");
-                    Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = $"❌ 标题不符 ({lastTitleSeen})，停止。");
+                    Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = $"❌ 标题不符，停止。");
                     _lastEnteredGroupName = null;
                     return false;
                 }
             }
             catch (Exception ex)
             {
-                System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [异常] 💥 流程发生未捕获异常: {ex}");
                 Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = $"💥 流程异常: {ex.Message}");
                 return false;
             }
@@ -1506,91 +1585,145 @@ namespace moshushou
 
 
 
-        private async Task<bool> PasteExcelFileAsync(string storeName)
+
+        // MainWindow.xaml.cs
+
+        private async Task<bool> PasteExcelFileAsync(string storeName, bool isWework)
         {
+            Action<string> Log = (msg) => System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [粘贴文件] {msg}");
+            Log($"开始处理文件: {storeName}, isWework: {isWework}");
+
             if (string.IsNullOrEmpty(storeName)) return false;
 
             IntPtr targetHwnd = GetForegroundWindow();
-            if (!IsTargetChatWindow(targetHwnd, out string processName)) return false;
+            Log($"当前窗口句柄: {targetHwnd}");
 
             string filePath;
             lock (_dataLock) { if (!_exportedFilePaths.TryGetValue(storeName, out filePath)) return false; }
-            if (!File.Exists(filePath)) return false;
+            if (!File.Exists(filePath))
+            {
+                Log($"❌ 文件不存在: {filePath}");
+                return false;
+            }
 
-            // 剪贴板操作必须在 STA 线程 (UI线程)
+            // 剪贴板
+            Log("设置文件到剪贴板...");
             bool clipboardSuccess = await Application.Current.Dispatcher.InvokeAsync(() =>
             {
                 try
                 {
-                    var dataObject = new DataObject();
-                    dataObject.SetData(DataFormats.FileDrop, new string[] { filePath });
-                    Clipboard.SetDataObject(dataObject, true);
+                    var data = new DataObject();
+                    data.SetData(DataFormats.FileDrop, new string[] { filePath });
+                    Clipboard.SetDataObject(data, true);
                     return true;
                 }
-                catch { return false; }
+                catch (Exception ex)
+                {
+                    Log($"剪贴板异常: {ex.Message}");
+                    return false;
+                }
             });
 
-            if (!clipboardSuccess) return false;
+            if (!clipboardSuccess)
+            {
+                Log("❌ 剪贴板设置失败");
+                return false;
+            }
+            Log("剪贴板就绪");
 
             await Task.Delay(50);
 
-            // ✅ 【核心修复】同样进行 Task 解包
             var innerTask = await Application.Current.Dispatcher.InvokeAsync(async () =>
             {
-                IntPtr currentHwnd = GetForegroundWindow();
-                if (currentHwnd != targetHwnd) return false;
+                if (targetHwnd != GetForegroundWindow())
+                {
+                    Log("⚠️ 窗口失焦，抢回焦点...");
+                    RobustActivateWindow(targetHwnd);
+                    await Task.Delay(50);
+                }
+
+                int clickX, clickY;
+                if (_screenshotHelper.GetInputBoxClickCoordinates(targetHwnd, isWework, out clickX, out clickY))
+                {
+                    Log($"点击坐标: ({clickX}, {clickY})");
+                    SetCursorPos(clickX, clickY);
+                    mouse_event(MOUSEEVENTF_LEFTDOWN, clickX, clickY, 0, 0);
+                    mouse_event(MOUSEEVENTF_LEFTUP, clickX, clickY, 0, 0);
+                    await Task.Delay(50);
+                }
+                else
+                {
+                    Log("⚠️ 坐标计算失败");
+                }
 
                 bool result = false;
-
                 if (AutoSendCheckBox.IsChecked == true)
                 {
+                    Log("执行自动发送...");
                     result = await PasteAndVerifySendAsync(filePath, true);
                     if (result)
                     {
                         _currentItemPasted = true;
                         _lastPastedStoreName = storeName;
-                        _screenshotHelper.CaptureWindowTop(targetHwnd, storeName, processName, HandleOcrResult);
-                        StatusTextBlock.Text = $"✅ 已发送文件: {storeName}";
+                        StatusTextBlock.Text = $"✅ [自动] 已发送文件: {storeName}";
+                        Log("✅ 发送成功");
                     }
+                    else Log("❌ 发送失败");
                 }
                 else
                 {
+                    Log("执行手动粘贴...");
                     SimulatePaste();
-                    result = true;
+                    Log("Ctrl+V 已发送");
+                    StatusTextBlock.Text = $"📋 [自动] 已粘贴文件: {storeName}";
                     _currentItemPasted = true;
                     _lastPastedStoreName = storeName;
-                    StatusTextBlock.Text = $"✅ 已粘贴文件: {storeName}";
+                    result = true;
                 }
                 return result;
             });
 
-            // ⚠️ 等待结果
             return await innerTask;
         }
 
 
-
-
-        // ✅ [包装器] 兼容旧代码调用
+        // 兼容旧代码调用 (文件)
         private void PasteExcelFile(string storeName)
         {
-            _ = PasteExcelFileAsync(storeName);
+            bool isWework = "企业微信".Equals(_currentSelectedNode?.Source);
+            _ = PasteExcelFileAsync(storeName, isWework);
         }
 
 
 
-        private async Task<bool> PasteFullStoreInfoAsync(string storeName)
+        // MainWindow.xaml.cs
+
+        private async Task<bool> PasteFullStoreInfoAsync(string storeName, bool isWework)
         {
+            Action<string> Log = (msg) => System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [粘贴文本] {msg}");
+            Log($"开始处理商家: {storeName}, isWework: {isWework}");
+
             if (string.IsNullOrEmpty(storeName)) return false;
 
+            // 1. 窗口检查
             IntPtr targetHwnd = GetForegroundWindow();
-            if (!IsTargetChatWindow(targetHwnd, out string processName)) return false;
+            Log($"当前前台窗口句柄: {targetHwnd}");
 
-            // 准备数据
+            if (targetHwnd == IntPtr.Zero)
+            {
+                Log("❌ 无法获取前台窗口，取消粘贴");
+                return false;
+            }
+
+            // 2. 数据准备
             List<string> trackingNumbers;
             lock (_dataLock)
             {
-                if (!_storeData.TryGetValue(storeName, out trackingNumbers)) return false;
+                if (!_storeData.TryGetValue(storeName, out trackingNumbers))
+                {
+                    Log("❌ 未找到商家数据");
+                    return false;
+                }
                 trackingNumbers = trackingNumbers.ToList();
             }
 
@@ -1600,59 +1733,95 @@ namespace moshushou
             sb.AppendLine(FIXED_MESSAGE);
             string fullText = sb.ToString();
 
-            // 尝试复制到剪贴板
-            if (!await SetClipboardWithRetryAsync(fullText)) return false;
+            // 3. 剪贴板
+            Log("正在设置剪贴板...");
+            if (!await SetClipboardWithRetryAsync(fullText))
+            {
+                Log("❌ 剪贴板设置失败");
+                return false;
+            }
+            Log("剪贴板设置成功");
 
             await Task.Delay(50);
 
-            // ✅ 【核心修复】先获取内部的 Task，再 await 它
+            // 4. UI线程操作
             var innerTask = await Application.Current.Dispatcher.InvokeAsync(async () =>
             {
-                IntPtr currentHwnd = GetForegroundWindow();
-                // 再次检查焦点，如果焦点跑了，直接算失败
-                if (currentHwnd != targetHwnd) return false;
+                // 焦点复查
+                if (targetHwnd != GetForegroundWindow())
+                {
+                    Log($"⚠️ 窗口失焦 (当前: {GetForegroundWindow()})，尝试抢回...");
+                    RobustActivateWindow(targetHwnd);
+                    await Task.Delay(50);
+                }
 
+                // 5. 坐标计算与点击
+                int clickX = 0, clickY = 0;
+                bool gotCoords = _screenshotHelper.GetInputBoxClickCoordinates(targetHwnd, isWework, out clickX, out clickY);
+                Log($"获取点击坐标: {gotCoords}, X={clickX}, Y={clickY}");
+
+                if (gotCoords)
+                {
+                    Log($"执行鼠标点击: ({clickX}, {clickY})");
+                    SetCursorPos(clickX, clickY);
+                    mouse_event(MOUSEEVENTF_LEFTDOWN, clickX, clickY, 0, 0);
+                    mouse_event(MOUSEEVENTF_LEFTUP, clickX, clickY, 0, 0);
+                    await Task.Delay(50);
+                }
+                else
+                {
+                    Log("⚠️ 无法计算坐标 (可能窗口最小化或句柄无效)");
+                }
+
+                // 6. 粘贴与发送
                 bool result = false;
-
                 if (AutoSendCheckBox.IsChecked == true)
                 {
-                    // 严密验证版发送
+                    Log("模式: 自动发送");
+                    // 注意：PasteAndVerifySendAsync 内部日志未在此处展示，需确保该函数也正常
                     result = await PasteAndVerifySendAsync(fullText, false);
-
                     if (result)
                     {
                         _currentItemPasted = true;
                         _lastPastedStoreName = storeName;
-                        _screenshotHelper.CaptureWindowTop(targetHwnd, storeName, processName, HandleOcrResult);
-                        StatusTextBlock.Text = $"✅ 已发送: {storeName}";
+                        StatusTextBlock.Text = $"✅ [自动] 已发送: {storeName}";
+                        Log("✅ 发送流程完成 (PasteAndVerifySendAsync 返回 true)");
+                    }
+                    else
+                    {
+                        Log("❌ 发送流程失败 (PasteAndVerifySendAsync 返回 false)");
                     }
                 }
                 else
                 {
-                    // 未开启自动发送，只粘贴就算成功
+                    Log("模式: 手动发送 (仅粘贴)");
                     SimulatePaste();
-                    result = true;
+                    Log("已模拟 Ctrl+V");
+
+                    StatusTextBlock.Text = $"📋 [自动] 已粘贴: {storeName} (等待发送)";
                     _currentItemPasted = true;
                     _lastPastedStoreName = storeName;
-                    StatusTextBlock.Text = $"✅ 已粘贴: {storeName} (未开启自动发送)";
+                    result = true;
                 }
 
                 return result;
             });
 
-            // ⚠️ 这里是修复的关键：等待内部的 Task 完成并返回 bool
             return await innerTask;
         }
 
 
 
-        // ✅ [包装器] 兼容旧代码调用 (如右键菜单/普通快捷键)
+
+
+
+        // 兼容旧代码调用 (文本)
         private void PasteFullStoreInfo(string storeName)
         {
-            _ = PasteFullStoreInfoAsync(storeName);
+            // 尝试推断，如果无法推断默认 false 或根据实际情况
+            bool isWework = "企业微信".Equals(_currentSelectedNode?.Source);
+            _ = PasteFullStoreInfoAsync(storeName, isWework);
         }
-
-
 
 
 
@@ -1741,14 +1910,48 @@ namespace moshushou
         }
 
 
+
         private void LoadAndProcessExcel(string filePath)
         {
+            // 1. 清除内存中的旧数据
             lock (_dataLock)
             {
                 _storeData.Clear();
                 _exportedFilePaths.Clear();
             }
 
+            // ✅ [新增] 清空 ExportedFiles 目录，防止旧文件残留
+            try
+            {
+                if (Directory.Exists(_exportDirectory))
+                {
+                    string[] files = Directory.GetFiles(_exportDirectory);
+                    foreach (string file in files)
+                    {
+                        try
+                        {
+                            File.Delete(file);
+                        }
+                        catch (Exception delEx)
+                        {
+                            // 如果某个文件被占用无法删除，跳过并记录调试信息
+                            System.Diagnostics.Debug.WriteLine($"[警告] 无法删除旧文件 '{file}': {delEx.Message}");
+                        }
+                    }
+                }
+                else
+                {
+                    // 如果目录不存在，顺便创建它
+                    Directory.CreateDirectory(_exportDirectory);
+                }
+            }
+            catch (Exception ex)
+            {
+                // 不让清理失败影响主流程，只做记录
+                System.Diagnostics.Debug.WriteLine($"[警告] 清理导出目录失败: {ex.Message}");
+            }
+
+            // 2. 开始读取新文件
             try
             {
                 using (var package = new ExcelPackage(new FileInfo(filePath)))
@@ -1759,11 +1962,25 @@ namespace moshushou
                         throw new InvalidOperationException("Excel文件或工作表为空");
                     }
 
+                    // ✅ [保留修复] 本地辅助函数：防止长数字变成科学计数法
+                    string GetSafeText(object cellValue)
+                    {
+                        if (cellValue == null) return string.Empty;
+
+                        // 如果是数字类型，强制格式化为不带指数的字符串
+                        if (cellValue is double || cellValue is decimal || cellValue is float || cellValue is long || cellValue is int)
+                        {
+                            return string.Format("{0:0.#############################}", cellValue);
+                        }
+                        return cellValue.ToString();
+                    }
+
                     int rowCount = worksheet.Dimension.End.Row;
                     for (int row = 2; row <= rowCount; row++)
                     {
-                        string trackingNumber = worksheet.Cells[row, 1].Text?.Trim() ?? string.Empty;
-                        string storeName = worksheet.Cells[row, 2].Text?.Trim() ?? string.Empty;
+                        // 读取并清洗数据
+                        string trackingNumber = GetSafeText(worksheet.Cells[row, 1].Value).Trim();
+                        string storeName = GetSafeText(worksheet.Cells[row, 2].Value).Trim();
 
                         if (string.IsNullOrEmpty(trackingNumber) || string.IsNullOrEmpty(storeName)) continue;
 
@@ -1778,10 +1995,11 @@ namespace moshushou
                     }
                 }
 
-                // ✅ 加载新文件时重置选中状态
+                // 重置选中状态，避免指向不存在的旧索引
                 _currentSelectedIndex = -1;
                 _currentSelectedNode = null;
 
+                // 处理并显示数据
                 ProcessAndDisplayData();
             }
             catch (Exception ex)
@@ -1793,6 +2011,8 @@ namespace moshushou
                 });
             }
         }
+
+
 
 
         /// <summary>

@@ -141,14 +141,38 @@ namespace moshushou
             }
         }
 
+
+
+        // SearchHelper.cs
+
         private void PerformSearchSequence()
         {
+            // 1. 激活搜索框
             _inputSimulator.Keyboard.ModifiedKeyStroke(VirtualKeyCode.CONTROL, VirtualKeyCode.VK_F);
-            Thread.Sleep(_config.DelayAfterCtrlF);
+            Thread.Sleep(Math.Max(_config.DelayAfterCtrlF, 100)); // ⏳ 稍微加大等待
+
+            // 2. 🛡️ 防御性清空：先发一个 Backspace，防止 Ctrl+A 没选中
+            // 如果焦点在输入框，这会删掉一个字；如果焦点在列表，这没副作用
+            _inputSimulator.Keyboard.KeyPress(VirtualKeyCode.BACK);
+            Thread.Sleep(30);
+
+            // 3. 全选并清空
             _inputSimulator.Keyboard.ModifiedKeyStroke(VirtualKeyCode.CONTROL, VirtualKeyCode.VK_A);
-            Thread.Sleep(_config.DelayKeyboardAction);
+            Thread.Sleep(50);
+            _inputSimulator.Keyboard.KeyPress(VirtualKeyCode.BACK); // 🔥 显式删除，比直接粘贴更稳
+            Thread.Sleep(50);
+
+            // 4. 粘贴新内容
             _inputSimulator.Keyboard.ModifiedKeyStroke(VirtualKeyCode.CONTROL, VirtualKeyCode.VK_V);
+            Thread.Sleep(100);
+
+            // 5. ⚡ 触发搜索列表 (空格+退格大法)
+            _inputSimulator.Keyboard.KeyPress(VirtualKeyCode.SPACE);
+            Thread.Sleep(50);
+            _inputSimulator.Keyboard.KeyPress(VirtualKeyCode.BACK);
+            Thread.Sleep(150); // 等待列表渲染
         }
+
 
         private bool SetClipboardWithRetry(string text)
         {
