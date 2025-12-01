@@ -55,6 +55,9 @@ namespace moshushou
 
 
 
+        // ✅ 新增：定义取消令牌源
+        private CancellationTokenSource _searchCts;
+
         // 微信/企业微信切换状态
         private bool _isWeworkTurn = true;
 
@@ -700,8 +703,10 @@ namespace moshushou
         }
 
 
+
+
         /// <summary>
-        /// ✅ [修复版] 将失败项移动到列表最末尾（同级），并选中下一项
+        /// ✅ [修复版] 修复了移除节点导致索引归零的 Bug
         /// </summary>
         private void MoveCurrentToFailureNode()
         {
@@ -711,20 +716,26 @@ namespace moshushou
             // 如果当前没有选中，或者选中的是失败归档节点本身，则不处理
             if (node == null || node == _failureNode || node.StoreName == "FAIL_SEPARATOR") return;
 
-            // 1. 从主列表 (_treeViewCollection) 中移除当前项
+            // 🔒 1. 关键修复：在修改列表前，先锁定并记住当前的逻辑索引
+            // 因为 Remove 操作可能会触发 UI 事件把 _currentSelectedIndex 变成 0
+            int targetSlotIndex = _currentSelectedIndex;
+
+            // 2. 从主列表 (_treeViewCollection) 中移除当前项并添加到末尾
             if (_treeViewCollection.Contains(node))
             {
-                _treeViewCollection.Remove(node);
-
-                // 3. ✅ 【修改点】不再添加到 Children，而是添加到主列表的最末尾
+                _treeViewCollection.Remove(node); // 这里可能会触发 SelectedItemChanged，但我们不在乎了
                 _treeViewCollection.Add(node);
             }
 
-            // 4. 重建扁平列表 (因为顺序变了，必须重新生成索引)
+            // 3. 重建扁平列表 (确保列表数据是最新的)
             RebuildFlatNodeList();
 
+            // 🔒 4. 关键修复：强制恢复正确的索引
+            // 无论刚才 UI 事件把索引改成了什么，我们都把它改回原本的槽位
+            _currentSelectedIndex = targetSlotIndex;
+
             // 5. 修正索引：防止越界
-            // 因为刚刚移除了一个元素，当前位置的元素索引可能变了，或者后面没有元素了
+            // 因为刚刚移除了一个元素，如果原本是最后一个，现在需要指向新的最后一个（即刚刚移过去的那个）
             if (_currentSelectedIndex >= _flatNodeList.Count)
             {
                 _currentSelectedIndex = _flatNodeList.Count - 1;
@@ -746,25 +757,23 @@ namespace moshushou
             this.Focus();
             SetForegroundWindow(_windowHandle);
 
-            // B. 更新引用
-            // 注意：我们要找的不是刚刚移到末尾的那个 node，而是原本位置替补上来的 nextNode
-            // 此时 _currentSelectedIndex 指向的位置就是替补上位的新节点（因为旧的被移走了）
+            // B. 使用恢复后的正确索引获取节点
             if (_currentSelectedIndex >= 0 && _currentSelectedIndex < _flatNodeList.Count)
             {
+                // 获取当前槽位上的新节点（即原本排在这个节点后面的那一位）
                 var nextNode = _flatNodeList[_currentSelectedIndex];
 
                 // 如果当前索引指向的正好是我们刚刚移到末尾的那个节点（说明已经循环一圈了，或者后面没得选了）
                 if (nextNode == node)
                 {
-                    // 尝试找列表里的第一个“非重试”节点，或者干脆停止
-                    // 这里简单处理：如果下一项就是刚刚移走的自己，说明列表只有这一个了，或者都处理完了
+                    // 保持选中自己，或者在这里加入停止逻辑
                     _currentSelectedNode = nextNode;
                 }
                 else
                 {
                     // 选中新的替补节点
                     FocusAndSelectItem(nextNode);
-                    _currentSelectedNode = nextNode; // 👈 更新指针，让下一轮循环处理新的人
+                    _currentSelectedNode = nextNode; // 👈 更新指针，继续处理下一位
                 }
             }
             else
@@ -773,42 +782,55 @@ namespace moshushou
             }
         }
 
+
         #endregion
 
 
 
-
-        // MainWindow.xaml.cs
-
-        // 增加一个静态锁对象 (或者使用类成员变量)
-        private static readonly SemaphoreSlim _manualLock = new SemaphoreSlim(1, 1);
-
         private async Task SmartAdvanceOrSearchAsync()
         {
-            // 1. 🔒 立即尝试获取锁，如果正在处理中，直接忽略本次按键
-            if (!await _manualLock.WaitAsync(0))
+            // 1. ✅ 取消上一次正在进行的任务 (如果存在)
+            if (_searchCts != null)
             {
-                System.Diagnostics.Debug.WriteLine("⚠️ 操作太快，忽略本次 Ctrl+Enter");
-                return;
+                _searchCts.Cancel();
+                _searchCts.Dispose();
+                _searchCts = null;
+
+                // 🔥 关键优化：如果是人为打断（想快速切APP），则立即手动切换轮询状态
+                // 这样你按一次是微信，觉得不对马上按第二次就是企微，不需要等它搜完
+                if (_currentSelectedNode != null && string.IsNullOrEmpty(_currentSelectedNode.GroupName))
+                {
+                    _isWeworkTurn = !_isWeworkTurn; // 强制翻转
+                    string nextApp = _isWeworkTurn ? "企业微信" : "微信";
+                    StatusTextBlock.Text = $"⏭️ [切换] 正在转搜: {nextApp}...";
+                }
+                else
+                {
+                    StatusTextBlock.Text = "⏭️ [中断] 正在重新启动...";
+                }
             }
+
+            // 2. 创建新的令牌
+            _searchCts = new CancellationTokenSource();
+            var token = _searchCts.Token;
 
             try
             {
+                // 使用 Dispatcher 确保 UI 访问安全
                 await Application.Current.Dispatcher.InvokeAsync(async () =>
                 {
-                    // ... 这里的逻辑保持不变 ...
                     if (_currentSelectedNode == null || string.IsNullOrEmpty(_currentSelectedNode.StoreName))
                     {
                         StatusTextBlock.Text = "⚠️ 请先选择一个商家";
                         return;
                     }
 
-                    // 智能前进判断逻辑 (保持不变)
+                    // 智能前进判断逻辑 (保持原样)
                     string currentStoreName = _currentSelectedNode.StoreName;
                     if (_currentItemPasted && _lastPastedStoreName == currentStoreName)
                     {
                         StatusTextBlock.Text = "⏭️ [手动] 前进到下一项...";
-                        await Task.Delay(50);
+                        // 注意：NavigateTreeView 是同步的，如果需要支持取消，这里其实很快，通常不用改
                         NavigateTreeView(1);
 
                         if (_currentSelectedNode == null || string.IsNullOrEmpty(_currentSelectedNode.StoreName))
@@ -818,7 +840,9 @@ namespace moshushou
                         }
                         _currentItemPasted = false;
                         _lastPastedStoreName = null;
-                        await Task.Delay(100);
+
+                        // 给一点时间让UI刷新，支持取消
+                        try { await Task.Delay(100, token); } catch (TaskCanceledException) { return; }
                     }
                     else
                     {
@@ -827,18 +851,248 @@ namespace moshushou
                         _lastPastedStoreName = null;
                     }
 
-                    // 调用核心方法
-                    await ManualSmartProcessAsync();
+                    // 3. ✅ 调用处理函数，传入 token
+                    await ManualSmartProcessAsync(token);
                 });
             }
-            finally
+            catch (OperationCanceledException)
             {
-                // 🔓 释放锁，允许下一次操作
-                _manualLock.Release();
+                // 任务被新的按键取消了，这是正常现象
+                System.Diagnostics.Debug.WriteLine("上一次搜索已被用户手动打断。");
+            }
+            catch (Exception ex)
+            {
+                StatusTextBlock.Text = $"❌ 错误: {ex.Message}";
             }
         }
 
+        private async Task ManualSmartProcessAsync(CancellationToken token)
+        {
+            // 1. 基础检查
+            if (_currentSelectedNode == null) return;
 
+            // 2. 🛡️ 净化环境：释放按键
+            try
+            {
+                _inputSimulator.Keyboard.KeyUp(VirtualKeyCode.CONTROL);
+                _inputSimulator.Keyboard.KeyUp(VirtualKeyCode.RETURN);
+            }
+            catch { }
+
+            // 3. ♻️ 调用核心逻辑 (传入 token)
+            // 注意：SearchCurrentItemAsync 的签名也需要修改
+            bool success = await SearchCurrentItemAsync(false, token);
+
+            // 原来的轮询切换逻辑已移除，由 SmartAdvanceOrSearchAsync 在按键打断时接管
+            if (!success && token.IsCancellationRequested)
+            {
+                // 如果是被取消的，什么都不做，直接退出
+                return;
+            }
+        }
+        /// <summary>
+        /// ✅ [自动模式核心] 支持取消令牌 (CancellationToken)
+        /// </summary>
+        private async Task<bool> SearchCurrentItemAsync(bool isAutoMode = false, CancellationToken token = default)
+        {
+            // 🔍 [调试日志]
+            System.Diagnostics.Debug.WriteLine($"\n[{DateTime.Now:HH:mm:ss.fff}] ============== [调试] 开始搜索流程 ==============");
+
+            // 1. 获取数据快照
+            string storeName = null;
+            string groupName = null;
+            string source = null;
+            bool isFileNode = false;
+
+            await Application.Current.Dispatcher.InvokeAsync(() =>
+            {
+                if (_currentSelectedNode != null)
+                {
+                    storeName = _currentSelectedNode.StoreName;
+                    groupName = _currentSelectedNode.GroupName;
+                    source = _currentSelectedNode.Source;
+                    isFileNode = _currentSelectedNode.IsFileNode;
+                }
+            });
+
+            if (string.IsNullOrEmpty(storeName)) return false;
+
+            var snapshot = new
+            {
+                StoreName = storeName,
+                GroupName = groupName?.Trim(),
+                SearchText = !string.IsNullOrEmpty(groupName) ? groupName.Trim() : storeName.Trim(),
+                HasGroupName = !string.IsNullOrEmpty(groupName),
+                IsWework = !string.IsNullOrEmpty(groupName) ? "企业微信".Equals(source) : _isWeworkTurn
+            };
+
+            string appName = snapshot.IsWework ? "企业微信" : "微信";
+            Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = $"🔍 正在 [{appName}] 搜索: {snapshot.SearchText}...");
+
+            // 定义粘贴动作
+            Func<Task<bool>> performPasteAsync = async () =>
+            {
+                if (isFileNode)
+                    return await PasteExcelFileAsync(snapshot.StoreName, snapshot.IsWework);
+                else
+                    return await PasteFullStoreInfoAsync(snapshot.StoreName, snapshot.IsWework);
+            };
+
+            try
+            {
+                // ✅ 检查取消
+                if (token.IsCancellationRequested) return false;
+
+                // --------------------------------------------------------
+                // 🚀 1. 极速模式 (略微简化展示，关键是加入 ActivateWindow 的等待)
+                // --------------------------------------------------------
+                if (snapshot.HasGroupName && snapshot.SearchText == _lastEnteredGroupName)
+                {
+                    // ... (省略部分日志) ...
+
+                    bool activateResult = false;
+                    if (_lastChatWindowHandle != IntPtr.Zero)
+                        activateResult = RobustActivateWindow(_lastChatWindowHandle);
+                    else
+                        activateResult = RobustActivateWindow(GetForegroundWindow());
+
+                    // ✅ 延时支持取消
+                    try { await Task.Delay(100, token); } catch (TaskCanceledException) { return false; }
+
+                    IntPtr checkHwnd = GetForegroundWindow();
+                    string titleText = await _screenshotHelper.GetWeChatWindowTitleTextAsync(checkHwnd, snapshot.IsWework);
+
+                    if (_screenshotHelper.IsFuzzyMatch(snapshot.SearchText, titleText))
+                    {
+                        Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = $"⚡ [极速] 验证通过，直接发送。");
+                        return await performPasteAsync();
+                    }
+                    else
+                    {
+                        Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = "⚠️ 窗口不符，转常规搜索...");
+                        _lastEnteredGroupName = null;
+                        _lastChatWindowHandle = IntPtr.Zero;
+                    }
+                }
+
+                // ============================================================
+                // 🔍 2. 常规搜索模式
+                // ============================================================
+
+                // ✅ 检查取消
+                if (token.IsCancellationRequested) return false;
+
+                IntPtr mainHwnd = GetForegroundWindow();
+                if (!RobustActivateWindow(mainHwnd)) return false;
+
+                // 执行搜索
+                bool autoSearchSuccess = await Task.Run(() => _searchHelper.SearchInApp(snapshot.SearchText, snapshot.IsWework));
+                if (!autoSearchSuccess) return false;
+
+                Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = "👀 [自动] 验证搜索列表...");
+
+                // ✅ 延时支持取消
+                try { await Task.Delay(200, token); } catch (TaskCanceledException) { return false; }
+
+                // --------------------------------------------------------
+                // 🔥 步骤 A: 搜索列表 OCR 验证
+                // --------------------------------------------------------
+                IntPtr searchHwnd = GetForegroundWindow();
+                bool isListMatch = false;
+
+                for (int i = 0; i < 3; i++)
+                {
+                    // ✅ 循环中检查取消
+                    if (token.IsCancellationRequested) return false;
+
+                    isListMatch = await _screenshotHelper.CheckSearchResultAsync(searchHwnd, snapshot.SearchText, snapshot.IsWework);
+                    if (isListMatch) break;
+
+                    if (i < 2)
+                    {
+                        try { await Task.Delay(800, token); } catch (TaskCanceledException) { return false; }
+                    }
+                }
+
+                if (!isListMatch)
+                {
+                    Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = "❌ 搜索列表超时或未找到目标，停止。");
+                    return false;
+                }
+
+                // --------------------------------------------------------
+                // 🔥 步骤 B: 直接回车
+                // --------------------------------------------------------
+                if (token.IsCancellationRequested) return false;
+
+                RobustActivateWindow(searchHwnd);
+
+                try { await Task.Delay(50, token); } catch (TaskCanceledException) { return false; }
+                _inputSimulator.Keyboard.KeyPress(VirtualKeyCode.RETURN);
+                try { await Task.Delay(100, token); } catch (TaskCanceledException) { return false; }
+
+                // --------------------------------------------------------
+                // 🔥 步骤 C: 进群验证
+                // --------------------------------------------------------
+                IntPtr chatHwnd = GetForegroundWindow();
+                if (chatHwnd == IntPtr.Zero) return false;
+
+                bool enteredSuccess = false;
+                string cleanTarget = snapshot.SearchText.Replace(" ", "").ToLower();
+
+                for (int i = 0; i < 6; i++)
+                {
+                    // ✅ 循环中检查取消 - 这里的取消能让你快速切到下一个APP
+                    if (token.IsCancellationRequested) return false;
+
+                    string rawTitle = await _screenshotHelper.GetWeChatWindowTitleTextAsync(chatHwnd, snapshot.IsWework);
+                    string cleanTitle = System.Text.RegularExpressions.Regex.Replace(rawTitle ?? "", @"\(\d+.*?\)|（\d+.*?）|\(外部\)|（外部）|\s+", "").ToLower();
+
+                    bool isMatch = false;
+                    if (_screenshotHelper.IsFuzzyMatch(snapshot.SearchText, rawTitle)) isMatch = true;
+                    else if (cleanTitle.Contains(cleanTarget) || (cleanTarget.Contains(cleanTitle) && cleanTitle.Length > 2)) isMatch = true;
+                    // ... (其他匹配逻辑略) ...
+
+                    if (isMatch)
+                    {
+                        enteredSuccess = true;
+                        Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = $"✅ [自动] 确认进入: {rawTitle}");
+                        if (snapshot.HasGroupName)
+                        {
+                            _lastEnteredGroupName = snapshot.SearchText;
+                            _lastChatWindowHandle = chatHwnd;
+                        }
+                        break;
+                    }
+
+                    // ✅ 延时支持取消
+                    try { await Task.Delay(200, token); } catch (TaskCanceledException) { return false; }
+                }
+
+                if (enteredSuccess)
+                {
+                    // 粘贴前最后检查一次
+                    if (token.IsCancellationRequested) return false;
+                    return await performPasteAsync();
+                }
+                else
+                {
+                    Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = $"❌ 标题不符，停止。");
+                    _lastEnteredGroupName = null;
+                    return false;
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                // 任务被取消，静默返回 false
+                return false;
+            }
+            catch (Exception ex)
+            {
+                Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = $"💥 流程异常: {ex.Message}");
+                return false;
+            }
+        }
 
         private async Task ManualSmartProcessAsync()
         {
