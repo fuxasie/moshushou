@@ -1,0 +1,27 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 18
+VisualStudioVersion = 18.3.11206.111 d18.3
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "moshushou", "moshushou\moshushou.csproj", "{64CEB289-024D-4252-AC3A-BA2F874428AA}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "解决方案项", "解决方案项", "{44B9D0E7-F85B-4C1C-98A5-A8720AF8F334}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{64CEB289-024D-4252-AC3A-BA2F874428AA}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{64CEB289-024D-4252-AC3A-BA2F874428AA}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{64CEB289-024D-4252-AC3A-BA2F874428AA}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{64CEB289-024D-4252-AC3A-BA2F874428AA}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {EA066B49-4929-48DA-8DB6-B26138FD89C2}
+	EndGlobalSection
+EndGlobal

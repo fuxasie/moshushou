@@ -38,6 +38,8 @@ namespace moshushou
         private List<string> _currentFilter = new List<string>();
         private readonly ScreenshotHelper _screenshotHelper;
 
+
+
         // 全局快捷键相关
         private const int WM_HOTKEY = 0x0312;
         private const int HOTKEY_UP = 9001;
@@ -49,6 +51,8 @@ namespace moshushou
         private IntPtr _windowHandle;
         private HwndSource _source;
         private bool _globalHotkeysRegistered = false;
+
+
 
 
         // 微信/企业微信切换状态
@@ -94,7 +98,23 @@ namespace moshushou
         private const uint VK_F1 = 0x70;
         private const uint VK_F2 = 0x71;
 
+        private const int SW_RESTORE = 9;
+        private const int SW_SHOW = 5;
 
+
+
+        // 核心：线程挂接 API
+        [DllImport("user32.dll")]
+        private static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
+
+        [DllImport("user32.dll")]
+        private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
+        [DllImport("kernel32.dll")]
+        private static extern uint GetCurrentThreadId();
+
+        [DllImport("user32.dll")]
+        private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
 
         [DllImport("user32.dll")]
         [return: MarshalAs(UnmanagedType.Bool)]
@@ -123,8 +143,7 @@ namespace moshushou
         private static extern bool IsIconic(IntPtr hWnd); // 判断窗口是否最小化
 
 
-        [DllImport("user32.dll", SetLastError = true)]
-        static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
 
         [DllImport("user32.dll")]
         private static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
@@ -150,6 +169,21 @@ namespace moshushou
 
         // 修饰键
         private const uint MOD_CONTROL = 0x0002;
+
+
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern int GetWindowLong(IntPtr hWnd, int nIndex);
+
+        [DllImport("user32.dll")]
+        private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+
+        private const int GWL_EXSTYLE = -20;
+        private const int WS_EX_TOPMOST = 0x00000008;
+        private static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
+        private const uint SWP_NOMOVE = 0x0002;
+        private const uint SWP_NOSIZE = 0x0001;
+        private const uint SWP_SHOWWINDOW = 0x0040;
 
         public MainWindow()
         {
@@ -279,9 +313,109 @@ namespace moshushou
 
 
 
+        /// <summary>
+        /// 终极窗口激活：置顶 + 还原 + 线程挂接夺权
+        /// </summary>
+        private bool RobustActivateWindow(IntPtr targetHwnd)
+        {
+            if (targetHwnd == IntPtr.Zero) return false;
+
+            // 1. 【视觉层】智能置顶：保证 OCR 不被遮挡
+            // 直接复用你刚才写的 EnsureWindowTopMost 方法
+            EnsureWindowTopMost(targetHwnd);
+
+            // 2. 【状态层】检查是否最小化，如果是则还原
+            if (IsIconic(targetHwnd))
+            {
+                ShowWindow(targetHwnd, SW_RESTORE);
+                System.Threading.Thread.Sleep(200); // 还原动画需要时间
+            }
+            else
+            {
+                ShowWindow(targetHwnd, SW_SHOW);
+            }
+
+            // 3. 【逻辑层】使用 AttachThreadInput 强行夺取焦点
+            uint currentThreadId = GetCurrentThreadId();
+            uint targetThreadId = GetWindowThreadProcessId(targetHwnd, out _);
+
+            if (currentThreadId != targetThreadId)
+            {
+                try
+                {
+                    // A. 挂接线程：告诉系统我们是一家人
+                    AttachThreadInput(currentThreadId, targetThreadId, true);
+
+                    // B. 夺取前景：此时系统不会拦截
+                    SetForegroundWindow(targetHwnd);
+
+                    // C. 焦点兜底：有些控件需要显式 Focus
+                    // SetFocus(targetHwnd); // 需要引入 API，通常 SetForegroundWindow 够用了
+
+                    // D. 循环确认：确保真的激活了
+                    int retries = 0;
+                    while (GetForegroundWindow() != targetHwnd && retries < 10)
+                    {
+                        SetForegroundWindow(targetHwnd);
+                        System.Threading.Thread.Sleep(50);
+                        retries++;
+                    }
+                }
+                finally
+                {
+                    // E. 脱钩：操作完必须解绑，否则会卡死
+                    AttachThreadInput(currentThreadId, targetThreadId, false);
+                }
+            }
+            else
+            {
+                // 同线程直接激活
+                SetForegroundWindow(targetHwnd);
+            }
+
+            return GetForegroundWindow() == targetHwnd;
+        }
 
 
 
+        /// <summary>
+        /// ✅ [智能置顶] 检查窗口状态，仅在未置顶时执行置顶操作
+        /// </summary>
+        private void EnsureWindowTopMost(IntPtr hwnd)
+        {
+            if (hwnd == IntPtr.Zero) return;
+
+            try
+            {
+                // 获取窗口当前的扩展样式
+                int exStyle = GetWindowLong(hwnd, GWL_EXSTYLE);
+
+                // 判断是否已经包含 TOPMOST 属性
+                bool isTopMost = (exStyle & WS_EX_TOPMOST) != 0;
+
+                if (!isTopMost)
+                {
+                    // 只有未置顶时，才执行置顶，避免重复操作
+                    SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+
+                    // 给一点时间让系统反应
+                    System.Threading.Thread.Sleep(50);
+                    System.Diagnostics.Debug.WriteLine($"[窗口优化] 检测到未置顶，已强制置顶: {hwnd}");
+                }
+                else
+                {
+                    // 已经是置顶状态，无需操作，直接返回
+                    // System.Diagnostics.Debug.WriteLine($"[窗口优化] 窗口已置顶，跳过设置: {hwnd}");
+                }
+
+                // 双重保险：无论是否刚设置过，都请求一次前台激活
+                SetForegroundWindow(hwnd);
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"置顶操作异常: {ex.Message}");
+            }
+        }
 
 
 
@@ -512,13 +646,13 @@ namespace moshushou
                         StatusTextBlock.Text += " [成功] 下一条...";
                         NavigateTreeView(1);
                     });
-                    await Task.Delay(800);
+                    
                 }
                 else
                 {
                     // ❌ 失败分支
                     await Application.Current.Dispatcher.InvokeAsync(() => StatusTextBlock.Text += " [失败] 移入重试区...");
-                    await Task.Delay(800);
+                   
 
                     await Application.Current.Dispatcher.InvokeAsync(() =>
                     {
@@ -672,16 +806,13 @@ namespace moshushou
             });
         }
 
-
         /// <summary>
-        /// ✅ [乱序匹配增强版] SearchCurrentItemAsync
-        /// 修复点：
-        /// 1. 针对 "ID在前名字在后" vs "名字在前ID在后" 的情况，增加了【字符重合度检查】。
-        /// 2. 只要核心字符都在，无视顺序，视为匹配。
+        /// ✅ [乱序匹配增强版 + 详细日志 + 强力激活修复]
         /// </summary>
         private async Task<bool> SearchCurrentItemAsync(bool isAutoMode = false)
         {
-            System.Diagnostics.Debug.WriteLine($"\n============== [调试] 开始搜索流程 ==============");
+            // 🔍 [调试日志] 流程开始
+            System.Diagnostics.Debug.WriteLine($"\n[{DateTime.Now:HH:mm:ss.fff}] ============== [调试] 开始搜索流程 ==============");
 
             // 1. 获取数据快照
             string storeName = null;
@@ -700,7 +831,11 @@ namespace moshushou
                 }
             });
 
-            if (string.IsNullOrEmpty(storeName)) return false;
+            if (string.IsNullOrEmpty(storeName))
+            {
+                System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [错误] 商家名为空，流程中止。");
+                return false;
+            }
 
             var snapshot = new
             {
@@ -712,10 +847,13 @@ namespace moshushou
             };
 
             string appName = snapshot.IsWework ? "企业微信" : "微信";
+
+            System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [快照] 目标应用:{appName}, 搜索词:{snapshot.SearchText}, 有群名:{snapshot.HasGroupName}, 上次群名:{_lastEnteredGroupName ?? "无"}");
             Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = $"🔍 正在 [{appName}] 搜索: {snapshot.SearchText}...");
 
             Func<Task<bool>> performPasteAsync = async () =>
             {
+                System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [动作] 准备执行粘贴/发送任务...");
                 if (isFileNode) return await PasteExcelFileAsync(snapshot.StoreName);
                 else return await PasteFullStoreInfoAsync(snapshot.StoreName);
             };
@@ -725,87 +863,150 @@ namespace moshushou
                 // --------------------------------------------------------
                 // 🚀 1. 极速模式
                 // --------------------------------------------------------
+                // 只有配置了群名，且群名与上次一致时才触发（保留原逻辑限制）
                 if (snapshot.HasGroupName && snapshot.SearchText == _lastEnteredGroupName)
                 {
+                    System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [极速] 命中同名群条件，开始视觉验证...");
                     Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = "👀 [极速] 检测同名群...");
+
+                    // ✅ [修复点1]：视觉保障 - 强力激活窗口确保能OCR到
+                    bool activateResult = false;
                     if (_lastChatWindowHandle != IntPtr.Zero)
                     {
-                        SetForegroundWindow(_lastChatWindowHandle);
-                        await Task.Delay(250);
+                        activateResult = RobustActivateWindow(_lastChatWindowHandle);
+                        System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [极速] 激活上次窗口句柄({_lastChatWindowHandle}): {activateResult}");
                     }
+                    else
+                    {
+                        activateResult = RobustActivateWindow(GetForegroundWindow());
+                        System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [极速] 激活当前前台窗口: {activateResult}");
+                    }
+
+                    // 给一点时间让窗口重绘，防止截到残影
+                    await Task.Delay(100);
+
                     IntPtr checkHwnd = GetForegroundWindow();
                     string titleText = await _screenshotHelper.GetWeChatWindowTitleTextAsync(checkHwnd, snapshot.IsWework);
+
+                    System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [极速] OCR标题结果: '{titleText}'");
 
                     // 极速模式下也使用 IsFuzzyMatch (已包含基础弹性)
                     if (_screenshotHelper.IsFuzzyMatch(snapshot.SearchText, titleText))
                     {
+                        System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [极速] ✅ 验证通过，跳过搜索步骤。");
                         Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = $"⚡ [极速] 验证通过，直接发送。");
-                        await Task.Delay(200);
                         return await performPasteAsync();
                     }
                     else
                     {
+                        System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [极速] ❌ 验证失败 (OCR不符)，转入常规搜索。");
                         Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = "⚠️ 窗口不符，转常规搜索...");
                         _lastEnteredGroupName = null;
                         _lastChatWindowHandle = IntPtr.Zero;
                     }
+                }
+                else
+                {
+                    System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [常规] 不满足极速模式条件，开始常规流程。");
                 }
 
                 // ============================================================
                 // 🔍 2. 常规搜索模式
                 // ============================================================
 
-                if (!CheckWindowReady(GetForegroundWindow(), "开始搜索")) return false;
+                // 此时需要先确保焦点在微信上，才能进行 Ctrl+F
+                IntPtr mainHwnd = GetForegroundWindow();
+                if (!RobustActivateWindow(mainHwnd)) // 使用强力激活替代 CheckWindowReady
+                {
+                    System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [错误] 初始激活窗口失败。");
+                    return false;
+                }
 
-                if (!await SetClipboardWithRetryAsync(snapshot.SearchText)) return false;
+                if (!await SetClipboardWithRetryAsync(snapshot.SearchText))
+                {
+                    System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [错误] 剪贴板设置失败。");
+                    return false;
+                }
                 await Task.Delay(50);
 
+                System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [动作] 执行 Ctrl+F 搜索逻辑...");
                 bool autoSearchSuccess = await Task.Run(() => _searchHelper.SearchInApp(snapshot.SearchText, snapshot.IsWework));
-                if (!autoSearchSuccess) return false;
+                if (!autoSearchSuccess)
+                {
+                    System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [错误] SearchHelper 返回失败。");
+                    return false;
+                }
 
                 Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = "👀 [自动] 验证搜索列表...");
-                await Task.Delay(800);
+                // 原来的死等 800ms 可以适当保留或减小，因为下面有循环重试
+                await Task.Delay(200);
 
                 // --------------------------------------------------------
-                // 🔥 步骤 A: 搜索列表 OCR 验证
+                // 🔥 步骤 A: 搜索列表 OCR 验证 (增强重试版)
                 // --------------------------------------------------------
                 IntPtr searchHwnd = GetForegroundWindow();
-                bool isListMatch = await _screenshotHelper.CheckSearchResultAsync(searchHwnd, snapshot.SearchText, snapshot.IsWework);
+                bool isListMatch = false;
 
-                if (!isListMatch)
+                // ✅ [修复点2]：循环重试，解决“搜太快结果没出来就判死刑”的问题
+                for (int i = 0; i < 3; i++)
                 {
-                    System.Diagnostics.Debug.WriteLine("[调试] 初次列表OCR失败，重试...");
-                    await Task.Delay(600);
+                    System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [验证] 检查搜索结果列表 (第 {i + 1}/3 次)...");
+
                     isListMatch = await _screenshotHelper.CheckSearchResultAsync(searchHwnd, snapshot.SearchText, snapshot.IsWework);
+
+                    if (isListMatch)
+                    {
+                        System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [验证] ✅ 列表匹配成功！");
+                        break;
+                    }
+
+                    if (i < 2) // 如果不是最后一次，就等待重试
+                    {
+                        System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [验证] 列表OCR未通过，等待800ms结果渲染...");
+                        Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = $"⏳ 结果未显示，重试 {i + 1}/3...");
+                        await Task.Delay(800); // 给微信反应时间
+                    }
                 }
 
                 if (!isListMatch)
                 {
-                    Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = "❌ 搜索列表未找到目标群，停止。");
+                    System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [错误] ❌ 3次尝试后列表验证均失败，流程停止。");
+                    Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = "❌ 搜索列表超时或未找到目标，停止。");
                     return false;
                 }
 
                 // --------------------------------------------------------
                 // 🔥 步骤 B: 直接回车
                 // --------------------------------------------------------
-                System.Diagnostics.Debug.WriteLine("[调试] 列表验证通过，回车进入...");
-                SetForegroundWindow(searchHwnd);
+                System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [动作] 列表验证通过，准备回车进入...");
+
+                // ✅ [修复点3]：强力激活，防止回车键被遮挡吞掉
+                if (!RobustActivateWindow(searchHwnd))
+                {
+                    System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [警告] 回车前无法强力激活窗口，可能会漏发。");
+                }
+                else
+                {
+                    System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [状态] 窗口已强力激活，发送回车。");
+                }
+
                 await Task.Delay(50);
                 _inputSimulator.Keyboard.KeyPress(VirtualKeyCode.RETURN);
-                await Task.Delay(800);
+                await Task.Delay(100); // 进群需要一点时间
 
                 // --------------------------------------------------------
                 // 🔥 步骤 C: 进群后的二次标题验证 (抗乱序增强版)
                 // --------------------------------------------------------
 
                 IntPtr chatHwnd = GetForegroundWindow();
-                if (!CheckWindowReady(chatHwnd, "进群验证")) return false;
+                if (!CheckWindowReady(chatHwnd, "进群验证")) return false; // 这里也可以换成 RobustActivateWindow，看需求
 
                 bool enteredSuccess = false;
                 string lastTitleSeen = "";
 
                 // 预处理目标词：去掉空格，转小写
                 string cleanTarget = snapshot.SearchText.Replace(" ", "").ToLower();
+                System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [验证] 开始进群标题验证，目标清洗后: '{cleanTarget}'");
 
                 for (int i = 0; i < 6; i++)
                 {
@@ -815,7 +1016,7 @@ namespace moshushou
                     // 1. 基础去噪
                     string cleanTitle = System.Text.RegularExpressions.Regex.Replace(rawTitle, @"\(\d+.*?\)|（\d+.*?）|\(外部\)|（外部）|\s+", "").ToLower();
 
-                    System.Diagnostics.Debug.WriteLine($"[调试] 标题验证 ({i + 1}): '{cleanTitle}' vs '{cleanTarget}'");
+                    System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [调试] 标题验证 ({i + 1}/6): 原文='{rawTitle}' -> 清洗='{cleanTitle}'");
 
                     bool isMatch = false;
 
@@ -823,16 +1024,17 @@ namespace moshushou
                     if (_screenshotHelper.IsFuzzyMatch(snapshot.SearchText, rawTitle))
                     {
                         isMatch = true;
+                        System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [匹配] 规则1(模糊) 命中。");
                     }
                     // 规则2: 包含关系 (原有逻辑)
                     else if (cleanTitle.Contains(cleanTarget) || (cleanTarget.Contains(cleanTitle) && cleanTitle.Length > 2))
                     {
                         isMatch = true;
+                        System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [匹配] 规则2(包含) 命中。");
                     }
-                    // 🔥 规则3:【新增】字符乱序重合度检查 (解决 ID在前名字在后 vs ID在后名字在前)
+                    // 🔥 规则3: 字符乱序重合度检查
                     else
                     {
-                        // 统计 target 里有多少字符在 title 里出现了
                         int matchCount = 0;
                         foreach (char c in cleanTarget)
                         {
@@ -842,14 +1044,12 @@ namespace moshushou
                         double overlapRate = 0;
                         if (cleanTarget.Length > 0) overlapRate = (double)matchCount / cleanTarget.Length;
 
-                        System.Diagnostics.Debug.WriteLine($"[调试] 字符重合度: {overlapRate:P0} ({matchCount}/{cleanTarget.Length})");
+                        System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [调试] 乱序重合度: {overlapRate:P2} ({matchCount}/{cleanTarget.Length})");
 
-                        // 如果超过 80% 的字符都对上了，哪怕顺序不对，也认为是同一个群
-                        // (例如: "tb123张三" vs "张三tb123"，重合度是 100%)
                         if (overlapRate > 0.8)
                         {
                             isMatch = true;
-                            System.Diagnostics.Debug.WriteLine($"[调试] ✅ 触发乱序重合匹配！");
+                            System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [匹配] ✅ 触发乱序重合匹配！");
                         }
                     }
 
@@ -861,6 +1061,7 @@ namespace moshushou
                         {
                             _lastEnteredGroupName = snapshot.SearchText;
                             _lastChatWindowHandle = chatHwnd;
+                            System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [记录] 更新极速模式记录: {_lastEnteredGroupName}");
                         }
                         break;
                     }
@@ -869,10 +1070,12 @@ namespace moshushou
 
                 if (enteredSuccess)
                 {
+                    System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [成功] 标题验证通过，调用发送逻辑。");
                     return await performPasteAsync();
                 }
                 else
                 {
+                    System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [失败] ❌ 标题验证未通过，最后看到的标题: {lastTitleSeen}");
                     Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = $"❌ 标题不符 ({lastTitleSeen})，停止。");
                     _lastEnteredGroupName = null;
                     return false;
@@ -880,6 +1083,7 @@ namespace moshushou
             }
             catch (Exception ex)
             {
+                System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [异常] 💥 流程发生未捕获异常: {ex}");
                 Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = $"💥 流程异常: {ex.Message}");
                 return false;
             }
@@ -890,8 +1094,12 @@ namespace moshushou
         {
             IntPtr targetHwnd = GetForegroundWindow();
 
-            // 🛑 1. 准备阶段：严格检查（还没发呢，必须窗口要在）
-            if (!CheckWindowReady(targetHwnd, "准备发送")) return false;
+            if (!RobustActivateWindow(targetHwnd))
+            {
+                Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = "❌ 窗口无法激活，发送中止");
+                return false;
+            }
+
 
             // 获取窗口坐标
             if (!GetWindowRect(targetHwnd, out RECT rect)) return false;
