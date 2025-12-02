@@ -54,7 +54,8 @@ namespace moshushou
 
 
 
-
+        // 【新增】用于记录已经进入过重试流程的商家，防止无限循环
+        private HashSet<string> _failedStores = new HashSet<string>();
         // ✅ 新增：定义取消令牌源
         private CancellationTokenSource _searchCts;
 
@@ -625,29 +626,34 @@ namespace moshushou
                     // A. 焦点自救
                     if (_currentSelectedNode == null && _currentSelectedIndex >= 0 && _currentSelectedIndex < _flatNodeList.Count)
                     {
-                        StatusTextBlock.Text = "⚠️ 检测到焦点丢失，正在尝试恢复...";
                         var rescueNode = _flatNodeList[_currentSelectedIndex];
                         FocusAndSelectItem(rescueNode);
                         _currentSelectedNode = rescueNode;
                     }
 
+                    // ✅ [新增] 遇到分隔符自动跳过
+                    if (_currentSelectedNode != null && _currentSelectedNode.StoreName == "FAIL_SEPARATOR")
+                    {
+                        StatusTextBlock.Text = "⬇️ 进入自动重试区...";
+                        NavigateTreeView(1); // 跳到分隔符的下一位（即重试区的第一个）
+                                             // 此时直接 return 跳出本次 invoke，主循环会进入下一轮直接处理新选中的项
+                        return;
+                    }
+
                     // B. 检查是否到达列表末尾
-                    if (_currentSelectedNode == null ||
-                        _currentSelectedNode == _failureNode ||
-                        _currentSelectedNode.StoreName == "FAIL_SEPARATOR")
+                    if (_currentSelectedNode == null)
                     {
                         StatusTextBlock.Text = "🏁 列表已处理完毕，自动化停止。";
                         shouldStop = true;
                         return;
                     }
 
-                    // 🛑 C. [仅自动模式] 检查是否有群名
-                    // 如果没有群名，认为到了未配置区域，自动模式必须停下来，防止乱发
+                    // C. 检查是否有群名 (重试区如果没有群名也得停)
                     if (string.IsNullOrEmpty(_currentSelectedNode.GroupName))
                     {
                         StatusTextBlock.Text = $"🛑 商家 '{_currentSelectedNode.StoreName}' 无群名，自动停止。";
-                        FocusAndSelectItem(_currentSelectedNode); // 选中它提示用户
                         shouldStop = true;
+                        FocusAndSelectItem(_currentSelectedNode);
                         return;
                     }
                 });
@@ -658,42 +664,70 @@ namespace moshushou
                     break;
                 }
 
+                // ⚠️ 双重检查：如果刚才刚好跳过了分隔符，_currentSelectedNode 可能变了，
+                // 虽然理论上循环回来会处理，但为了安全起见，如果当前是空（比如分隔符是最后一个），则在下一次循环停止。
+                if (_currentSelectedNode == null || _currentSelectedNode.StoreName == "FAIL_SEPARATOR")
+                {
+                    await Task.Delay(100);
+                    continue;
+                }
+
                 // 2. 核心处理
                 bool success = await SearchCurrentItemAsync(true);
 
                 if (!_isAutoRunning) break;
 
-                if (success)
+                await Application.Current.Dispatcher.InvokeAsync(() =>
                 {
-                    // ✅ 成功分支
-                    await Application.Current.Dispatcher.InvokeAsync(() =>
-                    {
-                        if (WindowState == WindowState.Minimized) WindowState = WindowState.Normal;
-                        this.Activate();
-                        this.Focus();
-                        SetForegroundWindow(_windowHandle);
+                    // 抢回前台
+                    if (WindowState == WindowState.Minimized) WindowState = WindowState.Normal;
+                    this.Activate();
+                    this.Focus();
+                    SetForegroundWindow(_windowHandle);
 
+                    if (success)
+                    {
+                        // ✅ 成功分支：直接处理下一条
                         StatusTextBlock.Text += " [成功] 下一条...";
                         NavigateTreeView(1);
-                    });
-                    
-                }
-                else
-                {
-                    // ❌ 失败分支
-                    await Application.Current.Dispatcher.InvokeAsync(() => StatusTextBlock.Text += " [失败] 移入重试区...");
-                   
-
-                    await Application.Current.Dispatcher.InvokeAsync(() =>
+                    }
+                    else
                     {
-                        if (WindowState == WindowState.Minimized) WindowState = WindowState.Normal;
-                        this.Activate();
-                        this.Focus();
-                        SetForegroundWindow(_windowHandle);
-                        MoveCurrentToFailureNode();
-                    });
-                    await Task.Delay(500);
-                }
+                        // ❌ 失败分支：进行逻辑分流
+                        var node = _currentSelectedNode;
+                        if (node != null)
+                        {
+                            if (_failedStores.Contains(node.StoreName))
+                            {
+                                // --- 情况 B: 已经是重试项了（第二次失败） ---
+                                StatusTextBlock.Text += " [重试失败] 标记需人工...";
+
+                                // 视觉标记：加前缀（如果还没有的话）
+                                if (!node.Header.StartsWith("❌"))
+                                {
+                                    node.Header = "❌ [需人工] " + node.Header;
+                                }
+
+                                // 不再移动，直接前往下一条，让自动化继续跑完剩下的
+                                NavigateTreeView(1);
+                            }
+                            else
+                            {
+                                // --- 情况 A: 第一次失败 ---
+                                StatusTextBlock.Text += " [初次失败] 移入重试区...";
+
+                                // 1. 记入名单
+                                _failedStores.Add(node.StoreName);
+
+                                // 2. 移动到末尾 (MoveCurrentToFailureNode 会自动处理索引，使其指向当前位置的替补者)
+                                MoveCurrentToFailureNode();
+                            }
+                        }
+                    }
+                });
+
+                // 失败时稍作停顿
+                if (!success) await Task.Delay(500);
             }
 
             await Application.Current.Dispatcher.InvokeAsync(() =>
@@ -705,75 +739,56 @@ namespace moshushou
 
 
 
-        /// <summary>
-        /// ✅ [修复版] 修复了移除节点导致索引归零的 Bug
-        /// </summary>
         private void MoveCurrentToFailureNode()
         {
             // 此方法必须在 UI 线程调用
             var node = _currentSelectedNode;
 
-            // 如果当前没有选中，或者选中的是失败归档节点本身，则不处理
+            // 校验
             if (node == null || node == _failureNode || node.StoreName == "FAIL_SEPARATOR") return;
 
-            // 🔒 1. 关键修复：在修改列表前，先锁定并记住当前的逻辑索引
-            // 因为 Remove 操作可能会触发 UI 事件把 _currentSelectedIndex 变成 0
+            // 🔒 锁定索引：因为我们即将把当前项移走，当前位置会被“下一项”填补
+            // 所以我们不需要改变 _currentSelectedIndex，它自然就会指向“下一项”
             int targetSlotIndex = _currentSelectedIndex;
 
-            // 2. 从主列表 (_treeViewCollection) 中移除当前项并添加到末尾
+            // 从集合中移除并添加到末尾
             if (_treeViewCollection.Contains(node))
             {
-                _treeViewCollection.Remove(node); // 这里可能会触发 SelectedItemChanged，但我们不在乎了
-                _treeViewCollection.Add(node);
+                _treeViewCollection.Remove(node); // 移除当前
+                _treeViewCollection.Add(node);    // 加到最后
             }
 
-            // 3. 重建扁平列表 (确保列表数据是最新的)
+            // 重建扁平索引
             RebuildFlatNodeList();
 
-            // 🔒 4. 关键修复：强制恢复正确的索引
-            // 无论刚才 UI 事件把索引改成了什么，我们都把它改回原本的槽位
+            // 恢复索引
             _currentSelectedIndex = targetSlotIndex;
 
-            // 5. 修正索引：防止越界
-            // 因为刚刚移除了一个元素，如果原本是最后一个，现在需要指向新的最后一个（即刚刚移过去的那个）
+            // 边界修正
             if (_currentSelectedIndex >= _flatNodeList.Count)
             {
                 _currentSelectedIndex = _flatNodeList.Count - 1;
             }
-
-            // 如果列表空了（全移完了），归位
             if (_flatNodeList.Count == 0)
             {
                 _currentSelectedIndex = -1;
             }
 
-            // =========================================================
-            // 🛑 防止死循环核心：抢回焦点 并 指向替补上来的新节点
-            // =========================================================
-
-            // A. 抢回窗口焦点
-            if (WindowState == WindowState.Minimized) WindowState = WindowState.Normal;
-            this.Activate();
-            this.Focus();
-            SetForegroundWindow(_windowHandle);
-
-            // B. 使用恢复后的正确索引获取节点
+            // 选中当前槽位的新节点（即原本排在后面的那个）
             if (_currentSelectedIndex >= 0 && _currentSelectedIndex < _flatNodeList.Count)
             {
-                // 获取当前槽位上的新节点（即原本排在这个节点后面的那一位）
                 var nextNode = _flatNodeList[_currentSelectedIndex];
 
-                // 如果当前索引指向的正好是我们刚刚移到末尾的那个节点（说明已经循环一圈了，或者后面没得选了）
+                // 如果只剩下一个节点，或者我们移走的是最后一个，nextNode可能就是它自己
                 if (nextNode == node)
                 {
-                    // 保持选中自己，或者在这里加入停止逻辑
+                    // 这种情况下，说明这已经是最后一项了（或者后面就是分隔符），让Loop去处理分隔符逻辑
                     _currentSelectedNode = nextNode;
                 }
                 else
                 {
-                    // 选中新的替补节点
                     FocusAndSelectItem(nextNode);
-                    _currentSelectedNode = nextNode; // 👈 更新指针，继续处理下一位
+                    _currentSelectedNode = nextNode;
                 }
             }
             else
@@ -781,8 +796,6 @@ namespace moshushou
                 _currentSelectedNode = null;
             }
         }
-
-
         #endregion
 
 
@@ -2522,11 +2535,11 @@ namespace moshushou
         /// <summary>
         /// ✅ [修改版] 处理显示数据，并初始化“失败归档区”
         /// </summary>
+
         private void ProcessAndDisplayData()
         {
             List<KeyValuePair<string, List<string>>> sortedStores;
 
-            // ... (原有的排序逻辑保持不变) ...
             var infoMap = _businessInfoList.GroupBy(b => b.StoreName).ToDictionary(g => g.Key, g => g.FirstOrDefault());
 
             lock (_dataLock)
@@ -2553,7 +2566,19 @@ namespace moshushou
                 sortedStores = sortedStores.Where(kvp => _currentFilter.Any(filter => kvp.Key.Contains(filter, StringComparison.OrdinalIgnoreCase))).ToList();
             }
 
-            // ✅ 改动：使用 ObservableCollection
+            // ✅ [关键逻辑] 将数据拆分为“正常组”和“重试组”
+            var normalList = new List<KeyValuePair<string, List<string>>>();
+            var failedList = new List<KeyValuePair<string, List<string>>>();
+
+            foreach (var item in sortedStores)
+            {
+                if (_failedStores.Contains(item.Key))
+                    failedList.Add(item);
+                else
+                    normalList.Add(item);
+            }
+
+            // 初始化新的集合
             _treeViewCollection = new ObservableCollection<TreeViewNode>();
 
             try
@@ -2566,15 +2591,17 @@ namespace moshushou
                 return;
             }
 
-            foreach (var kvp in sortedStores)
+            // --- 内部辅助函数：创建节点 ---
+            TreeViewNode CreateNode(string storeName, List<string> trackingNumbers)
             {
-                string storeName = kvp.Key;
-                var trackingNumbers = kvp.Value;
                 var parentNode = new TreeViewNode
                 {
                     Header = $"{storeName} ({trackingNumbers.Count}条)",
                     StoreName = storeName
                 };
+
+                // 如果已经在失败名单中（即重试区），可以在这里预先加个标记，或者等跑失败了再加
+                // 这里为了保持整洁，暂不加前缀，依靠 AutoProcessLoop 运行时动态加
 
                 var busInfo = infoMap.ContainsKey(storeName) ? infoMap[storeName] : null;
                 if (busInfo != null)
@@ -2605,29 +2632,39 @@ namespace moshushou
                         parentNode.Children.Add(new TreeViewNode { Text = number });
                     }
                 }
-                _treeViewCollection.Add(parentNode);
+                return parentNode;
             }
 
-            // ✅ 新增：在尾部添加“发送失败”分隔符节点
+            // 1. 先添加正常列表
+            foreach (var kvp in normalList)
+            {
+                _treeViewCollection.Add(CreateNode(kvp.Key, kvp.Value));
+            }
+
+            // 2. 添加分隔符 (始终存在，作为自动化流程的界碑)
             _failureNode = new TreeViewNode
             {
-                Header = "========== 🚫 发送失败/待重试 ==========",
+                Header = "========== 🚫 自动重试区 ==========",
                 StoreName = "FAIL_SEPARATOR",
-                Children = new ObservableCollection<TreeViewNode>() // 初始化子容器
+                Children = new ObservableCollection<TreeViewNode>() // 空子集
             };
             _treeViewCollection.Add(_failureNode);
 
+            // 3. 后添加失败/重试列表
+            foreach (var kvp in failedList)
+            {
+                _treeViewCollection.Add(CreateNode(kvp.Key, kvp.Value));
+            }
+
             Application.Current.Dispatcher.Invoke(() =>
             {
-                // ✅ 绑定新的集合
                 StoreTreeView.ItemsSource = _treeViewCollection;
-
                 RebuildFlatNodeList();
+
                 string filterInfo = _currentFilter.Count > 0 ? $"（已筛选 {_currentFilter.Count} 个关键词）" : "";
                 StatusTextBlock.Text = $"处理完成，共显示 {sortedStores.Count} 个商家{filterInfo}";
             });
         }
-
 
 
 
@@ -2702,7 +2739,8 @@ namespace moshushou
         }
 
 
-    
+
+
         private void DeleteStoreButton_Click(object sender, RoutedEventArgs e)
         {
             if (sender is Button button && button.Tag is string storeName)
@@ -2711,6 +2749,9 @@ namespace moshushou
                 {
                     _storeData.Remove(storeName);
                     _exportedFilePaths.Remove(storeName);
+
+                    // ✅ [新增] 删除商家时，同步清理失败状态
+                    _failedStores.Remove(storeName);
                 }
                 ProcessAndDisplayData();
                 StatusTextBlock.Text = $"已删除商家: '{storeName}'";
