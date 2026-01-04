@@ -679,7 +679,8 @@ namespace moshushou
                 }
 
                 // 2. 核心处理
-                bool success = await SearchCurrentItemAsync(true);
+                // ✅ [修复] 调用带点击逻辑的版本（与 Ctrl+Enter 手动模式一致）
+                bool success = await SearchCurrentItemAsync(true, CancellationToken.None);
 
                 if (!_isAutoRunning) break;
 
@@ -1040,22 +1041,36 @@ namespace moshushou
                     // ✅ 循环中检查取消
                     if (token.IsCancellationRequested) return false;
 
-                    System.Diagnostics.Debug.WriteLine($"🔍 [MainWindow] CheckSearchResultAsync 开始验证... (第{i+1}次)");
-                    isListMatch = await _screenshotHelper.CheckSearchResultAsync(searchHwnd, snapshot.SearchText, snapshot.IsWework);
-                    System.Diagnostics.Debug.WriteLine($"🔍 [MainWindow] CheckSearchResultAsync 结果: {isListMatch}");
+                    System.Diagnostics.Debug.WriteLine($"🔍 [DEBUG_TRACE] 步骤A-验证列表(第{i+1}次), AutoMode={isAutoMode}");
+                    try 
+                    {
+                        isListMatch = await _screenshotHelper.CheckSearchResultAsync(searchHwnd, snapshot.SearchText, snapshot.IsWework);
+                        System.Diagnostics.Debug.WriteLine($"🔍 [DEBUG_TRACE] 步骤A-验证列表 返回: {isListMatch}");
+                    }
+                    catch (Exception ex)
+                    {
+                        System.Diagnostics.Debug.WriteLine($"💥 [DEBUG_TRACE] 步骤A 发生异常: {ex.ToString()}");
+                        // ❌ [修复] 必须使用 Dispatcher，否则后台线程会崩
+                        Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = $"💥 验证过程异常: {ex.Message}");
+                        return false;
+                    }
+
                     if (isListMatch) break;
 
                     if (i < 2)
                     {
-                        try { await Task.Delay(800, token); } catch (TaskCanceledException) { return false; }
+                         try { await Task.Delay(800, token); } catch (TaskCanceledException) { return false; }
                     }
                 }
 
                 if (!isListMatch)
                 {
+                    System.Diagnostics.Debug.WriteLine($"❌ [DEBUG_TRACE] 验证失败，准备退出。AutoMode={isAutoMode}");
                     Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = "❌ 搜索列表超时或未找到目标，停止。");
                     return false;
                 }
+
+                System.Diagnostics.Debug.WriteLine($"✅ [DEBUG_TRACE] 验证成功，准备进入点击流程... AutoMode={isAutoMode}");
 
                 // --------------------------------------------------------
                 // 🔥 步骤 B: OCR 动态定位 + 鼠标点击群聊 (优先方案)
@@ -1067,15 +1082,16 @@ namespace moshushou
                 await Task.Delay(300);
                 
                 IntPtr hwndForClick = GetForegroundWindow();
-                System.Diagnostics.Debug.WriteLine($"🔍 [MainWindow] 准备调用 FindGroupChatClickPositionAsync, hwnd={hwndForClick}, 目标='{snapshot.SearchText}', isWework={snapshot.IsWework}");
+                System.Diagnostics.Debug.WriteLine($"🔍 [DEBUG_TRACE] 准备调用 FindGroupChatClickPositionAsync, hwnd={hwndForClick}, 目标='{snapshot.SearchText}'");
+                
                 // 🔄 [重试机制] 增加重试以防列表渲染延迟导致"遗漏"
                 System.Drawing.Point? clickPos = null;
                 for (int ft = 0; ft < 3; ft++)
                 {
                     if (ft > 0)
                     {
-                        Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = $"⏳ [OCR] 定位重试 ({ft}/3)...");
-                        await Task.Delay(500, token); // 增加延迟等待列表稳定
+                        System.Diagnostics.Debug.WriteLine($"⏳ [DEBUG_TRACE] 定位重试 ({ft}/3)...");
+                        await Task.Delay(500, token); 
                     }
                     
                     clickPos = await _screenshotHelper.FindGroupChatClickPositionAsync(hwndForClick, snapshot.SearchText, snapshot.IsWework);
@@ -1084,7 +1100,7 @@ namespace moshushou
                     if (token.IsCancellationRequested) return false;
                 }
                 
-                System.Diagnostics.Debug.WriteLine($"🔍 [MainWindow] FindGroupChatClickPositionAsync (最终) 返回: {(clickPos.HasValue ? clickPos.Value.ToString() : "null")}");
+                System.Diagnostics.Debug.WriteLine($"🔍 [DEBUG_TRACE] FindGroupChatClickPositionAsync 返回: {(clickPos.HasValue ? clickPos.Value.ToString() : "null")}");
                 
                 bool enteredSuccess = false;
                 string cleanTarget = snapshot.SearchText.Replace(" ", "").ToLower();
@@ -1299,7 +1315,7 @@ namespace moshushou
             // 3. ♻️ 直接复用自动化的核心逻辑！
             // 核心优势：F1 怎么跑，这里就怎么跑。包含完整的：
             // 找窗口 -> 激活 -> 搜索(含防抖) -> OCR验证列表 -> 回车 -> OCR验证标题 -> 粘贴
-            bool success = await SearchCurrentItemAsync(false); // isAutoMode = false
+            bool success = await SearchCurrentItemAsync(false, CancellationToken.None); // isAutoMode = false
         }
 
 
@@ -1713,215 +1729,10 @@ namespace moshushou
 
 
 
-        // MainWindow.xaml.cs
-
-        /// <summary>
-        /// ✅ [自动模式核心] 乱序匹配增强版 + 详细日志 + 强力激活修复
-        /// </summary>
-        private async Task<bool> SearchCurrentItemAsync(bool isAutoMode = false)
-        {
-            // 🔍 [调试日志] 流程开始
-            System.Diagnostics.Debug.WriteLine($"\n[{DateTime.Now:HH:mm:ss.fff}] ============== [调试] 开始搜索流程 ==============");
-
-            // 1. 获取数据快照
-            string storeName = null;
-            string groupName = null;
-            string source = null;
-            bool isFileNode = false;
-
-            await Application.Current.Dispatcher.InvokeAsync(() =>
-            {
-                if (_currentSelectedNode != null)
-                {
-                    storeName = _currentSelectedNode.StoreName;
-                    groupName = _currentSelectedNode.GroupName;
-                    source = _currentSelectedNode.Source;
-                    isFileNode = _currentSelectedNode.IsFileNode;
-                }
-            });
-
-            if (string.IsNullOrEmpty(storeName))
-            {
-                System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [错误] 商家名为空，流程中止。");
-                return false;
-            }
-
-            var snapshot = new
-            {
-                StoreName = storeName,
-                GroupName = groupName?.Trim(),
-                SearchText = !string.IsNullOrEmpty(groupName) ? groupName.Trim() : storeName.Trim(),
-                HasGroupName = !string.IsNullOrEmpty(groupName),
-                // 判断目标是企微还是微信
-                IsWework = !string.IsNullOrEmpty(groupName) ? "企业微信".Equals(source) : _isWeworkTurn
-            };
-
-            string appName = snapshot.IsWework ? "企业微信" : "微信";
-
-            System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [快照] 目标应用:{appName}, 搜索词:{snapshot.SearchText}, 有群名:{snapshot.HasGroupName}, 上次群名:{_lastEnteredGroupName ?? "无"}");
-            Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = $"🔍 正在 [{appName}] 搜索: {snapshot.SearchText}...");
-
-            // ✅ 定义执行粘贴的动作 (这里修复了参数缺失报错)
-            Func<Task<bool>> performPasteAsync = async () =>
-            {
-                System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [动作] 准备执行粘贴/发送任务...");
-
-                // 关键修复：传入 snapshot.IsWework 参数
-                if (isFileNode)
-                    return await PasteExcelFileAsync(snapshot.StoreName, snapshot.IsWework);
-                else
-                    return await PasteFullStoreInfoAsync(snapshot.StoreName, snapshot.IsWework);
-            };
-
-            try
-            {
-                // --------------------------------------------------------
-                // 🚀 1. 极速模式
-                // --------------------------------------------------------
-                if (snapshot.HasGroupName && snapshot.SearchText == _lastEnteredGroupName)
-                {
-                    System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [极速] 命中同名群条件，开始视觉验证...");
-                    Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = "👀 [极速] 检测同名群...");
-
-                    bool activateResult = false;
-                    if (_lastChatWindowHandle != IntPtr.Zero)
-                    {
-                        activateResult = RobustActivateWindow(_lastChatWindowHandle);
-                    }
-                    else
-                    {
-                        activateResult = RobustActivateWindow(GetForegroundWindow());
-                    }
-
-                    await Task.Delay(100);
-
-                    IntPtr checkHwnd = GetForegroundWindow();
-                    string titleText = await _screenshotHelper.GetWeChatWindowTitleTextAsync(checkHwnd, snapshot.IsWework);
-
-                    if (_screenshotHelper.IsFuzzyMatch(snapshot.SearchText, titleText))
-                    {
-                        System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [极速] ✅ 验证通过，跳过搜索步骤。");
-                        Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = $"⚡ [极速] 验证通过，直接发送。");
-                        return await performPasteAsync();
-                    }
-                    else
-                    {
-                        System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [极速] ❌ 验证失败 (OCR不符)，转入常规搜索。");
-                        Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = "⚠️ 窗口不符，转常规搜索...");
-                        _lastEnteredGroupName = null;
-                        _lastChatWindowHandle = IntPtr.Zero;
-                    }
-                }
-
-                // ============================================================
-                // 🔍 2. 常规搜索模式
-                // ============================================================
-
-                IntPtr mainHwnd = GetForegroundWindow();
-                if (!RobustActivateWindow(mainHwnd))
-                {
-                    return false;
-                }
-
-                // 搜索 (SearchHelper 已包含空格退格修复)
-                // 执行搜索 (异步)
-                bool autoSearchSuccess = await _searchHelper.SearchInAppAsync(snapshot.SearchText, snapshot.IsWework, CancellationToken.None);
-                if (!autoSearchSuccess)
-                {
-                    return false;
-                }
-
-                Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = "👀 [自动] 验证搜索列表...");
-                await Task.Delay(200);
-
-                // --------------------------------------------------------
-                // 🔥 步骤 A: 搜索列表 OCR 验证
-                // --------------------------------------------------------
-                IntPtr searchHwnd = GetForegroundWindow();
-                bool isListMatch = false;
-
-                for (int i = 0; i < 3; i++)
-                {
-                    isListMatch = await _screenshotHelper.CheckSearchResultAsync(searchHwnd, snapshot.SearchText, snapshot.IsWework);
-                    if (isListMatch) break;
-                    if (i < 2) await Task.Delay(800);
-                }
-
-                if (!isListMatch)
-                {
-                    Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = "❌ 搜索列表超时或未找到目标，停止。");
-                    return false;
-                }
-
-                // --------------------------------------------------------
-                // 🔥 步骤 B: 直接回车
-                // --------------------------------------------------------
-                RobustActivateWindow(searchHwnd);
-                await Task.Delay(50);
-                _inputSimulator.Keyboard.KeyPress(VirtualKeyCode.RETURN);
-                await Task.Delay(100);
-
-                // --------------------------------------------------------
-                // 🔥 步骤 C: 进群验证
-                // --------------------------------------------------------
-
-                IntPtr chatHwnd = GetForegroundWindow();
-                // 简单检查窗口
-                if (chatHwnd == IntPtr.Zero) return false;
-
-                bool enteredSuccess = false;
-                string cleanTarget = snapshot.SearchText.Replace(" ", "").ToLower();
-
-                for (int i = 0; i < 6; i++)
-                {
-                    string rawTitle = await _screenshotHelper.GetWeChatWindowTitleTextAsync(chatHwnd, snapshot.IsWework);
-                    string cleanTitle = System.Text.RegularExpressions.Regex.Replace(rawTitle, @"\(\d+.*?\)|（\d+.*?）|\(外部\)|（外部）|\s+", "").ToLower();
-
-                    bool isMatch = false;
-
-                    if (_screenshotHelper.IsFuzzyMatch(snapshot.SearchText, rawTitle)) isMatch = true;
-                    else if (cleanTitle.Contains(cleanTarget) || (cleanTarget.Contains(cleanTitle) && cleanTitle.Length > 2)) isMatch = true;
-                    else
-                    {
-                        int matchCount = 0;
-                        foreach (char c in cleanTarget) if (cleanTitle.Contains(c)) matchCount++;
-                        double overlapRate = cleanTarget.Length > 0 ? (double)matchCount / cleanTarget.Length : 0;
-                        if (overlapRate > 0.8) isMatch = true;
-                    }
-
-                    if (isMatch)
-                    {
-                        enteredSuccess = true;
-                        Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = $"✅ [自动] 确认进入: {rawTitle}");
-                        if (snapshot.HasGroupName)
-                        {
-                            _lastEnteredGroupName = snapshot.SearchText;
-                            _lastChatWindowHandle = chatHwnd;
-                        }
-                        break;
-                    }
-                    await Task.Delay(200);
-                }
-
-                if (enteredSuccess)
-                {
-                    return await performPasteAsync();
-                }
-                else
-                {
-                    Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = $"❌ 标题不符，停止。");
-                    _lastEnteredGroupName = null;
-                    return false;
-                }
-            }
-            catch (Exception ex)
-            {
-                Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = $"💥 流程异常: {ex.Message}");
-                return false;
-            }
-        }
-
-
+        // ✅ [已删除简化版 SearchCurrentItemAsync]
+        // 原因：存在两个同名方法导致调用混乱
+        // 现在所有调用统一使用 SearchCurrentItemAsync(bool isAutoMode, CancellationToken token) 版本
+        // 该版本位于第 922 行，包含完整的 OCR 定位 + 鼠标点击逻辑
         private async Task<bool> PasteAndVerifySendAsync(string contentToSend, bool isFile)
         {
             IntPtr targetHwnd = GetForegroundWindow();

@@ -609,7 +609,8 @@ namespace moshushou
                     using (var scaledMap = ScaleImage(bitmap, 3))
                     {
                         var bytes = ImageToBytes(scaledMap);
-                        var tcs = new TaskCompletionSource<bool>();
+                        // ✅ [修复] 强制异步延续，防止 OCR 回调线程（非托管/临时）卡死后续逻辑
+                        var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
                         var ocr = new ImageOcr();
 
                         ocr.Run(bytes, (path, result) =>
@@ -758,6 +759,10 @@ namespace moshushou
                         });
 
                         var completedTask = await Task.WhenAny(tcs.Task, Task.Delay(8000));
+                        
+                        // ✅ [防止GC] 保持 ocr 对象存活，防止在回调回来之前被回收导致 native crash
+                        GC.KeepAlive(ocr);
+
                         if (completedTask == tcs.Task)
                         {
                             return await tcs.Task;
@@ -772,6 +777,10 @@ namespace moshushou
             {
                 _logAction?.Invoke($"💥 搜索验证出错: {ex.Message}");
                 return false;
+            }
+            finally
+            {
+                 System.Diagnostics.Debug.WriteLine("🏁 [DEBUG_TRACE] CheckSearchResultAsync 方法结束 (Finally)");
             }
         }
 
@@ -808,7 +817,8 @@ namespace moshushou
                     }
 
                     var bytes = ImageToBytes(bitmap);
-                    var tcs = new TaskCompletionSource<Point?>();
+                    // ✅ [修复] 强制异步延续
+                    var tcs = new TaskCompletionSource<Point?>(TaskCreationOptions.RunContinuationsAsynchronously);
                     var ocr = new ImageOcr();
 
                     ocr.Run(bytes, (path, result) =>
@@ -851,6 +861,9 @@ namespace moshushou
                     });
 
                     var completedTask = await Task.WhenAny(tcs.Task, Task.Delay(5000));
+                    
+                    GC.KeepAlive(ocr); // ✅ 防止过早回收
+
                     if (completedTask == tcs.Task) return await tcs.Task;
                     return null;
                 }
@@ -1008,7 +1021,8 @@ namespace moshushou
                         catch { }
 
                         var bytes = ImageToBytes(scaledBitmap);
-                        var tcs = new TaskCompletionSource<Point?>();
+                        // ✅ [修复] 强制异步延续
+                        var tcs = new TaskCompletionSource<Point?>(TaskCreationOptions.RunContinuationsAsynchronously);
                         var ocr = new ImageOcr();
 
                         ocr.Run(bytes, (path, result) =>
@@ -1313,6 +1327,9 @@ namespace moshushou
                         });
 
                         var completedTask = await Task.WhenAny(tcs.Task, Task.Delay(5000));
+                        
+                        GC.KeepAlive(ocr); // ✅ 防止过早回收
+
                         if (completedTask == tcs.Task) return await tcs.Task;
                         
                         _logAction?.Invoke("⚠️ [FindGroupChat] OCR 超时");
