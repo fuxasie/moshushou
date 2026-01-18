@@ -36,6 +36,8 @@ namespace moshushou
         private List<TreeViewNode> _flatNodeList = new List<TreeViewNode>();
         private TreeViewNode _currentSelectedNode = null;
         private List<string> _currentFilter = new List<string>();
+        // ✅ 新增：保存进入筛选前的选中项（用于清空筛选时恢复）
+        private string _preFilterSelectedStoreName = null;
         private readonly ScreenshotHelper _screenshotHelper;
 
 
@@ -85,7 +87,7 @@ namespace moshushou
         private IntPtr _lastChatWindowHandle = IntPtr.Zero; // <--- 新增行
 
         // 固定话术
-        private const string FIXED_MESSAGE = "现同步未发货预警，超时未交件会考核处罚，请尽快处理转出,已售后的及时发起拦截。（注：未处理售后请勿虚假拦截，核实虚假正常考核处罚。字节超时未发出总部将发起拦截）";
+        private const string FIXED_MESSAGE = "（以当前信息为准）现同步未发货预警，超时未交件会考核处罚，请尽快处理转出,已售后的及时发起拦截。（注：未处理售后请勿虚假拦截，核实虚假正常考核处罚。字节超时未发出总部将发起拦截）";
 
         // 商家信息
         private List<BusinessInfo> _businessInfoList = new List<BusinessInfo>();
@@ -341,17 +343,16 @@ namespace moshushou
 
 
         /// <summary>
-        /// 终极窗口激活：置顶 + 还原 + 线程挂接夺权
+        /// ✅ [优化版] 窗口激活：移除置顶和线程挂接，降低风控触发风险
         /// </summary>
         private bool RobustActivateWindow(IntPtr targetHwnd)
         {
             if (targetHwnd == IntPtr.Zero) return false;
 
-            // 1. 【视觉层】智能置顶：保证 OCR 不被遮挡
-            // 直接复用你刚才写的 EnsureWindowTopMost 方法
-            EnsureWindowTopMost(targetHwnd);
+            // ✅ [优化] 不再置顶，避免触发风控
+            // EnsureWindowTopMost(targetHwnd);
 
-            // 2. 【状态层】检查是否最小化，如果是则还原
+            // 【状态层】检查是否最小化，如果是则还原
             if (IsIconic(targetHwnd))
             {
                 ShowWindow(targetHwnd, SW_RESTORE);
@@ -362,43 +363,10 @@ namespace moshushou
                 ShowWindow(targetHwnd, SW_SHOW);
             }
 
-            // 3. 【逻辑层】使用 AttachThreadInput 强行夺取焦点
-            uint currentThreadId = GetCurrentThreadId();
-            uint targetThreadId = GetWindowThreadProcessId(targetHwnd, out _);
-
-            if (currentThreadId != targetThreadId)
-            {
-                try
-                {
-                    // A. 挂接线程：告诉系统我们是一家人
-                    AttachThreadInput(currentThreadId, targetThreadId, true);
-
-                    // B. 夺取前景：此时系统不会拦截
-                    SetForegroundWindow(targetHwnd);
-
-                    // C. 焦点兜底：有些控件需要显式 Focus
-                    // SetFocus(targetHwnd); // 需要引入 API，通常 SetForegroundWindow 够用了
-
-                    // D. 循环确认：确保真的激活了
-                    int retries = 0;
-                    while (GetForegroundWindow() != targetHwnd && retries < 10)
-                    {
-                        SetForegroundWindow(targetHwnd);
-                        System.Threading.Thread.Sleep(50);
-                        retries++;
-                    }
-                }
-                finally
-                {
-                    // E. 脱钩：操作完必须解绑，否则会卡死
-                    AttachThreadInput(currentThreadId, targetThreadId, false);
-                }
-            }
-            else
-            {
-                // 同线程直接激活
-                SetForegroundWindow(targetHwnd);
-            }
+            // ✅ [优化] 简化激活逻辑，不使用 AttachThreadInput
+            // 只调用一次 SetForegroundWindow，不循环重试
+            SetForegroundWindow(targetHwnd);
+            System.Threading.Thread.Sleep(100); // 给系统一点反应时间
 
             return GetForegroundWindow() == targetHwnd;
         }
@@ -711,6 +679,7 @@ namespace moshushou
 
                                 // ✅ [修复] 记录到人工名单
                                 _manualReviewStores.Add(node.StoreName);
+                                SaveFileState(); // ✅ 保存状态
 
                                 if (!node.Header.StartsWith("❌"))
                                 {
@@ -725,6 +694,7 @@ namespace moshushou
 
                                 _failedStores.Add(node.StoreName);
                                 MoveCurrentToFailureNode();
+                                SaveFileState(); // ✅ 保存状态
                             }
                         }
 
@@ -745,6 +715,19 @@ namespace moshushou
                 }
                 else
                 {
+                    // ✅ [新增] 失败时检测是否出现了“设备异常/需扫码”的安全验证
+                    bool isSecurityBlock = await CheckForSecurityVerificationAsync();
+                    if (isSecurityBlock)
+                    {
+                        _isAutoRunning = false;
+                        await Application.Current.Dispatcher.InvokeAsync(() => 
+                        {
+                             StatusTextBlock.Text = "🛑 [严重] 检测到需安全验证(扫码)，自动化紧急停止！";
+                            
+                        });
+                        break;
+                    }
+
                     await Task.Delay(500); // 失败后等待 500ms
                 }
             }
@@ -884,6 +867,62 @@ namespace moshushou
             catch (Exception ex)
             {
                 StatusTextBlock.Text = $"❌ 错误: {ex.Message}";
+            }
+        }
+
+        /// <summary>
+        /// ✅ [优化版] 检测企业微信是否已退出登录
+        /// 检测条件：1. 进程不存在  2. 无有效窗口  3. 出现登录窗口(WeChatLogin)
+        /// </summary>
+        private async Task<bool> CheckForSecurityVerificationAsync()
+        {
+            try
+            {
+                // 检测企业微信进程是否存在
+                var wxWorkProcesses = System.Diagnostics.Process.GetProcessesByName("WXWork");
+                
+                if (wxWorkProcesses.Length == 0)
+                {
+                    System.Diagnostics.Debug.WriteLine("[安全检测] ⛔ 企业微信进程不存在，需要停止");
+                    return true;
+                }
+
+                // ✅ [关键] 检测是否出现了登录窗口 (类名: WeChatLogin)
+                IntPtr loginWindowHandle = FindWindow("WeChatLogin", null);
+                if (loginWindowHandle != IntPtr.Zero)
+                {
+                    System.Diagnostics.Debug.WriteLine("[安全检测] ⛔ 检测到登录窗口 (WeChatLogin)，企业微信已退出登录！");
+                    return true;
+                }
+
+                // 检测企业微信主窗口是否存在且有效
+                bool hasValidWindow = false;
+                foreach (var process in wxWorkProcesses)
+                {
+                    try
+                    {
+                        if (process.MainWindowHandle != IntPtr.Zero)
+                        {
+                            hasValidWindow = true;
+                            System.Diagnostics.Debug.WriteLine($"[安全检测] ✅ 企业微信窗口存在: PID={process.Id}, Title='{process.MainWindowTitle}'");
+                            break;
+                        }
+                    }
+                    catch { }
+                }
+
+                if (!hasValidWindow)
+                {
+                    System.Diagnostics.Debug.WriteLine("[安全检测] ⛔ 企业微信进程存在但无有效窗口，可能已退出登录");
+                    return true;
+                }
+
+                return false;
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"[安全检测] 异常: {ex.Message}");
+                return false;
             }
         }
 
@@ -1078,8 +1117,8 @@ namespace moshushou
                 
                 Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = "🔍 [OCR] 正在定位群聊位置...");
                 
-                // ⏳ 关键：等待搜索下拉菜单完全显示
-                await Task.Delay(300);
+                // ⏳ 等待搜索下拉菜单显示 (优化 300 → 200ms)
+                await Task.Delay(200);
                 
                 IntPtr hwndForClick = GetForegroundWindow();
                 System.Diagnostics.Debug.WriteLine($"🔍 [DEBUG_TRACE] 准备调用 FindGroupChatClickPositionAsync, hwnd={hwndForClick}, 目标='{snapshot.SearchText}'");
@@ -1091,7 +1130,7 @@ namespace moshushou
                     if (ft > 0)
                     {
                         System.Diagnostics.Debug.WriteLine($"⏳ [DEBUG_TRACE] 定位重试 ({ft}/3)...");
-                        await Task.Delay(500, token); 
+                        await Task.Delay(300, token); 
                     }
                     
                     clickPos = await _screenshotHelper.FindGroupChatClickPositionAsync(hwndForClick, snapshot.SearchText, snapshot.IsWework);
@@ -1118,12 +1157,21 @@ namespace moshushou
                         
                         // 直接按回车进入
                         _inputSimulator.Keyboard.KeyPress(VirtualKeyCode.RETURN);
-                        await Task.Delay(400);
+                        await Task.Delay(300);
+                    }
+                    else if (snapshot.IsWework)
+                    {
+                        // ✅ [优化] 企业微信使用回车代替鼠标点击，降低风控触发风险
+                        Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = "⌨️ [企业微信] 使用回车进入群聊...");
+                        System.Diagnostics.Debug.WriteLine("⌨️ [MainWindow] 企业微信模式，使用回车代替鼠标点击");
+                        
+                        _inputSimulator.Keyboard.KeyPress(VirtualKeyCode.RETURN);
+                        await Task.Delay(300);
                     }
                     else
                     {
-                        // 正常坐标，执行鼠标点击
-                        Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = $"🖱️ [OCR] 点击坐标: ({clickX}, {clickY})");
+                        // 微信：正常坐标，执行鼠标点击
+                        Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = $"🖱️ [微信] 点击坐标: ({clickX}, {clickY})");
                         
                         SetCursorPos(clickX, clickY);
                         await Task.Delay(50);
@@ -1131,8 +1179,8 @@ namespace moshushou
                         await Task.Delay(30);
                         mouse_event(MOUSEEVENTF_LEFTUP, clickX, clickY, 0, 0);
                         
-                        // 等待窗口切换
-                        await Task.Delay(400);
+                        // 等待窗口切换 (优化 400 → 300ms)
+                        await Task.Delay(300);
                     }
                     
                     // 验证是否进入了正确的群聊
@@ -1735,6 +1783,20 @@ namespace moshushou
         // 该版本位于第 922 行，包含完整的 OCR 定位 + 鼠标点击逻辑
         private async Task<bool> PasteAndVerifySendAsync(string contentToSend, bool isFile)
         {
+            Action<string> Log = (msg) => System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [SendVerify] {msg}");
+            
+            // ✅ Fix: 如果是发送文本，必须在此处更新剪贴板，否则会重复粘贴上一次的文件
+            if (!isFile && !string.IsNullOrEmpty(contentToSend))
+            {
+                 bool copied = await SetClipboardWithRetryAsync(contentToSend);
+                 if (!copied)
+                 {
+                     Log("❌ [SendVerify] 设置剪贴板失败");
+                     return false; 
+                 }
+                 await Task.Delay(100); 
+            }
+
             IntPtr targetHwnd = GetForegroundWindow();
 
             if (!RobustActivateWindow(targetHwnd))
@@ -1753,10 +1815,20 @@ namespace moshushou
                 if (_currentSelectedNode != null) isWework = "企业微信".Equals(_currentSelectedNode.Source);
             });
 
-            // 计算输入框点击位置
-            int xOffset = 270 + 30 + (isWework ? 70 : 0);
-            int clickX = rect.Left + xOffset;
-            int clickY = rect.Bottom - 70;
+            // ✅ Fix: 使用 OCR 获取精准点击坐标，而不是硬编码
+            int clickX, clickY;
+            if (_screenshotHelper.GetInputBoxClickCoordinates(targetHwnd, isWework, out clickX, out clickY))
+            {
+                Log($"[SendVerify] OCR 锁定输入框坐标: ({clickX}, {clickY})");
+            }
+            else
+            {
+                // 兜底策略：如果 OCR 失败，回退到硬编码
+                int xOffset = 270 + 30 + (isWework ? 70 : 0);
+                clickX = rect.Left + xOffset;
+                clickY = rect.Bottom - 70;
+                Log($"⚠️ [SendVerify] OCR 失败，使用硬编码坐标: ({clickX}, {clickY})");
+            }
 
             // === 动作 A: 激活输入框并粘贴 ===
             SetCursorPos(clickX, clickY);
@@ -1784,23 +1856,10 @@ namespace moshushou
                 else keyword = contentToSend.Length > 8 ? contentToSend.Substring(0, 8) : contentToSend;
             }
 
-            // 3. 【验证A】粘贴快照
-            var resultPaste = await _screenshotHelper.CaptureSplitVerificationAsync(targetHwnd, isWework);
-
-            if (resultPaste.bottomText == null)
-            {
-                // 这里如果是截图失败，可能是窗口被挡住了，不判死刑，尝试盲发
-                Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = "⚠️ 无法截屏，尝试盲发...");
-            }
-            else
-            {
-                bool pasteHadText = _screenshotHelper.IsTextMatch(resultPaste.bottomText, keyword);
-                if (!pasteHadText)
-                {
-                    Debug.WriteLine($"[警告] 粘贴检测未通过。OCR结果: {resultPaste.bottomText}");
-                    Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = "⚠️ 粘贴文字模糊，尝试强行发送...");
-                }
-            }
+            // 3. 【优化】移除发送前的 OCR 粘贴检测
+            // 用户反馈该步骤拖慢速度且识别不准，直接跳过，依靠后续的“发送后验证”来确认
+            Log("🚀 [极速] 跳过粘贴OCR检测，准备直接发送...");
+            await Task.Delay(100); // 虽然跳过检测，还是留给 UI 极短的渲染反应时间，防止粘贴指令还没处理完就发了
 
             // === 动作 B: 执行发送 (双保险) ===
 
@@ -1809,14 +1868,57 @@ namespace moshushou
             mouse_event(MOUSEEVENTF_LEFTUP, clickX, clickY, 0, 0);
             await Task.Delay(50);
 
-            // 方案 1: Alt + S
-            SimulateAltS();
-            Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = "✉️ 发送指令 (Alt+S)...");
-            await Task.Delay(300);
+            bool skipEnter = false;
+            // ✅ 新增：如果是企业微信发送文件，尝试处理“转为在线表格”弹窗
+            // ✅ 新增：如果是企业微信发送文件，尝试处理“转为在线表格”弹窗
+            if (isFile && isWework)
+            {
+                Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = "🔎 检测企业微信弹窗(OCR)...");
+                
+                // OCR 查找 "使用原文件"
+                // OCR 查找 "使用原文件"
+                System.Drawing.Point? clickPoint = null;
+                for(int k=0; k<5; k++)
+                {
+                    clickPoint = await _screenshotHelper.FindPopupTextPositionAsync(targetHwnd, "使用原文件");
+                    if (clickPoint != null) break;
+                    await Task.Delay(300);
+                }
 
-            // 方案 2: Enter (补刀)
-            SimulateEnter();
-            Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text += " + (Enter补刀)...");
+                if (clickPoint != null)
+                {
+                    int cx = (int)clickPoint.Value.X;
+                    int cy = (int)clickPoint.Value.Y;
+                    Log($"⚡ OCR 定位到 '使用原文件' ({cx}, {cy})，执行点击...");
+
+                    SetCursorPos(cx, cy);
+                    mouse_event(MOUSEEVENTF_LEFTDOWN, cx, cy, 0, 0);
+                    mouse_event(MOUSEEVENTF_LEFTUP, cx, cy, 0, 0);
+
+                    Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = "⚡ 已点击'使用原文件' (自动发送)");
+                    skipEnter = true; 
+                }
+                else
+                {
+                    Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = "⚠️ 未检测到弹窗，使用常规发送");
+                }
+            }
+
+            if (!skipEnter)
+            {
+                // 方案 1: Alt + S
+                SimulateAltS();
+                Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = "✉️ 发送指令 (Alt+S)...");
+                await Task.Delay(300);
+
+                // 方案 2: Enter (补刀)
+                SimulateEnter();
+                Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text += " + (Enter补刀)...");
+            }
+            else
+            {
+                await Task.Delay(400); // 弹窗点击后，给予更长的上传缓冲时间
+            }
 
             // ============================================================
             // 🌟 轮询验证结果 (宽松版)
@@ -2221,7 +2323,8 @@ namespace moshushou
                 }
 
                 bool result = false;
-                if (AutoSendCheckBox.IsChecked == true)
+                // ✅ Fix: 如果处于 F1 自动化模式 (_isAutoRunning)，强制启用自动发送逻辑
+                if (AutoSendCheckBox.IsChecked == true || _isAutoRunning)
                 {
                     Log("执行自动发送...");
                     result = await PasteAndVerifySendAsync(filePath, true);
@@ -2231,6 +2334,12 @@ namespace moshushou
                         _lastPastedStoreName = storeName;
                         StatusTextBlock.Text = $"✅ [自动] 已发送文件: {storeName}";
                         Log("✅ 发送成功");
+
+                        // ✅ [新增] 成功发送文件后，追加发送一条固定文本
+                        await Task.Delay(200); 
+                        Log("➕ 追加发送未发货预警...");
+                        StatusTextBlock.Text += " + 正在追加预警...";
+                        await PasteAndVerifySendAsync(FIXED_MESSAGE, false);
                     }
                     else Log("❌ 发送失败");
                 }
@@ -2239,7 +2348,54 @@ namespace moshushou
                     Log("执行手动粘贴...");
                     SimulatePaste();
                     Log("Ctrl+V 已发送");
-                    StatusTextBlock.Text = $"📋 [自动] 已粘贴文件: {storeName}";
+
+                    if (isWework)
+                    {
+                         Log("🔎 [手动模式] 检测企业微信弹窗(OCR)...");
+                         
+                         System.Drawing.Point? clickPoint = null;
+                         for(int k=0; k<5; k++)
+                         {
+                             clickPoint = await _screenshotHelper.FindPopupTextPositionAsync(targetHwnd, "使用原文件");
+                             if (clickPoint != null) break;
+                             await Task.Delay(300);
+                         }
+
+                         if (clickPoint != null)
+                         {
+                              int cx = (int)clickPoint.Value.X;
+                              int cy = (int)clickPoint.Value.Y;
+                              Log($"⚡ [手动] OCR 点击 '使用原文件' ({cx}, {cy})");
+
+                              SetCursorPos(cx, cy);
+                              mouse_event(MOUSEEVENTF_LEFTDOWN, cx, cy, 0, 0);
+                              mouse_event(MOUSEEVENTF_LEFTUP, cx, cy, 0, 0);
+                              
+                              StatusTextBlock.Text = $"⚡ [快捷] 已点击'使用原文件' (自动发送): {storeName}";
+
+                              // ✅ Fix: 手动模式下，如果点击了“使用原文件”，实际上文件已发出，
+                              // 所以这里也需要追加发送“未发货预警”信息，保持逻辑一致。
+                              await Task.Delay(200);
+                              Log("➕ [手动->自动] 追加发送未发货预警...");
+                              StatusTextBlock.Text += " + 正在追加预警...";
+                              await PasteAndVerifySendAsync(FIXED_MESSAGE, false);
+                         }
+                         else
+                         {
+                              StatusTextBlock.Text = $"📋 [快捷] 已粘贴文件: {storeName}";
+                         }
+                    }
+                    else
+                    {
+                        StatusTextBlock.Text = $"📋 [自动] 已粘贴文件: {storeName}";
+
+                        // ✅ Fix: 响应用户需求，即使是普通微信的手动/快捷模式，也追加发送预警信息
+                        // 这将导致文件和文字一起被发出（符合用户期望）
+                        await Task.Delay(500); 
+                        Log("➕ [微信-手动] 追加发送未发货预警...");
+                        StatusTextBlock.Text += " + 正在追加预警...";
+                        await PasteAndVerifySendAsync(FIXED_MESSAGE, false);
+                    }
                     _currentItemPasted = true;
                     _lastPastedStoreName = storeName;
                     result = true;
@@ -2339,7 +2495,8 @@ namespace moshushou
 
                 // 6. 粘贴与发送
                 bool result = false;
-                if (AutoSendCheckBox.IsChecked == true)
+                // ✅ Fix: 如果处于 F1 自动化模式 (_isAutoRunning)，强制启用自动发送逻辑
+                if (AutoSendCheckBox.IsChecked == true || _isAutoRunning)
                 {
                     Log("模式: 自动发送");
                     // 注意：PasteAndVerifySendAsync 内部日志未在此处展示，需确保该函数也正常
@@ -2477,12 +2634,68 @@ namespace moshushou
 
         private void LoadAndProcessExcel(string filePath)
         {
+            // ✅ 获取文件的最后修改时间
+            DateTime fileLastModified = File.GetLastWriteTime(filePath);
+            
+            // ✅ 记录是否应该恢复上次状态
+            bool shouldRestoreState = false;
+            FileState stateToRestore = null;
+            
+            if (_searchConfig?.LastFileState != null)
+            {
+                var savedState = _searchConfig.LastFileState;
+                // 判断是否为"相同版本文件"：路径相同 且 修改时间相同
+                if (!string.IsNullOrEmpty(savedState.FilePath) &&
+                    filePath.Equals(savedState.FilePath, StringComparison.OrdinalIgnoreCase) &&
+                    Math.Abs((fileLastModified - savedState.LastModifiedTime).TotalSeconds) < 2) // 允许2秒误差
+                {
+                    shouldRestoreState = true;
+                    stateToRestore = savedState;
+                    System.Diagnostics.Debug.WriteLine($"[文件状态] 检测到相同版本文件，将恢复状态");
+                }
+                else
+                {
+                    System.Diagnostics.Debug.WriteLine($"[文件状态] 文件已更新或为新文件，不恢复旧状态");
+                }
+            }
+            
+            // ✅ 保存当前打开的文件信息到 FileState
+            if (_searchConfig != null)
+            {
+                _searchConfig.LastFileState = new FileState
+                {
+                    FilePath = filePath,
+                    LastModifiedTime = fileLastModified,
+                    LastSelectedStoreName = "",
+                    FailedStores = new List<string>(),
+                    ManualReviewStores = new List<string>(),
+                    DeletedStores = new List<string>()
+                };
+                // 向后兼容：同步更新旧字段
+                _searchConfig.LastOpenedFilePath = filePath;
+                _searchConfig.Save();
+            }
+
             // 1. 清除内存中的旧数据
             lock (_dataLock)
             {
                 _storeData.Clear();
                 _exportedFilePaths.Clear();
             }
+            
+            // ✅ 清空运行时状态集合
+            _failedStores.Clear();
+            _manualReviewStores.Clear();
+            
+            // ✅ 如果需要恢复状态，预先加载重试区和需人工列表
+            if (shouldRestoreState && stateToRestore != null)
+            {
+                if (stateToRestore.FailedStores != null)
+                    foreach (var s in stateToRestore.FailedStores) _failedStores.Add(s);
+                if (stateToRestore.ManualReviewStores != null)
+                    foreach (var s in stateToRestore.ManualReviewStores) _manualReviewStores.Add(s);
+            }
+
 
             // ✅ [新增] 清空 ExportedFiles 目录，防止旧文件残留
             try
@@ -2565,6 +2778,18 @@ namespace moshushou
 
                 // 处理并显示数据
                 ProcessAndDisplayData();
+                
+                // ✅ 如果是相同版本文件，恢复上次选中的商家位置
+                if (shouldRestoreState && stateToRestore != null && !string.IsNullOrEmpty(stateToRestore.LastSelectedStoreName))
+                {
+                    string storeNameToRestore = stateToRestore.LastSelectedStoreName;
+                    Application.Current.Dispatcher.InvokeAsync(() =>
+                    {
+                        RestoreSelection(storeNameToRestore, 0);
+                        StatusTextBlock.Text = $"已恢复到上次选中: {storeNameToRestore} (包括重试区 {_failedStores.Count} 个)";
+                    }, System.Windows.Threading.DispatcherPriority.Loaded);
+                }
+
             }
             catch (Exception ex)
             {
@@ -2574,6 +2799,31 @@ namespace moshushou
                     StoreTreeView.ItemsSource = null;
                 });
             }
+        }
+
+        /// <summary>
+        /// ✅ 保存当前文件的完整状态（选中项、重试区、需人工、已删除）
+        /// </summary>
+        private void SaveFileState(string selectedStoreName = null)
+        {
+            if (_searchConfig?.LastFileState == null) return;
+            
+            var state = _searchConfig.LastFileState;
+            
+            // 更新选中项（如果提供）
+            if (!string.IsNullOrEmpty(selectedStoreName))
+            {
+                state.LastSelectedStoreName = selectedStoreName;
+            }
+            
+            // 同步当前运行时状态到持久化对象
+            state.FailedStores = _failedStores.ToList();
+            state.ManualReviewStores = _manualReviewStores.ToList();
+            
+            // 向后兼容：同步旧字段
+            _searchConfig.LastSelectedStoreName = state.LastSelectedStoreName;
+            
+            _searchConfig.Save();
         }
 
 
@@ -2594,8 +2844,8 @@ namespace moshushou
             {
                 sortedStores = _storeData
                     .Select(kvp => new { Kvp = kvp, Info = infoMap.ContainsKey(kvp.Key) ? infoMap[kvp.Key] : null })
-                    .OrderByDescending(x => x.Kvp.Value.Count > 100)
-                    .ThenByDescending(x => !string.IsNullOrEmpty(x.Info?.GroupName))
+                    .OrderByDescending(x => !string.IsNullOrEmpty(x.Info?.GroupName))
+                    .ThenByDescending(x => x.Kvp.Value.Count > 100)
                     .ThenBy(x =>
                     {
                         var src = x.Info?.Source;
@@ -2765,6 +3015,12 @@ namespace moshushou
                 return;
             }
 
+            // ✅ 进入筛选前，保存当前选中项（仅在首次进入筛选时保存）
+            if (string.IsNullOrEmpty(_preFilterSelectedStoreName) && _currentSelectedNode != null)
+            {
+                _preFilterSelectedStoreName = _currentSelectedNode.StoreName;
+            }
+
             // ✅ 筛选时重置选中状态
             _currentSelectedIndex = -1;
             _currentSelectedNode = null;
@@ -2777,11 +3033,27 @@ namespace moshushou
             FilterTextBox.Clear();
             _currentFilter.Clear();
 
-            // ✅ 清除筛选时重置选中状态
+            // ✅ 保存需要恢复的商家名
+            string storeNameToRestore = _preFilterSelectedStoreName;
+            
+            // ✅ 清空筛选前保存的商家名（已使用完毕）
+            _preFilterSelectedStoreName = null;
+
+            // ✅ 先重置选中状态
             _currentSelectedIndex = -1;
             _currentSelectedNode = null;
 
             ProcessAndDisplayData();
+
+            // ✅ 清除筛选后，恢复到进入筛选前的选中项
+            if (!string.IsNullOrEmpty(storeNameToRestore))
+            {
+                Application.Current.Dispatcher.InvokeAsync(() =>
+                {
+                    RestoreSelection(storeNameToRestore, -1);
+                    StatusTextBlock.Text = $"已恢复选中: '{storeNameToRestore}'";
+                }, System.Windows.Threading.DispatcherPriority.Loaded);
+            }
         }
 
 
@@ -2802,6 +3074,9 @@ namespace moshushou
                     _failedStores.Remove(storeName);
                     _manualReviewStores.Remove(storeName);
                 }
+
+                // ✅ 保存删除后的状态
+                SaveFileState();
 
                 // 刷新列表
                 ProcessAndDisplayData();
@@ -2914,6 +3189,13 @@ namespace moshushou
                 {
                     _currentSelectedIndex = _flatNodeList.IndexOf(node);
                 }
+                
+                // ✅ 保存当前选中的商家名，用于下次打开相同文件时恢复
+                if (node.StoreName != "FAIL_SEPARATOR")
+                {
+                    SaveFileState(node.StoreName);
+                }
+
                 if (Interlocked.CompareExchange(ref _copyingFlag, 1, 0) == 1) return;
 
                 if (node.IsFileNode)
@@ -3056,6 +3338,16 @@ namespace moshushou
             return false;
         }
 
+        // ✅ 新增：选中事件自动滚动
+        private void TreeViewItem_Selected(object sender, RoutedEventArgs e)
+        {
+            if (sender is TreeViewItem item)
+            {
+                item.BringIntoView();
+                e.Handled = true;
+            }
+        }
+
         #endregion
 
         #region UI辅助
@@ -3063,11 +3355,65 @@ namespace moshushou
         private void FilterToggleButton_Checked(object sender, RoutedEventArgs e)
         {
             FilterPanel.Visibility = Visibility.Visible;
+
+            // ✅ 修复：展开筛选面板后也需要同步选中状态
+            if (_currentSelectedNode != null)
+            {
+                Application.Current.Dispatcher.InvokeAsync(() =>
+                {
+                    SyncTreeViewSelection(_currentSelectedNode);
+                }, System.Windows.Threading.DispatcherPriority.Loaded);
+            }
         }
 
         private void FilterToggleButton_Unchecked(object sender, RoutedEventArgs e)
         {
             FilterPanel.Visibility = Visibility.Collapsed;
+
+            // ✅ 修复：收起筛选面板后重新同步选中状态
+            // 由于 TreeView 使用虚拟化，收起面板后高度变化会导致容器重建，需要重新设置选中项
+            if (_currentSelectedNode != null)
+            {
+                Application.Current.Dispatcher.InvokeAsync(() =>
+                {
+                    SyncTreeViewSelection(_currentSelectedNode);
+                }, System.Windows.Threading.DispatcherPriority.Loaded);
+            }
+        }
+
+
+
+        /// <summary>
+        /// ✅ 修复：直接操作数据模型清除选中状态
+        /// </summary>
+        private void ClearAllTreeViewSelections()
+        {
+            // 直接遍历扁平化列表，效率更高且覆盖所有节点（包括不可见的）
+            foreach (var node in _flatNodeList)
+            {
+                if (node != _currentSelectedNode && node.IsSelected)
+                {
+                    node.IsSelected = false;
+                }
+            }
+        }
+
+        /// <summary>
+        /// ✅ 修复：仅负责滚动到视图
+        /// </summary>
+        private void BringNodeIntoViewByIndex(int index)
+        {
+            if (index < 0 || index >= _flatNodeList.Count) return;
+
+            var node = _flatNodeList[index];
+            node.IsSelected = true; // 确保数据层面被选中
+
+            Application.Current.Dispatcher.InvokeAsync(() =>
+            {
+                StoreTreeView.UpdateLayout();
+                // ✅ 修复：使用支持虚拟化的滚动方法
+                ScrollToNode(node);
+            }, System.Windows.Threading.DispatcherPriority.Background);
         }
 
         private static T FindVisualParent<T>(DependencyObject child) where T : DependencyObject
@@ -3075,6 +3421,20 @@ namespace moshushou
             DependencyObject parentObject = VisualTreeHelper.GetParent(child);
             if (parentObject == null) return null;
             return parentObject as T ?? FindVisualParent<T>(parentObject);
+        }
+
+        // ✅ 新增：查找子元素辅助方法
+        private static T FindVisualChild<T>(DependencyObject parent) where T : DependencyObject
+        {
+            if (parent == null) return null;
+            for (int i = 0; i < VisualTreeHelper.GetChildrenCount(parent); i++)
+            {
+                var child = VisualTreeHelper.GetChild(parent, i);
+                if (child is T t) return t;
+                var result = FindVisualChild<T>(child);
+                if (result != null) return result;
+            }
+            return null;
         }
 
         #endregion
@@ -3386,37 +3746,26 @@ namespace moshushou
             // 1. 更新当前选中项记录
             _currentSelectedNode = node;
 
-            // 2. 延迟执行，确保数据源更新后再操作 UI
+            // 2. 数据驱动：设置选中状态
+            ClearAllTreeViewSelections();
+            node.IsSelected = true;
+
+            // 3. 延迟执行滚动和焦点操作
             Application.Current.Dispatcher.InvokeAsync(() =>
             {
                 try
                 {
-                    // 尝试获取对应的 UI 容器 (TreeViewItem)
+                    // 确保布局更新
+                    StoreTreeView.UpdateLayout();
+                    
+                    // ✅ 修复：使用自定义滚动方法替代不存在的 ScrollIntoView
+                    ScrollToNode(node);
+
+                    // 尝试获取容器以设置焦点
                     var container = StoreTreeView.ItemContainerGenerator.ContainerFromItem(node) as TreeViewItem;
-
-                    // 🛑 如果容器为空（说明项在屏幕外，被虚拟化了，或者还没渲染）
-                    if (container == null)
-                    {
-                        // 强制更新一次布局，让生成器尝试创建容器
-                        StoreTreeView.UpdateLayout();
-                        container = StoreTreeView.ItemContainerGenerator.ContainerFromItem(node) as TreeViewItem;
-                    }
-
-                    // ✅ 如果找到了容器
                     if (container != null)
                     {
-                        // 核心：让容器自己把自己“搬”到视野内
-                        container.BringIntoView();
-
-                        // 设置选中和焦点
-                        container.IsSelected = true;
                         container.Focus();
-                    }
-                    else
-                    {
-                        // ⚠️ 兜底：如果实在找不到（极少数情况），尝试手动触发 TreeView 刷新
-                        StoreTreeView.Items.Refresh();
-                        StatusTextBlock.Text = $"⚠️ 正在定位商家 '{node.StoreName}'..."; // 提示用户
                     }
 
                     // 触发后续的业务逻辑（如复制）
@@ -3428,6 +3777,71 @@ namespace moshushou
                 }
 
             }, System.Windows.Threading.DispatcherPriority.Loaded);
+        }
+
+        /// <summary>
+        /// ✅ 新增：在虚拟化开启时安全滚动到指定节点
+        /// </summary>
+        private void ScrollToNode(TreeViewNode node)
+        {
+            if (node == null) return;
+
+            // 1. 尝试直接获取容器并滚动 (如果已生成)
+            var container = StoreTreeView.ItemContainerGenerator.ContainerFromItem(node) as TreeViewItem;
+            if (container != null)
+            {
+                container.BringIntoView();
+                return;
+            }
+
+            // 2. 如果容器未生成 (被虚拟化)，使用 VirtualizingStackPanel 的索引滚动
+            int index = _flatNodeList.IndexOf(node);
+            if (index >= 0)
+            {
+                var vsp = FindVisualChild<VirtualizingStackPanel>(StoreTreeView);
+                if (vsp != null)
+                {
+                    try
+                    {
+                        // BringIndexIntoView 是 protected 方法，需要反射调用
+                        var method = typeof(VirtualizingStackPanel).GetMethod("BringIndexIntoView", 
+                            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Public);
+                        
+                        if (method != null)
+                        {
+                            method.Invoke(vsp, new object[] { index });
+                            StoreTreeView.UpdateLayout(); // 滚动后强制更新布局以生成容器
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.WriteLine($"反射滚动失败: {ex.Message}");
+                    }
+                }
+            }
+        }
+
+        private void SyncTreeViewSelection(TreeViewNode targetNode)
+        {
+            if (targetNode == null) return;
+
+            try
+            {
+                // 1. 数据层：确保只有目标节点被选中
+                ClearAllTreeViewSelections();
+                targetNode.IsSelected = true;
+
+                // 2. UI层：确保目标节点可见
+                Application.Current.Dispatcher.InvokeAsync(() =>
+                {
+                    StoreTreeView.UpdateLayout();
+                    ScrollToNode(targetNode); // ✅ 修复：使用自定义滚动
+                }, System.Windows.Threading.DispatcherPriority.Background);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"同步选中状态失败: {ex.Message}");
+            }
         }
 
         #endregion
@@ -3454,6 +3868,7 @@ namespace moshushou
         private string _header;
         private string _groupName;
         private string _source;
+        private bool _isSelected; // ✅ 新增：选中状态字段
 
         public string Header
         {
@@ -3471,6 +3886,21 @@ namespace moshushou
         public string Text { get; set; }
         public string StoreName { get; set; }
         public bool IsFileNode { get; set; }
+        
+        // ✅ 新增：IsSelected 属性 (支持双向绑定)
+        public bool IsSelected
+        {
+            get => _isSelected;
+            set
+            {
+                if (_isSelected != value)
+                {
+                    _isSelected = value;
+                    OnPropertyChanged(nameof(IsSelected));
+                }
+            }
+        }
+
         public ObservableCollection<TreeViewNode> Children { get; set; } = new ObservableCollection<TreeViewNode>();
 
         public string Source

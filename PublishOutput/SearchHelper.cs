@@ -217,6 +217,9 @@ namespace moshushou
             return IntPtr.Zero;
         }
 
+        /// <summary>
+        /// ✅ [优化版] 简化激活逻辑，不使用 AttachThreadInput
+        /// </summary>
         private async Task<bool> ForceActivateWindowAsync(IntPtr hwnd, CancellationToken token)
         {
             if (hwnd == GetForegroundWindow()) return true;
@@ -224,28 +227,11 @@ namespace moshushou
             if (IsIconic(hwnd)) ShowWindow(hwnd, SW_RESTORE);
             else ShowWindow(hwnd, SW_SHOW);
 
-            uint currentThreadId = GetCurrentThreadId();
-            uint targetThreadId = GetWindowThreadProcessId(hwnd, out _);
+            // ✅ [优化] 不再使用 AttachThreadInput，只调用一次 SetForegroundWindow
+            SetForegroundWindow(hwnd);
+            await Task.Delay(100, token);
 
-            try
-            {
-                AttachThreadInput(currentThreadId, targetThreadId, true);
-                SetForegroundWindow(hwnd);
-
-                var stopwatch = Stopwatch.StartNew();
-                while (GetForegroundWindow() != hwnd && stopwatch.ElapsedMilliseconds < _config.ActivationTimeoutMs)
-                {
-                    if (token.IsCancellationRequested) return false;
-                    await Task.Delay(10, token);
-                }
-                stopwatch.Stop();
-
-                return GetForegroundWindow() == hwnd;
-            }
-            finally
-            {
-                AttachThreadInput(currentThreadId, targetThreadId, false);
-            }
+            return GetForegroundWindow() == hwnd;
         }
 
 
@@ -258,36 +244,24 @@ namespace moshushou
 
             // 1. 激活搜索框
             _inputSimulator.Keyboard.ModifiedKeyStroke(VirtualKeyCode.CONTROL, VirtualKeyCode.VK_F);
-            // 💡 必须有足够的延迟让焦点进去
-            await Task.Delay(Math.Max(_config.DelayAfterCtrlF, 200), token);
+            await Task.Delay(150, token);
 
             // 2. 防御性清空
             _inputSimulator.Keyboard.KeyPress(VirtualKeyCode.BACK);
-            await Task.Delay(30, token);
+            await Task.Delay(20, token);
 
             // 3. 全选并删除
             _inputSimulator.Keyboard.ModifiedKeyStroke(VirtualKeyCode.CONTROL, VirtualKeyCode.VK_A);
-            await Task.Delay(50, token);
+            await Task.Delay(30, token);
             _inputSimulator.Keyboard.KeyPress(VirtualKeyCode.BACK);
-            await Task.Delay(50, token);
+            await Task.Delay(30, token);
 
             if (token.IsCancellationRequested) return;
 
             // 4. 粘贴新内容
             _inputSimulator.Keyboard.ModifiedKeyStroke(VirtualKeyCode.CONTROL, VirtualKeyCode.VK_V);
 
-            // ⏳ 关键：粘贴后等待上屏
-            await Task.Delay(200, token);
-
-            // ============================================================
-            // 🔥 核心唤醒：空格 + 退格
-            // 这能强行覆盖掉物理 Ctrl 键带来的信号干扰，强制触发搜索
-            // ============================================================
-            _inputSimulator.Keyboard.KeyPress(VirtualKeyCode.SPACE);
-            await Task.Delay(50, token);
-            _inputSimulator.Keyboard.KeyPress(VirtualKeyCode.BACK);
-
-            // 再次等待列表渲染
+            // ✅ [优化] 粘贴后等待列表渲染
             await Task.Delay(200, token);
         }
 

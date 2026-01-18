@@ -15,6 +15,12 @@
             <Setter Property="IsExpanded" Value="False"/>
             <Setter Property="Padding" Value="3,2"/>
             <Setter Property="Margin" Value="0,1"/>
+            <!-- ✅ 新增：绑定 IsSelected 到数据模型 -->
+            <Setter Property="IsSelected" Value="{Binding IsSelected, Mode=TwoWay}"/>
+            
+            <!-- ✅ 新增：选中时自动滚动 -->
+            <EventSetter Event="Selected" Handler="TreeViewItem_Selected"/>
+
             <!-- 关键：使用艳丽的深色让失焦时的选中项更醒目 -->
             <Style.Resources>
                 <!-- 窗口激活时的选中背景 - 鲜艳的蓝色 -->
@@ -26,6 +32,7 @@
                 <!-- 窗口失焦时的选中文字 -->
                 <SolidColorBrush x:Key="{x:Static SystemColors.InactiveSelectionHighlightTextBrushKey}" Color="White"/>
             </Style.Resources>
+
             <!-- 添加触发器确保选中时文字变白 -->
             <Style.Triggers>
                 <Trigger Property="IsSelected" Value="True">
@@ -325,7 +332,8 @@
 
                 <TreeView x:Name="StoreTreeView"
                           VirtualizingStackPanel.IsVirtualizing="True"
-                          VirtualizingStackPanel.VirtualizationMode="Recycling"
+                          VirtualizingStackPanel.VirtualizationMode="Standard"
+                          VirtualizingStackPanel.ScrollUnit="Pixel"
                           ScrollViewer.VerticalScrollBarVisibility="Auto"
                           ScrollViewer.HorizontalScrollBarVisibility="Auto"
                           Background="Transparent"

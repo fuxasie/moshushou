@@ -158,19 +158,40 @@ namespace moshushou
             // 1. 快速检查：未处理前如果包含，直接返回 (最快)
             if (actual.Contains(expected) || expected.Contains(actual)) return true;
 
+            // ✅ [新增] 规范化特殊字符（OCR 经常把这些字符识别错或遗漏）
+            string NormalizeSpecialChars(string s)
+            {
+                // 波浪号统一：全角～ → 半角~，或直接移除
+                s = s.Replace("～", "~").Replace("〜", "~");
+                // 破折号统一
+                s = s.Replace("—", "-").Replace("–", "-").Replace("一", "-");
+                // 省略号统一
+                s = s.Replace("…", "..").Replace("。。", "..");
+                // 中文括号统一
+                s = s.Replace("（", "(").Replace("）", ")");
+                s = s.Replace("【", "[").Replace("】", "]");
+                return s;
+            }
+
+            string normalizedTarget = NormalizeSpecialChars(expected);
+            string normalizedOCR = NormalizeSpecialChars(actual);
+
+            // 规范化后再检查包含关系
+            if (normalizedOCR.Contains(normalizedTarget) || normalizedTarget.Contains(normalizedOCR)) return true;
+
             // 2. 深度清洗：
             // - 去除所有空白字符 (\s)
-            // - 去除常见标点符号 (包括中文标点和截断用的点)
+            // - 去除常见标点符号 (包括中文标点、截断用的点、波浪号等)
             // - 统一转小写
-            string pattern = @"\s+|[.,;:'""()\-\[\]{}<>/\\|、，。；：“”（）—…\.]";
-            string cleanTarget = Regex.Replace(expected, pattern, "").ToLower();
-            string cleanOCR = Regex.Replace(actual, pattern, "").ToLower();
+            string pattern = @"\s+|[.,;:'""()\-\[\]{}<>/\\|、，。；：""（）—…\.~～〜]";
+            string cleanTarget = Regex.Replace(normalizedTarget, pattern, "").ToLower();
+            string cleanOCR = Regex.Replace(normalizedOCR, pattern, "").ToLower();
 
             // 防止清洗后为空
             if (string.IsNullOrEmpty(cleanTarget) || string.IsNullOrEmpty(cleanOCR)) return false;
 
             // 3. 【核心优化】智能前缀匹配 (专门解决 "张旭彬...官方旗舰店" 变成 "张旭彬...官方.." 的问题)
-            // 逻辑：如果清洗后的 OCR 结果，是 目标词 的“开头部分”，且长度足够长，视为匹配。
+            // 逻辑：如果清洗后的 OCR 结果，是 目标词 的"开头部分"，且长度足够长，视为匹配。
             int minPrefixLen = 4; // 至少匹配前4个字才算数，防止匹配到"张三"这种泛滥的词
             if (cleanTarget.Length >= minPrefixLen && cleanOCR.Length >= minPrefixLen)
             {
@@ -222,6 +243,7 @@ namespace moshushou
             // System.Diagnostics.Debug.WriteLine($"[Fuzzy] 相似度: {similarity:F2} (阈值: {threshold})");
             return similarity >= threshold;
         }
+
 
         /// <summary>
         /// 计算两个字符串的莱文斯坦距离 (编辑距离)
@@ -327,6 +349,62 @@ namespace moshushou
         }
 
 
+        /// <summary>
+        /// ✅ [新增] 截取整个窗口并进行 OCR 识别
+        /// 用于检测全屏覆盖的安全验证页面
+        /// </summary>
+        public async Task<string> CaptureFullWindowAndOcrAsync(IntPtr targetHwnd)
+        {
+            try
+            {
+                if (targetHwnd == IntPtr.Zero || !GetWindowRect(targetHwnd, out RECT rect))
+                {
+                    System.Diagnostics.Debug.WriteLine("[安全检测截图] 窗口句柄无效或无法获取窗口尺寸");
+                    return null;
+                }
+
+                int width = rect.Right - rect.Left;
+                int height = rect.Bottom - rect.Top;
+
+                System.Diagnostics.Debug.WriteLine($"[安全检测截图] 窗口尺寸: {width}x{height}, 位置: ({rect.Left}, {rect.Top})");
+
+                if (width <= 0 || height <= 0) return null;
+
+                // 截取整个窗口
+                using (var bitmap = new Bitmap(width, height, PixelFormat.Format32bppArgb))
+                {
+                    using (var graphics = Graphics.FromImage(bitmap))
+                    {
+                        graphics.CopyFromScreen(rect.Left, rect.Top, 0, 0, new Size(width, height), CopyPixelOperation.SourceCopy);
+                    }
+
+                    // ✅ [调试] 保存截图到文件以便验证
+                    try
+                    {
+                        string debugFolder = Path.Combine(_baseDirectory, "SecurityCheck_Debug");
+                        Directory.CreateDirectory(debugFolder);
+                        string debugPath = Path.Combine(debugFolder, $"security_check_{DateTime.Now:HHmmss_fff}.png");
+                        bitmap.Save(debugPath, ImageFormat.Png);
+                        System.Diagnostics.Debug.WriteLine($"[安全检测截图] 已保存到: {debugPath}");
+                    }
+                    catch (Exception saveEx)
+                    {
+                        System.Diagnostics.Debug.WriteLine($"[安全检测截图] 保存截图失败: {saveEx.Message}");
+                    }
+
+                    // 直接用原图进行 OCR (安全验证页面的文字通常较大，不需要放大)
+                    string result = await PerformOcrAsync(bitmap);
+                    System.Diagnostics.Debug.WriteLine($"[安全检测截图] OCR 结果 (前300字): {result?.Substring(0, Math.Min(300, result?.Length ?? 0))}");
+                    return result;
+                }
+            }
+            catch (Exception ex)
+            {
+                _logAction?.Invoke($"💥 全窗口截图失败: {ex.Message}");
+                System.Diagnostics.Debug.WriteLine($"[安全检测截图] 异常: {ex.Message}");
+                return null;
+            }
+        }
 
 
 
@@ -800,80 +878,105 @@ namespace moshushou
                 int width = relativeSearchArea?[2] ?? 400; // 搜索栏通常在左侧
                 int height = relativeSearchArea?[3] ?? (rect.Bottom - rect.Top - 60);
 
+                // 越界保护
+                if (width <= 0) width = 200;
+                if (height <= 0) height = 200;
+
                 int screenX = rect.Left + relX;
                 int screenY = rect.Top + relY;
 
-                // 🔧 DEBUG: 打印详细坐标信息
-                _logAction?.Invoke($"🔍 [FindKeyword] WindowRect: {rect.Left},{rect.Top} size {rect.Right-rect.Left}x{rect.Bottom-rect.Top}");
-                _logAction?.Invoke($"🔍 [FindKeyword] SearchArea Screen: {screenX},{screenY} {width}x{height}");
-
-                if (width <= 0 || height <= 0) return null;
-
                 using (var bitmap = new Bitmap(width, height, PixelFormat.Format32bppArgb))
                 {
-                    using (var graphics = Graphics.FromImage(bitmap))
+                    using (var g = Graphics.FromImage(bitmap))
                     {
-                        graphics.CopyFromScreen(screenX, screenY, 0, 0, new Size(width, height), CopyPixelOperation.SourceCopy);
+                        g.CopyFromScreen(screenX, screenY, 0, 0, new Size(width, height), CopyPixelOperation.SourceCopy);
                     }
 
-                    var bytes = ImageToBytes(bitmap);
-                    // ✅ [修复] 强制异步延续
-                    var tcs = new TaskCompletionSource<Point?>(TaskCreationOptions.RunContinuationsAsynchronously);
-                    var ocr = new ImageOcr();
-
-                    ocr.Run(bytes, (path, result) =>
+                    // OCR
+                    using (var scaled = ScaleImage(bitmap, 2)) // 2倍放大通常够了
                     {
-                        try
-                        {
-                            if (result?.OcrResult?.SingleResult != null)
-                            {
-                                foreach (var item in result.OcrResult.SingleResult)
-                                {
-                                    if (item != null && !string.IsNullOrEmpty(item.SingleStrUtf8))
-                                    {
-                                        if (item.SingleStrUtf8.Contains(keyword))
-                                        {
-                                            // 尝试直接访问坐标属性
-                                            // 如果 WeChatOcr 的 item 定义是 flat 的
-                                            if (item.Left >= 0) 
-                                            {
-                                                int itemX = (int)(item.Left + (item.Right - item.Left) / 2);
-                                                int itemY = (int)(item.Top + (item.Bottom - item.Top) / 2);
-                                                
-                                                int centerX = screenX + itemX;
-                                                int centerY = screenY + itemY;
-
-                                                _logAction?.Invoke($"✅ [FindKeyword] Found '{keyword}' at Rel({itemX},{itemY}) -> Screen({centerX}, {centerY})");
-                                                tcs.TrySetResult(new Point(centerX, centerY));
-                                                return;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            tcs.TrySetResult(null);
-                        }
-                        catch (Exception ex) { tcs.TrySetException(ex); }
-                        finally
-                        {
-                            try { if (File.Exists(path)) File.Delete(path); } catch {}
-                        }
-                    });
-
-                    var completedTask = await Task.WhenAny(tcs.Task, Task.Delay(5000));
-                    
-                    GC.KeepAlive(ocr); // ✅ 防止过早回收
-
-                    if (completedTask == tcs.Task) return await tcs.Task;
-                    return null;
+                         string ocrText = await PerformOcrAsync(scaled);
+                         // TODO: 这里 PerformOcrAsync 返回的是拼接字符串，我们需要坐标信息
+                         // 因此 PerformOcrAsync 需要修改，或者我们需要直接调用 ImageOcr 返回详细结果
+                         // 为了不破坏现有结构，直接在这里实例化 ImageOcr
+                         
+                         var tcs = new TaskCompletionSource<Point?>(TaskCreationOptions.RunContinuationsAsynchronously);
+                         var bytes = ImageToBytes(scaled);
+                         var ocr = new ImageOcr();
+                         
+                         ocr.Run(bytes, (path, result) => 
+                         {
+                             try 
+                             {
+                                 if (result?.OcrResult?.SingleResult != null)
+                                 {
+                                     foreach(var item in result.OcrResult.SingleResult)
+                                     {
+                                         if (!string.IsNullOrEmpty(item.SingleStrUtf8) && 
+                                             IsFuzzyMatch(keyword, item.SingleStrUtf8))
+                                         {
+                                             // 找到目标！
+                                             // 坐标转换回屏幕坐标 (注意 Scale 2.0)
+                                             float centerX = (item.Left + item.Right) / 2.0f / 2.0f;
+                                             float centerY = (item.Top + item.Bottom) / 2.0f / 2.0f;
+                                             
+                                             int finalX = screenX + (int)centerX;
+                                             int finalY = screenY + (int)centerY;
+                                             
+                                             tcs.TrySetResult(new Point(finalX, finalY));
+                                             return;
+                                         }
+                                     }
+                                 }
+                                 tcs.TrySetResult(null);
+                             }
+                             catch(Exception ex) { tcs.TrySetException(ex); }
+                             finally 
+                             {
+                                 try { if (File.Exists(path)) File.Delete(path); } catch { }
+                             }
+                         });
+                         
+                         await Task.WhenAny(tcs.Task, Task.Delay(5000));
+                         if (tcs.Task.IsCompleted) return await tcs.Task;
+                         return null;
+                    }
                 }
             }
             catch (Exception ex)
             {
-                _logAction?.Invoke($"💥 查找关键词 '{keyword}' 失败: {ex.Message}");
+                _logAction?.Invoke($"💥 FindKeywordPositionAsync 异常: {ex.Message}");
                 return null;
             }
         }
+        
+        /// <summary>
+        /// ✅ [新增] 专门用于查找弹窗上的文字坐标 (如 "使用原文件")
+        /// </summary>
+        public async Task<Point?> FindPopupTextPositionAsync(IntPtr targetHwnd, string keyword)
+        {
+            // 弹窗通常在屏幕中央，或者作为子窗口在父窗口中央
+            // 如果我们能获取 targetHwnd (主窗口)，可以截取主窗口中心区域
+            // 或者简单点，截取整个主窗口，因为弹窗一定在上面
+            
+            // 为了效率，假设弹窗在主窗口的中心区域 (50% 宽, 50% 高)
+            if (targetHwnd == IntPtr.Zero || !GetWindowRect(targetHwnd, out RECT rect)) return null;
+            
+            int w = rect.Right - rect.Left;
+            int h = rect.Bottom - rect.Top;
+            
+            // 搜索区域：中心 60% 区域
+            int searchW = (int)(w * 0.8);
+            int searchH = (int)(h * 0.8);
+            int marginX = (w - searchW) / 2;
+            int marginY = (h - searchH) / 2;
+            
+            int[] area = new int[] { marginX, marginY, searchW, searchH };
+            
+            return await FindKeywordPositionAsync(targetHwnd, keyword, area);
+        }
+
+
 
 
         /// <summary>
