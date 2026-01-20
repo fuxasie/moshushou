@@ -379,6 +379,7 @@ namespace moshushou
                     }
 
                     // ✅ [调试] 保存截图到文件以便验证
+                    /*
                     try
                     {
                         string debugFolder = Path.Combine(_baseDirectory, "SecurityCheck_Debug");
@@ -391,6 +392,7 @@ namespace moshushou
                     {
                         System.Diagnostics.Debug.WriteLine($"[安全检测截图] 保存截图失败: {saveEx.Message}");
                     }
+                    */
 
                     // 直接用原图进行 OCR (安全验证页面的文字通常较大，不需要放大)
                     string result = await PerformOcrAsync(bitmap);
@@ -457,6 +459,8 @@ namespace moshushou
                         graphics.CopyFromScreen(rect.Left + leftCrop, rect.Top, 0, 0, new Size(cropWidth, cropHeight), CopyPixelOperation.SourceCopy);
                     }
 
+                    // ✅ [已禁用调试] 不再保存截图到文件
+                    /*
                     string dateFolder = $"{DateTime.Now:yyyyMMdd}_OCR_Screenshots";
                     string fullDirectoryPath = Path.Combine(_baseDirectory, dateFolder);
                     Directory.CreateDirectory(fullDirectoryPath);
@@ -467,9 +471,34 @@ namespace moshushou
 
                     bitmap.Save(filePath, ImageFormat.Png);
                     _logAction?.Invoke($"✅ 截图 '{initialFileName}' 已保存，正在启动后台OCR...");
-
-                    // *** 核心 ***: 使用Task.Run在后台线程执行耗时的OCR操作
+                    
+                    // 文件模式的 OCR
                     Task.Run(() => PerformOcrAndRenameAsync(filePath, storeName, appIdentifier, onOcrComplete));
+                    */
+
+                    // ✅ [优化] 直接在内存中进行 OCR，不保存文件
+                    _logAction?.Invoke($"✅ 正在后台 OCR 识别 '{storeName}'...");
+                    Task.Run(async () =>
+                    {
+                        BusinessInfo ocrResult = new BusinessInfo { StoreName = storeName, Source = appIdentifier };
+                        try
+                        {
+                            using (var scaledBmp = ScaleImage(bitmap, 3))
+                            {
+                                string rawText = await PerformOcrAsync(scaledBmp);
+                                ocrResult.GroupName = CleanGroupName(rawText);
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            ocrResult.GroupName = $"[OCR识别失败: {ex.Message}]";
+                            _logAction?.Invoke($"💥 OCR处理失败 '{storeName}': {ex.Message}");
+                        }
+                        finally
+                        {
+                            onOcrComplete?.Invoke(ocrResult);
+                        }
+                    });
                 }
             }
             catch (Exception ex)
@@ -1100,6 +1129,8 @@ namespace moshushou
                         graphics.CopyFromScreen(screenX, screenY, 0, 0, new Size(width, height), CopyPixelOperation.SourceCopy);
                     }
 
+                    // ✅ [已禁用调试] 不再保存截图到 Debug_GroupChat 目录
+                    /*
                     // 🔧 DEBUG: 保存原始截图供调试
                     string debugDir = Path.Combine(_baseDirectory, "Debug_GroupChat");
                     try
@@ -1110,10 +1141,13 @@ namespace moshushou
                         _logAction?.Invoke($"🧐 [调试] 原始截图已保存: {origFilename}");
                     }
                     catch { }
+                    */
 
                     // ✅ 关键优化：使用 3 倍放大提高 OCR 准确率
                     using (var scaledBitmap = ScaleImage(bitmap, 3))
                     {
+                        // ✅ [已禁用调试] 不再保存放大截图
+                        /*
                         // 🔧 DEBUG: 保存放大后截图供调试
                         try
                         {
@@ -1122,6 +1156,7 @@ namespace moshushou
                             _logAction?.Invoke($"🧐 [调试] 放大3x截图已保存: {scaledFilename}");
                         }
                         catch { }
+                        */
 
                         var bytes = ImageToBytes(scaledBitmap);
                         // ✅ [修复] 强制异步延续

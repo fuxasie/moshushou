@@ -160,6 +160,10 @@ namespace moshushou
 
                     foreach (var p in processes)
                     {
+                        // ✅ [关键修复] 强制刷新进程信息，确保获取最新的窗口句柄
+                        // 如果程序先于目标应用启动，Process 对象可能缓存了旧的（无效的）MainWindowHandle
+                        try { p.Refresh(); } catch { }
+
                         // 调试日志
                         Log($"     - PID: {p.Id}, Title: '{p.MainWindowTitle}', Handle: {p.MainWindowHandle}");
 

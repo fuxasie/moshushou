@@ -86,8 +86,7 @@ namespace moshushou
         // ✅ [新增] 记录上一次成功的聊天窗口句柄 (用于极速模式抢焦点)
         private IntPtr _lastChatWindowHandle = IntPtr.Zero; // <--- 新增行
 
-        // 固定话术
-        private const string FIXED_MESSAGE = "（以当前信息为准）现同步未发货预警，超时未交件会考核处罚，请尽快处理转出,已售后的及时发起拦截。（注：未处理售后请勿虚假拦截，核实虚假正常考核处罚。字节超时未发出总部将发起拦截）";
+        // 固定话术 (已迁移至 SearchConfig.FixedMessage 可配置)
 
         // 商家信息
         private List<BusinessInfo> _businessInfoList = new List<BusinessInfo>();
@@ -100,6 +99,9 @@ namespace moshushou
         private TreeViewNode _failureNode;
         // ✅ 新增：自动化运行标志
         private bool _isAutoRunning = false;
+
+        // ✅ 新增：问题件模式标志 (True=发送完整表格行, False=发送运单号+固定话术)
+        private bool _isIssueMode = false;
 
 
 
@@ -1569,7 +1571,11 @@ namespace moshushou
             var sb = new StringBuilder();
             sb.AppendLine(storeName);
             foreach (var num in trackingNumbers) sb.AppendLine(num);
-            sb.AppendLine(FIXED_MESSAGE);
+            // Only add fixed message in non-issue mode
+            if (!_isIssueMode)
+            {
+                sb.AppendLine(_searchConfig.FixedMessage);
+            }
 
             // 2. 核心：主动写入剪贴板 (这是“粘贴商家信息”的关键)
             if (!await SetClipboardWithRetryAsync(sb.ToString()))
@@ -2335,11 +2341,14 @@ namespace moshushou
                         StatusTextBlock.Text = $"✅ [自动] 已发送文件: {storeName}";
                         Log("✅ 发送成功");
 
-                        // ✅ [新增] 成功发送文件后，追加发送一条固定文本
-                        await Task.Delay(200); 
-                        Log("➕ 追加发送未发货预警...");
-                        StatusTextBlock.Text += " + 正在追加预警...";
-                        await PasteAndVerifySendAsync(FIXED_MESSAGE, false);
+                        // Only add fixed message in non-issue mode
+                        if (!_isIssueMode)
+                        {
+                            await Task.Delay(200); 
+                            Log("➕ 追加发送未发货预警...");
+                            StatusTextBlock.Text += " + 正在追加预警...";
+                            await PasteAndVerifySendAsync(_searchConfig.FixedMessage, false);
+                        }
                     }
                     else Log("❌ 发送失败");
                 }
@@ -2373,12 +2382,14 @@ namespace moshushou
                               
                               StatusTextBlock.Text = $"⚡ [快捷] 已点击'使用原文件' (自动发送): {storeName}";
 
-                              // ✅ Fix: 手动模式下，如果点击了“使用原文件”，实际上文件已发出，
-                              // 所以这里也需要追加发送“未发货预警”信息，保持逻辑一致。
-                              await Task.Delay(200);
-                              Log("➕ [手动->自动] 追加发送未发货预警...");
-                              StatusTextBlock.Text += " + 正在追加预警...";
-                              await PasteAndVerifySendAsync(FIXED_MESSAGE, false);
+                              // Only add fixed message in non-issue mode
+                              if (!_isIssueMode)
+                              {
+                                  await Task.Delay(200);
+                                  Log("➕ [手动->自动] 追加发送未发货预警...");
+                                  StatusTextBlock.Text += " + 正在追加预警...";
+                                  await PasteAndVerifySendAsync(_searchConfig.FixedMessage, false);
+                              }
                          }
                          else
                          {
@@ -2389,12 +2400,14 @@ namespace moshushou
                     {
                         StatusTextBlock.Text = $"📋 [自动] 已粘贴文件: {storeName}";
 
-                        // ✅ Fix: 响应用户需求，即使是普通微信的手动/快捷模式，也追加发送预警信息
-                        // 这将导致文件和文字一起被发出（符合用户期望）
-                        await Task.Delay(500); 
-                        Log("➕ [微信-手动] 追加发送未发货预警...");
-                        StatusTextBlock.Text += " + 正在追加预警...";
-                        await PasteAndVerifySendAsync(FIXED_MESSAGE, false);
+                        // Only add fixed message in non-issue mode
+                        if (!_isIssueMode)
+                        {
+                            await Task.Delay(500); 
+                            Log("➕ [微信-手动] 追加发送未发货预警...");
+                            StatusTextBlock.Text += " + 正在追加预警...";
+                            await PasteAndVerifySendAsync(_searchConfig.FixedMessage, false);
+                        }
                     }
                     _currentItemPasted = true;
                     _lastPastedStoreName = storeName;
@@ -2450,7 +2463,11 @@ namespace moshushou
             var sb = new StringBuilder();
             sb.AppendLine(storeName);
             foreach (var num in trackingNumbers) sb.AppendLine(num);
-            sb.AppendLine(FIXED_MESSAGE);
+            // Only add fixed message in non-issue mode
+            if (!_isIssueMode)
+            {
+                sb.AppendLine(_searchConfig.FixedMessage);
+            }
             string fullText = sb.ToString();
 
             // 3. 剪贴板
@@ -2637,44 +2654,10 @@ namespace moshushou
             // ✅ 获取文件的最后修改时间
             DateTime fileLastModified = File.GetLastWriteTime(filePath);
             
-            // ✅ 记录是否应该恢复上次状态
+            // ✅ 延迟状态恢复：需要先检测模式，再决定从哪个 FileState 恢复
+            // 这里只做变量声明，实际恢复在模式检测后执行
             bool shouldRestoreState = false;
             FileState stateToRestore = null;
-            
-            if (_searchConfig?.LastFileState != null)
-            {
-                var savedState = _searchConfig.LastFileState;
-                // 判断是否为"相同版本文件"：路径相同 且 修改时间相同
-                if (!string.IsNullOrEmpty(savedState.FilePath) &&
-                    filePath.Equals(savedState.FilePath, StringComparison.OrdinalIgnoreCase) &&
-                    Math.Abs((fileLastModified - savedState.LastModifiedTime).TotalSeconds) < 2) // 允许2秒误差
-                {
-                    shouldRestoreState = true;
-                    stateToRestore = savedState;
-                    System.Diagnostics.Debug.WriteLine($"[文件状态] 检测到相同版本文件，将恢复状态");
-                }
-                else
-                {
-                    System.Diagnostics.Debug.WriteLine($"[文件状态] 文件已更新或为新文件，不恢复旧状态");
-                }
-            }
-            
-            // ✅ 保存当前打开的文件信息到 FileState
-            if (_searchConfig != null)
-            {
-                _searchConfig.LastFileState = new FileState
-                {
-                    FilePath = filePath,
-                    LastModifiedTime = fileLastModified,
-                    LastSelectedStoreName = "",
-                    FailedStores = new List<string>(),
-                    ManualReviewStores = new List<string>(),
-                    DeletedStores = new List<string>()
-                };
-                // 向后兼容：同步更新旧字段
-                _searchConfig.LastOpenedFilePath = filePath;
-                _searchConfig.Save();
-            }
 
             // 1. 清除内存中的旧数据
             lock (_dataLock)
@@ -2686,15 +2669,7 @@ namespace moshushou
             // ✅ 清空运行时状态集合
             _failedStores.Clear();
             _manualReviewStores.Clear();
-            
-            // ✅ 如果需要恢复状态，预先加载重试区和需人工列表
-            if (shouldRestoreState && stateToRestore != null)
-            {
-                if (stateToRestore.FailedStores != null)
-                    foreach (var s in stateToRestore.FailedStores) _failedStores.Add(s);
-                if (stateToRestore.ManualReviewStores != null)
-                    foreach (var s in stateToRestore.ManualReviewStores) _manualReviewStores.Add(s);
-            }
+
 
 
             // ✅ [新增] 清空 ExportedFiles 目录，防止旧文件残留
@@ -2753,13 +2728,111 @@ namespace moshushou
                     }
 
                     int rowCount = worksheet.Dimension.End.Row;
+                    int colCount = worksheet.Dimension.End.Column;
+
+                    // ✅ 自动识别模式：如果列数 >= 5 且第2列是"问题件类型"，则认为是问题件表格
+                    // 为了更稳健，直接判断是否有 >= 5 列
+                    if (colCount >= 5)
+                    {
+                        var header = GetSafeText(worksheet.Cells[1, 2].Value);
+                        if (header.Contains("问题") || header.Contains("类型") || colCount >= 5)
+                        {
+                            _isIssueMode = true;
+                            System.Diagnostics.Debug.WriteLine("[模式识别] 检测到 5列数据，切换为【问题件模式】");
+                        }
+                    }
+                    else
+                    {
+                        _isIssueMode = false;
+                        System.Diagnostics.Debug.WriteLine("[模式识别] 检测到少于 5列数据，使用【未发货模式】");
+                    }
+
+                    // ✅ 根据模式选择对应的 FileState 进行状态恢复
+                    if (_searchConfig != null)
+                    {
+                        // 选择对应模式的状态存储
+                        var savedState = _isIssueMode ? _searchConfig.LastIssueFileState : _searchConfig.LastFileState;
+                        
+                        // 判断是否为"相同版本文件"：路径相同 且 修改时间相同 且 模式匹配
+                        if (savedState != null &&
+                            !string.IsNullOrEmpty(savedState.FilePath) &&
+                            filePath.Equals(savedState.FilePath, StringComparison.OrdinalIgnoreCase) &&
+                            Math.Abs((fileLastModified - savedState.LastModifiedTime).TotalSeconds) < 2 &&
+                            savedState.IsIssueMode == _isIssueMode)
+                        {
+                            shouldRestoreState = true;
+                            stateToRestore = savedState;
+                            System.Diagnostics.Debug.WriteLine($"[文件状态] 检测到相同版本文件（模式={(_isIssueMode ? "问题件" : "未发货")}），将恢复状态");
+                        }
+                        else
+                        {
+                            System.Diagnostics.Debug.WriteLine($"[文件状态] 文件已更新或为新文件，不恢复旧状态");
+                        }
+
+                        // 创建新的状态对象并保存
+                        var newState = new FileState
+                        {
+                            FilePath = filePath,
+                            LastModifiedTime = fileLastModified,
+                            LastSelectedStoreName = "",
+                            FailedStores = new List<string>(),
+                            ManualReviewStores = new List<string>(),
+                            DeletedStores = new List<string>(),
+                            IsIssueMode = _isIssueMode
+                        };
+                        
+                        if (_isIssueMode)
+                        {
+                            _searchConfig.LastIssueFileState = newState;
+                        }
+                        else
+                        {
+                            _searchConfig.LastFileState = newState;
+                        }
+                        
+                        // 向后兼容：同步更新旧字段
+                        _searchConfig.LastOpenedFilePath = filePath;
+                        _searchConfig.Save();
+                    }
+                    
+                    // ✅ 如果需要恢复状态，加载重试区和需人工列表
+                    if (shouldRestoreState && stateToRestore != null)
+                    {
+                        if (stateToRestore.FailedStores != null)
+                            foreach (var s in stateToRestore.FailedStores) _failedStores.Add(s);
+                        if (stateToRestore.ManualReviewStores != null)
+                            foreach (var s in stateToRestore.ManualReviewStores) _manualReviewStores.Add(s);
+                        System.Diagnostics.Debug.WriteLine($"[文件状态] 已恢复：重试区 {_failedStores.Count} 个，需人工 {_manualReviewStores.Count} 个");
+                    }
+
                     for (int row = 2; row <= rowCount; row++)
                     {
-                        // 读取并清洗数据
-                        string trackingNumber = GetSafeText(worksheet.Cells[row, 1].Value).Trim();
-                        string storeName = GetSafeText(worksheet.Cells[row, 2].Value).Trim();
+                        string storeName = "";
+                        string content = "";
 
-                        if (string.IsNullOrEmpty(trackingNumber) || string.IsNullOrEmpty(storeName)) continue;
+                        if (_isIssueMode)
+                        {
+                            // 🆕 问题件模式 (5列)
+                            // 格式：运单号(1) | 类型(2) | 原因(3) | 店铺(4) | 业务员(5)
+                            storeName = GetSafeText(worksheet.Cells[row, 4].Value).Trim();
+                            
+                            // 拼接完整行 (Tab分隔，Excel粘贴友好)
+                            var parts = new List<string>();
+                            for (int c = 1; c <= 5; c++)
+                            {
+                                parts.Add(GetSafeText(worksheet.Cells[row, c].Value).Trim());
+                            }
+                            content = string.Join("\t", parts);
+                        }
+                        else
+                        {
+                            // 🔙 原模式 (2列)
+                            // 格式：运单号(1) | 店铺(2)
+                            content = GetSafeText(worksheet.Cells[row, 1].Value).Trim(); // 只存运单号
+                            storeName = GetSafeText(worksheet.Cells[row, 2].Value).Trim();
+                        }
+
+                        if (string.IsNullOrEmpty(storeName)) continue;
 
                         lock (_dataLock)
                         {
@@ -2767,7 +2840,7 @@ namespace moshushou
                             {
                                 _storeData[storeName] = new List<string>();
                             }
-                            _storeData[storeName].Add(trackingNumber);
+                            _storeData[storeName].Add(content);
                         }
                     }
                 }
@@ -2803,12 +2876,15 @@ namespace moshushou
 
         /// <summary>
         /// ✅ 保存当前文件的完整状态（选中项、重试区、需人工、已删除）
+        /// 根据 _isIssueMode 保存到对应的 FileState
         /// </summary>
         private void SaveFileState(string selectedStoreName = null)
         {
-            if (_searchConfig?.LastFileState == null) return;
+            if (_searchConfig == null) return;
             
-            var state = _searchConfig.LastFileState;
+            // ✅ 根据当前模式选择正确的状态对象
+            var state = _isIssueMode ? _searchConfig.LastIssueFileState : _searchConfig.LastFileState;
+            if (state == null) return;
             
             // 更新选中项（如果提供）
             if (!string.IsNullOrEmpty(selectedStoreName))
@@ -2825,6 +2901,7 @@ namespace moshushou
             
             _searchConfig.Save();
         }
+
 
 
 
@@ -2925,7 +3002,21 @@ namespace moshushou
                     parentNode.IsFileNode = false;
                     foreach (var number in trackingNumbers)
                     {
-                        parentNode.Children.Add(new TreeViewNode { Text = number });
+                        // ✅ 适配显示：如果是问题件模式，内容太长，只截取第一段（运单号）显示
+                        string displayText = number;
+                        if (_isIssueMode && number.Contains("\t"))
+                        {
+                            var parts = number.Split('\t');
+                            if (parts.Length > 2)
+                            {
+                                displayText = $"{parts[0]} - {parts[2]}"; // 显示：运单号 - 原因
+                            }
+                            else
+                            {
+                                displayText = parts[0];
+                            }
+                        }
+                        parentNode.Children.Add(new TreeViewNode { Text = displayText, RawData = number });
                     }
                 }
                 return parentNode;
@@ -2967,28 +3058,69 @@ namespace moshushou
         private string CreateExcelFile(string storeName, List<string> trackingNumbers, string outputDir)
         {
             string safeFileName = string.Join("_", storeName.Split(Path.GetInvalidFileNameChars()));
-            string fileName = $"{safeFileName}未发货明细.xlsx";
+            
+            // ✅ 根据模式选择文件名后缀和工作表名
+            string suffix = _isIssueMode ? "问题件明细" : "未发货明细";
+            string fileName = $"{safeFileName}{suffix}.xlsx";
             string filePath = Path.Combine(outputDir, fileName);
 
             using (var package = new ExcelPackage())
             {
-                var worksheet = package.Workbook.Worksheets.Add("未发货明细");
-                worksheet.Cells[1, 1].Value = "运单号";
-                worksheet.Cells[1, 2].Value = "店铺";
-                using (var headerRange = worksheet.Cells[1, 1, 1, 2])
+                var worksheet = package.Workbook.Worksheets.Add(suffix);
+                
+                if (_isIssueMode)
                 {
-                    headerRange.Style.Font.Bold = true;
-                    headerRange.Style.Fill.PatternType = OfficeOpenXml.Style.ExcelFillStyle.Solid;
-                    headerRange.Style.Fill.BackgroundColor.SetColor(System.Drawing.Color.LightGray);
-                    headerRange.Style.HorizontalAlignment = OfficeOpenXml.Style.ExcelHorizontalAlignment.Center;
+                    // ✅ 问题件模式：5列表头
+                    worksheet.Cells[1, 1].Value = "运单号";
+                    worksheet.Cells[1, 2].Value = "问题件类型";
+                    worksheet.Cells[1, 3].Value = "问题件原因";
+                    worksheet.Cells[1, 4].Value = "店铺";
+                    worksheet.Cells[1, 5].Value = "业务员";
+                    using (var headerRange = worksheet.Cells[1, 1, 1, 5])
+                    {
+                        headerRange.Style.Font.Bold = true;
+                        headerRange.Style.Fill.PatternType = OfficeOpenXml.Style.ExcelFillStyle.Solid;
+                        headerRange.Style.Fill.BackgroundColor.SetColor(System.Drawing.Color.LightGray);
+                        headerRange.Style.HorizontalAlignment = OfficeOpenXml.Style.ExcelHorizontalAlignment.Center;
+                    }
+                    
+                    // ✅ 问题件模式：解析 Tab 分隔的数据并写入5列
+                    for (int i = 0; i < trackingNumbers.Count; i++)
+                    {
+                        var parts = trackingNumbers[i].Split('\t');
+                        for (int col = 0; col < Math.Min(parts.Length, 5); col++)
+                        {
+                            worksheet.Cells[i + 2, col + 1].Value = parts[col];
+                        }
+                    }
+                    
+                    // ✅ 自动调整列宽
+                    for (int col = 1; col <= 5; col++)
+                    {
+                        worksheet.Column(col).AutoFit(12);
+                    }
                 }
-                for (int i = 0; i < trackingNumbers.Count; i++)
+                else
                 {
-                    worksheet.Cells[i + 2, 1].Value = trackingNumbers[i];
-                    worksheet.Cells[i + 2, 2].Value = storeName;
+                    // ✅ 未发货模式：保持原有的2列格式
+                    worksheet.Cells[1, 1].Value = "运单号";
+                    worksheet.Cells[1, 2].Value = "店铺";
+                    using (var headerRange = worksheet.Cells[1, 1, 1, 2])
+                    {
+                        headerRange.Style.Font.Bold = true;
+                        headerRange.Style.Fill.PatternType = OfficeOpenXml.Style.ExcelFillStyle.Solid;
+                        headerRange.Style.Fill.BackgroundColor.SetColor(System.Drawing.Color.LightGray);
+                        headerRange.Style.HorizontalAlignment = OfficeOpenXml.Style.ExcelHorizontalAlignment.Center;
+                    }
+                    for (int i = 0; i < trackingNumbers.Count; i++)
+                    {
+                        worksheet.Cells[i + 2, 1].Value = trackingNumbers[i];
+                        worksheet.Cells[i + 2, 2].Value = storeName;
+                    }
+                    worksheet.Column(1).AutoFit(15);
+                    worksheet.Column(2).AutoFit(20);
                 }
-                worksheet.Column(1).AutoFit(15);
-                worksheet.Column(2).AutoFit(20);
+                
                 package.SaveAs(new FileInfo(filePath));
             }
             return filePath;
@@ -3151,18 +3283,25 @@ namespace moshushou
         {
             if (sender is TextBlock textBlock && !string.IsNullOrEmpty(textBlock.Text))
             {
-                string trackingNumber = textBlock.Text.Trim();
-                if (trackingNumber.StartsWith("(") && trackingNumber.EndsWith(")")) return;
+                string textToCopy = textBlock.Text.Trim();
+                if (textToCopy.StartsWith("(") && textToCopy.EndsWith(")")) return;
+
+                // ✅ 修复：获取子项的原始完整数据
+                // 如果 DataContext 是 TreeViewNode 且有 RawData，优先使用 RawData
+                if (textBlock.DataContext is TreeViewNode node && !string.IsNullOrEmpty(node.RawData))
+                {
+                    textToCopy = node.RawData;
+                }
 
                 Task.Run(async () =>
                 {
-                    if (await SetClipboardWithRetryAsync(trackingNumber))
+                    if (await SetClipboardWithRetryAsync(textToCopy))
                     {
-                        Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = $"已复制单号: {trackingNumber}");
+                        Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = $"已复制: {textToCopy}");
                     }
                     else
                     {
-                        Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = "复制单号失败");
+                        Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = "复制失败");
                     }
                 });
                 e.Handled = true;
@@ -3291,7 +3430,13 @@ namespace moshushou
                     var sb = new StringBuilder();
                     sb.AppendLine(storeName);
                     foreach (var num in trackingNumbers) sb.AppendLine(num);
-                    sb.AppendLine(FIXED_MESSAGE);
+                    
+                    // ✅ 核心区分：只有在【未发货模式】下才追加固定催件话术
+                    // 问题件模式下，发送的内容本身就是完整的长表格行，无需额外话术
+                    if (!_isIssueMode)
+                    {
+                        sb.AppendLine(_searchConfig.FixedMessage);
+                    }
 
                     if (!await SetClipboardWithRetryAsync(sb.ToString())) throw new Exception("剪贴板被占用");
 
@@ -3884,6 +4029,7 @@ namespace moshushou
         }
 
         public string Text { get; set; }
+        public string RawData { get; set; }  // ✅ 新增：保存原始完整数据，用于复制
         public string StoreName { get; set; }
         public bool IsFileNode { get; set; }
         

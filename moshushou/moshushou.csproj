@@ -9,7 +9,14 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <None Remove="search.png" />
     <None Remove="search_config.json" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="search.png">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </EmbeddedResource>
   </ItemGroup>
 
   <ItemGroup>
@@ -31,9 +38,6 @@
   <ItemGroup>
     <None Update="businfo.json">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-    </None>
-    <None Update="search.png">
-      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
     </None>
     <None Update="search_config.json">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
