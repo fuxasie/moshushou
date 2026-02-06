@@ -52,6 +52,18 @@ namespace moshushou
         private void Log(string message) => _logAction?.Invoke(message);
 
         /// <summary>
+        /// ✅ [新增] 允许外部强制清除窗口缓存 (用于应对窗口假死或找不到的情况)
+        /// </summary>
+        public void ClearWindowCache(string appName)
+        {
+            if (_windowHandleCache.ContainsKey(appName))
+            {
+                _windowHandleCache.Remove(appName);
+                Log($"🧹 [Cache] 已手动清除 {appName} 的窗口句柄缓存");
+            }
+        }
+
+        /// <summary>
         /// 【V2 - 已修复】核心搜索方法。
         /// 新增 searchText 参数，使其不再依赖外部剪贴板状态，彻底解决剪贴板污染问题。
         /// </summary>

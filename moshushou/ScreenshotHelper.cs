@@ -12,9 +12,11 @@ using System.Threading.Tasks;
 // using System.Windows; // 移除以避免 Point/Size 歧义
 using WeChatOcr; // 确保已通过 NuGet 安装 WeChatOcr.Lite
 
+using moshushou.Yolo;
+
 namespace moshushou
 {
-    public class ScreenshotHelper
+    public class ScreenshotHelper : IDisposable
     {
         #region Win32 API Imports
         [DllImport("user32.dll", SetLastError = true)]
@@ -23,6 +25,9 @@ namespace moshushou
 
         [DllImport("user32.dll", SetLastError = true)]
         private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
+        [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
 
         [StructLayout(LayoutKind.Sequential)]
         public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
@@ -38,6 +43,7 @@ namespace moshushou
         private readonly string _baseDirectory;
         private readonly Action<string> _logAction;
         private readonly SearchConfig _config;
+        private readonly YoloWindowDetector _yoloDetector;
 
 
         public ScreenshotHelper(string baseStorageDirectory, SearchConfig config, Action<string> logAction = null)
@@ -45,43 +51,105 @@ namespace moshushou
             _baseDirectory = baseStorageDirectory;
             _config = config;
             _logAction = logAction;
+            try
+            {
+                _yoloDetector = new YoloWindowDetector();
+            }
+            catch (Exception ex)
+            {
+                _logAction?.Invoke($"⚠️ YOLO 模型加载失败: {ex.Message}");
+            }
         }
 
 
-        // ✅ 新增：获取当前窗口顶部的标题文字（复用 CaptureWindowTop 的裁剪逻辑）
+        // ✅ 新增：获取当前窗口顶部的标题文字（完全基于 YOLO）
         public async Task<string> GetWeChatWindowTitleTextAsync(IntPtr targetHwnd, bool isWework)
         {
             try
             {
+                if (_yoloDetector == null) return null;
                 if (targetHwnd == IntPtr.Zero || !GetWindowRect(targetHwnd, out RECT rect)) return null;
 
-                // 复用 CaptureWindowTop 的逻辑确定裁剪参数
-                string appIdentifier = isWework ? "企业微信" : "微信";
-                int rightCrop = GetRightCropAmount(appIdentifier);
-                int leftCrop = _config.WeChatCropLeft; // 默认 270
-                
-                int cropHeight = _config.WeChatCropHeight; // 默认 53
+                // 🚀 [改版] 根据用户反馈，模型使用全窗口训练，因此截取整个窗口
+                int width = rect.Right - rect.Left;
+                int height = rect.Bottom - rect.Top;
+                int screenX = rect.Left;
+                int screenY = rect.Top;
 
-                int cropWidth = rect.Right - rect.Left - leftCrop - rightCrop;
-                if (cropWidth <= 0) return null;
+                if (width <= 0 || height <= 0) return null;
 
-                // 截图
-                using (var bitmap = new Bitmap(cropWidth, cropHeight, PixelFormat.Format32bppArgb))
+                // 🛡️ [防御] 防止截取到桌面
+                if (IsDesktopPixelSize(rect) || IsSystemWindowClass(targetHwnd))
+                {
+                    _logAction?.Invoke($"⚠️ [GetTitle] 拦截到桌面/系统窗口截取请求: {targetHwnd}");
+                    return null;
+                }
+
+                using (var bitmap = new Bitmap(width, height, PixelFormat.Format32bppArgb))
                 {
                     using (var graphics = Graphics.FromImage(bitmap))
                     {
-                        // 核心：这里的坐标 (rect.Left + LEFT_CROP) 就是原代码中识别群名的位置
-                        graphics.CopyFromScreen(rect.Left + leftCrop, rect.Top, 0, 0, new Size(cropWidth, cropHeight), CopyPixelOperation.SourceCopy);
+                        graphics.CopyFromScreen(screenX, screenY, 0, 0, new Size(width, height), CopyPixelOperation.SourceCopy);
                     }
 
-                    // 放大并 OCR
-                    using (var scaledMap = ScaleImage(bitmap, 3))
+                    // 1. YOLO 识别
+                    var yoloResults = _yoloDetector.Detect(bitmap);
+                    
+                    // 2. 保存调试图 [新增]
+                    string debugDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Debug_Yolo", DateTime.Now.ToString("yyyyMMdd"));
+                    Directory.CreateDirectory(debugDir);
+                    string debugFile = Path.Combine(debugDir, $"Title_{DateTime.Now:HHmmss_fff}.png");
+                    _yoloDetector.InferenceWrapper.SaveDebugImage(bitmap, yoloResults, debugFile);
+
+                    // 🚨 [调整] 场景宽松验证 (Relaxed Scene Validation)
+                    // 原则：只要有 "群名" 和 "输入框" 且置信度及格，就认为是聊天窗口。
+                    // "聊天信息" (Label_ChatInfo) 并非所有群/人都有(或识别不稳定)，故不强求。
+                    float threshold = 0.6f; 
+                    bool hasGroupName = yoloResults.Any(r => r.LabelName == YoloWindowDetector.Label_GroupName && r.Confidence > threshold);
+                    bool hasChatBox = yoloResults.Any(r => r.LabelName == YoloWindowDetector.Label_ChatBox && r.Confidence > threshold);
+                    
+                    // 仅记录信息用于调试，不作为硬性拦截条件
+                    var chatInfo = yoloResults.FirstOrDefault(r => r.LabelName == YoloWindowDetector.Label_ChatInfo);
+                    string chatInfoLog = chatInfo != null ? $"{chatInfo.Confidence:F2}" : "None";
+
+                    if (!hasGroupName || !hasChatBox)
                     {
-                        string ocrText = await PerformOcrAsync(scaledMap);
-                        // 清理结果（移除括号等干扰）
-                        return CleanGroupName(ocrText);
+                        _logAction?.Invoke($"⚠️ [GetTitle] 场景验证不通过: 群名={hasGroupName}, 输入框={hasChatBox} (阈值>{threshold:F1}), InfoConf={chatInfoLog}");
+                        return null; 
+                    }
+
+                    // 3. 筛选 "群聊名字"
+                    var target = yoloResults
+                        .Where(r => r.LabelName == YoloWindowDetector.Label_GroupName)
+                        .OrderByDescending(r => r.Confidence)
+                        .FirstOrDefault();
+
+                    if (target != null)
+                    {
+                        var bbox = target.BBox;
+                        
+                        // 🔧 [回退] 用户要求去掉裁切扩大，直接使用 YOLO 原始框
+                        using (var crop = new Bitmap(bbox.Width, bbox.Height))
+                        using (var g = Graphics.FromImage(crop))
+                        {
+                            g.DrawImage(bitmap, new Rectangle(0, 0, bbox.Width, bbox.Height), bbox, GraphicsUnit.Pixel);
+                        // 🔧 [优化] 使用 PreprocessForOcr 替代 ScaleImage，解决纯数字/边缘字符识别问题
+                        using (var processed = PreprocessForOcr(crop, 3))
+                        {
+                            // 📷 [调试] 保存 OCR 识别用的裁切图
+                            string cropDebugFile = Path.Combine(debugDir, $"Title_Crop_{DateTime.Now:HHmmss_fff}.png");
+                            processed.Save(cropDebugFile, ImageFormat.Png);
+                            // _logAction?.Invoke($"🖼️ [OCR调试] 标题裁切图已存: {cropDebugFile}");
+
+                            string ocrText = await PerformOcrAsync(processed);
+                            string cleaned = CleanGroupName(ocrText);
+                            _logAction?.Invoke($"🏷️ YOLO 识别窗口标题: '{cleaned}' (置信度:{target.Confidence:P0})");
+                            return cleaned;
+                        }
+                        }
                     }
                 }
+                return null;
             }
             catch (Exception ex)
             {
@@ -90,47 +158,75 @@ namespace moshushou
             }
         }
 
-
-
-
-
-        // ✅ [新增] 专门计算输入框点击坐标的方法
-        public bool GetInputBoxClickCoordinates(IntPtr hwnd, bool isWework, out int x, out int y)
+        // ✅ [新增] 专门计算输入框点击坐标的方法 (增强：YOLO 辅助)
+        public async Task<(bool success, int x, int y)> GetInputBoxClickCoordinatesAsync(IntPtr hwnd, bool isWework)
         {
-            x = 0; y = 0;
-            if (hwnd == IntPtr.Zero) return false;
+            if (hwnd == IntPtr.Zero || !GetWindowRect(hwnd, out RECT rect)) return (false, 0, 0);
 
-            if (!GetWindowRect(hwnd, out RECT rect)) return false;
-
-            // ---------------------------------------------------------
-            // 📐 坐标计算核心逻辑
-            // ---------------------------------------------------------
-            // 微信 PC 版：
-            //   侧边栏(图标+列表) 约 250~300px
-            //   偏移 310px 比较稳健 (270 + 40)
-            //
-            // 企业微信：
-            //   侧边栏通常更宽
-            //   偏移 380px 比较稳健 (310 + 70)
-            // ---------------------------------------------------------
-
-            int xOffset = isWework ? 380 : 310;
-            // 如果是微信 4.0，可能需要微调，暂时用硬编码，后续也可移入 Config
-            if (!isWework && _config.WeChatProcessName != "WeChat") 
+            // 🚀 [改版] 尝试 YOLO 定位 聊天输入框
+            try
             {
-                 // 预留位置
+                if (_yoloDetector != null)
+                {
+                // 🚀 [改版] 截取整个窗口 (Full Window)
+                int w = rect.Right - rect.Left;
+                int h = rect.Bottom - rect.Top;
+                int screenX = rect.Left;
+                int screenY = rect.Top;
+
+                if (w > 0 && h > 0)
+                {
+                    // 🛡️ [防御] 防止截取到桌面
+                    if (IsDesktopPixelSize(rect) || IsSystemWindowClass(hwnd))
+                    {
+                         _logAction?.Invoke($"⚠️ [GetInput] 拦截到桌面/系统窗口截取请求: {hwnd}");
+                         return (false, 0, 0);
+                    }
+
+                    using (var bitmap = new Bitmap(w, h, PixelFormat.Format32bppArgb))
+                    {
+                        using (var g = Graphics.FromImage(bitmap))
+                        {
+                            g.CopyFromScreen(screenX, screenY, 0, 0, new Size(w, h), CopyPixelOperation.SourceCopy);
+                        }
+
+                            var results = _yoloDetector.Detect(bitmap);
+                            
+                            // 调试保存
+                            string debugDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Debug_Yolo", DateTime.Now.ToString("yyyyMMdd"));
+                            Directory.CreateDirectory(debugDir);
+                            string debugFile = Path.Combine(debugDir, $"InputBox_{DateTime.Now:HHmmss_fff}.png");
+                            _yoloDetector.InferenceWrapper.SaveDebugImage(bitmap, results, debugFile);
+
+                            // 查找 "聊天框" (通常包含输入框)
+                            var chatBox = results.Where(r => r.LabelName == YoloWindowDetector.Label_ChatBox).OrderByDescending(r => r.Confidence).FirstOrDefault();
+                            if (chatBox != null)
+                            {
+                                // 输入框通常在 ChatBox 识别框的底部上方一点点
+                                int clickX = screenX + chatBox.BBox.X + chatBox.BBox.Width / 2;
+                                int clickY = screenY + chatBox.BBox.Bottom - 30; // 向上偏移以避开底部边缘
+                                
+                                _logAction?.Invoke($"🎯 YOLO 定位输入框成功: ({clickX}, {clickY})");
+                                return (true, clickX, clickY);
+                            }
+                        }
+                    }
+                }
             }
-            
-            int yOffset = 70; // 距离底部的高度
+            catch (Exception ex)
+            {
+                _logAction?.Invoke($"⚠️ YOLO 输入框检测失败，使用兜底逻辑: {ex.Message}");
+            }
 
-            x = rect.Left + xOffset;
-            y = rect.Bottom - yOffset;
+            // 📐 坐标计算兜底逻辑 (如果 YOLO 失败)
+            int x = rect.Left + (isWework ? 350 : 310);
+            int y = rect.Bottom - (isWework ? 80 : 70);
 
-            // 简单的越界检查 (防止窗口被缩得太小)
+            // 简单的越界检查
             if (x >= rect.Right) x = rect.Right - 50;
             if (y >= rect.Bottom) y = rect.Bottom - 20;
 
-            return true;
+            return (true, x, y);
         }
 
 
@@ -184,8 +280,12 @@ namespace moshushou
             // - 去除常见标点符号 (包括中文标点、截断用的点、波浪号等)
             // - 统一转小写
             string pattern = @"\s+|[.,;:'""()\-\[\]{}<>/\\|、，。；：""（）—…\.~～〜]";
-            string cleanTarget = Regex.Replace(normalizedTarget, pattern, "").ToLower();
-            string cleanOCR = Regex.Replace(normalizedOCR, pattern, "").ToLower();
+
+            // ✅ 定义局部函数，供后续分词匹配使用
+            string Clean(string s) => Regex.Replace(s, pattern, "").ToLower();
+
+            string cleanTarget = Clean(normalizedTarget);
+            string cleanOCR = Clean(normalizedOCR);
 
             // 防止清洗后为空
             if (string.IsNullOrEmpty(cleanTarget) || string.IsNullOrEmpty(cleanOCR)) return false;
@@ -228,7 +328,43 @@ namespace moshushou
             // 🎯 [优化] 降低阈值到 2，应对 OCR 将群名切分为多个短语的情况 (如 "中通" "快递")
             if (cleanTarget.Contains(cleanOCR) && cleanOCR.Length >= 2) return true;
 
-            // 5. 莱文斯坦距离 (兜底逻辑)
+            // 5. 【增强】分词乱序匹配 (解决 "A B" 变成 "B A" 或 "BA" 的问题)
+            // 场景：SearchText="tb522008016 郭润斌88"  OCR="郭润斌88..tb522008016"
+            // 逻辑：将 Target 按空格/标点拆分，如果 OCR 包含所有核心片段，视为匹配
+            var parts = expected.Split(new[] { ' ', ',', '，', '-', '_' }, StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length > 1) // 只有当 Target 本身就是复合词时才用这个逻辑
+            {
+                int matchCount = 0;
+                int totalLen = 0;
+                foreach (var part in parts)
+                {
+                    string cleanPart = Clean(part);
+                    if (string.IsNullOrEmpty(cleanPart)) continue;
+
+                    // 忽略太短的连接词
+                    if (cleanPart.Length < 2 && parts.Length > 2) continue; 
+
+                    totalLen++;
+                    if (cleanOCR.Contains(cleanPart))
+                    {
+                        matchCount++;
+                    }
+                }
+
+                // 如果片段匹配率超过 80% (或全部匹配)，视为成功
+                // 例如 3个词匹配了3个，或者 5个词匹配了4个
+                if (totalLen > 0 && (double)matchCount / totalLen >= 0.99) // 这里要求极其严格，必须全中(针对用户案例)或者允许极少缺失
+                {
+                    // 再次检查长度差异，防止匹配到"包含"但"多出太多内容"的情况（虽然CheckSearchResult通常不会）
+                    return true;
+                }
+                
+                // 宽松模式：针对用户这种 "tb522008016 郭润斌88 雄兴风扇" -> "郭润斌88雄兴风扇tb522008016"
+                // 只要所有部分都找到了，不管顺序，直接 True
+                if (matchCount == totalLen && totalLen > 0) return true;
+            }
+
+            // 6. 莱文斯坦距离 (兜底逻辑)
             int dist = LevenshteinDistance(cleanTarget, cleanOCR);
             int maxLength = Math.Max(cleanTarget.Length, cleanOCR.Length);
             double similarity = 1.0 - (double)dist / maxLength;
@@ -483,9 +619,9 @@ namespace moshushou
                         BusinessInfo ocrResult = new BusinessInfo { StoreName = storeName, Source = appIdentifier };
                         try
                         {
-                            using (var scaledBmp = ScaleImage(bitmap, 3))
+                            using (var processed = PreprocessForOcr(bitmap, 3))
                             {
-                                string rawText = await PerformOcrAsync(scaledBmp);
+                                string rawText = await PerformOcrAsync(processed);
                                 ocrResult.GroupName = CleanGroupName(rawText);
                             }
                         }
@@ -538,9 +674,10 @@ namespace moshushou
                 using (var originalBitmap = new Bitmap(ms))
                 {
                     // 依然保持放大策略以确保群名识别准确率 (群名文字通常较小)
-                    using (var finalBitmapToOcr = ScaleImage(originalBitmap, 3))
+                    // 🚀 [优化] 统一使用 PreprocessForOcr
+                    using (var processed = PreprocessForOcr(originalBitmap, 3))
                     {
-                        string rawText = await PerformOcrAsync(finalBitmapToOcr);
+                        string rawText = await PerformOcrAsync(processed);
                         recognizedGroupName = CleanGroupName(rawText);
                     }
                 } // 离开 using 块，Bitmap 资源释放
@@ -673,37 +810,49 @@ namespace moshushou
         /// <summary>
         /// ✅ [通用版] 验证搜索结果列表 (带网络搜索排除逻辑)
         /// 支持：微信 (53,93) 和 企业微信 (78,90)
-        /// 🚫 新增：排除"搜索网络结果"区域的匹配项
+        /// 🚫 改版：使用 YOLO 检测 "搜索群聊" 或 "最近搜索群聊" 标签
+        /// </summary>
+        /// <summary>
+        /// ✅ [通用版] 验证搜索结果列表 (带网络搜索排除逻辑)
+        /// 支持：微信 (53,93) 和 企业微信 (78,90)
+        /// 🚫 改版：使用 YOLO 检测 "搜索群聊" 或 "最近搜索群聊" 标签
         /// </summary>
         public async Task<bool> CheckSearchResultAsync(IntPtr targetHwnd, string expectedText, bool isWework)
         {
+            var result = await FindAndVerifySearchResultAsync(targetHwnd, expectedText, isWework);
+            return result.success;
+        }
+
+        /// <summary>
+        /// ✅ [合并版] 验证搜索结果并返回点击坐标 (合并 StepA 和 StepB)
+        /// 避免 StepA 成功但 StepB 重新截图导致失败的问题
+        /// </summary>
+        public async Task<(bool success, Point? clickPoint)> FindAndVerifySearchResultAsync(IntPtr targetHwnd, string expectedText, bool isWework)
+        {
             try
             {
-                if (targetHwnd == IntPtr.Zero || !GetWindowRect(targetHwnd, out RECT rect)) return false;
-
-                int relX, relY, width, height;
-
-                if (isWework)
+                if (_yoloDetector == null)
                 {
-                    // 🏢 企业微信坐标
-                    int[] rects = _config.WeWorkSearchResultRect ?? new int[] { 78, 90, 394, 58 };
-                    relX = rects[0]; relY = rects[1];
-                    width = rects[2];
-                    height = rects[3];
-                }
-                else
-                {
-                    // 💬 微信坐标 - 强制使用用户指定参数 (忽略Config干扰)
-                    int[] rects = new int[] { 74, 57, 326, 400 };
-                    relX = rects[0]; relY = rects[1];
-                    width = rects[2];
-                    height = rects[3];
+                    _logAction?.Invoke("❌ YOLO Detector 未初始化");
+                    return (false, null);
                 }
 
-                int screenX = rect.Left + relX;
-                int screenY = rect.Top + relY;
+                if (targetHwnd == IntPtr.Zero || !GetWindowRect(targetHwnd, out RECT rect)) return (false, null);
 
-                if (width <= 0 || height <= 0) return false;
+                // 🛡️ [防御] 防止截取到桌面 (当窗口失焦时)
+                if (IsDesktopPixelSize(rect) || IsSystemWindowClass(targetHwnd))
+                {
+                    System.Diagnostics.Debug.WriteLine($"⚠️ [FindAndVerify] 拦截到桌面/系统窗口截取请求: {targetHwnd}");
+                    return (false, null);
+                }
+
+                // 🚀 [改版] 截取整个窗口 (Full Window)
+                int width = rect.Right - rect.Left;
+                int height = rect.Bottom - rect.Top;
+                int screenX = rect.Left;
+                int screenY = rect.Top;
+
+                if (width <= 0 || (rect.Bottom - rect.Top) < 100) return (false, null);
 
                 using (var bitmap = new Bitmap(width, height, PixelFormat.Format32bppArgb))
                 {
@@ -712,182 +861,77 @@ namespace moshushou
                         graphics.CopyFromScreen(screenX, screenY, 0, 0, new Size(width, height), CopyPixelOperation.SourceCopy);
                     }
 
-                    // 使用 3 倍放大进行 OCR
-                    using (var scaledMap = ScaleImage(bitmap, 3))
+                    // 1. YOLO 检测
+                    var results = _yoloDetector.Detect(bitmap);
+                    
+                    // 2. 保存调试图
+                    string debugDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Debug_Yolo", DateTime.Now.ToString("yyyyMMdd"));
+                    Directory.CreateDirectory(debugDir);
+                    string debugFile = Path.Combine(debugDir, $"MergerSearch_{DateTime.Now:HHmmss_fff}.png");
+                    _yoloDetector.InferenceWrapper.SaveDebugImage(bitmap, results, debugFile);
+                    // _logAction?.Invoke($"🖼️ YOLO 识别图已存: {debugFile}");
+
+                    // 3. 筛选目标：搜索群聊 或 最近搜索群聊
+                    var targets = results
+                        .Where(r => r.LabelName == YoloWindowDetector.Label_SearchGroup || 
+                                    r.LabelName == YoloWindowDetector.Label_RecentGroup)
+                        .OrderByDescending(r => r.Confidence)
+                        .ToList();
+
+                    if (targets.Count == 0)
                     {
-                        var bytes = ImageToBytes(scaledMap);
-                        // ✅ [修复] 强制异步延续，防止 OCR 回调线程（非托管/临时）卡死后续逻辑
-                        var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-                        var ocr = new ImageOcr();
-
-                        ocr.Run(bytes, (path, result) =>
-                        {
-                            try
-                            {
-                                if (result?.OcrResult?.SingleResult == null)
-                                {
-                                    System.Diagnostics.Debug.WriteLine("❌ [CheckSearchResult] OCR 结果为空");
-                                    tcs.TrySetResult(false);
-                                    return;
-                                }
-
-                                // 🚫 步骤 1: 定位"搜索网络结果"区域
-                                float searchWebOriginalY_Start = -1;
-                                float searchWebOriginalY_End = -1;
-
-                                foreach (var item in result.OcrResult.SingleResult)
-                                {
-                                    if (item != null && !string.IsNullOrEmpty(item.SingleStrUtf8))
-                                    {
-                                        string text = item.SingleStrUtf8;
-                                        // 支持多种 OCR 识别变体
-                                        if (text.Contains("搜索网络结果") || text.Contains("搜索网络") || 
-                                            text.Contains("搜一搜") || text.Contains("网络搜索") || 
-                                            text.Contains("网络结果") || text.Contains("六搜索") ||
-                                            text.Contains("不搜索") || text.Contains("搜索网"))
-                                        {
-                                            searchWebOriginalY_Start = item.Top / 3.0f;
-                                            System.Diagnostics.Debug.WriteLine($"🚫 [CheckSearchResult] 发现网络搜索标记 '{text}'，原图StartY={searchWebOriginalY_Start}");
-                                            break;
-                                        }
-                                    }
-                                }
-
-                                // 🔍 步骤 1.5: 用图像搜索 search.png 来确定排除区域
-                                // ✅ 修复：无论 OCR 是否找到起点，都需要用图像搜索确定终点
-                                try
-                                {
-                                    string iconPath = System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "search.png");
-                                    if (System.IO.File.Exists(iconPath))
-                                    {
-                                        using (var iconBmp = new Bitmap(iconPath))
-                                        {
-                                            // 如果 OCR 没找到起点，用图像搜索找第一个图标作为起点
-                                            if (searchWebOriginalY_Start < 0)
-                                            {
-                                                var firstRect = FindFirstImageOccurrence(bitmap, iconBmp);
-                                                if (firstRect.HasValue)
-                                                {
-                                                    searchWebOriginalY_Start = firstRect.Value.Top - 10;
-                                                    System.Diagnostics.Debug.WriteLine($"🚫 [CheckSearchResult] (图像兜底) 找到第一个search图标，设定排除起点Y={searchWebOriginalY_Start}");
-                                                }
-                                            }
-
-                                            // ✅ 关键修复：无论起点来源，都要用图像搜索找终点
-                                            if (searchWebOriginalY_Start >= 0)
-                                            {
-                                                var lastRect = FindLastImageOccurrence(bitmap, iconBmp);
-                                                if (lastRect.HasValue)
-                                                {
-                                                    searchWebOriginalY_End = lastRect.Value.Bottom;
-                                                    System.Diagnostics.Debug.WriteLine($"🚫 [CheckSearchResult] 找到最后一个search图标，原图EndY={searchWebOriginalY_End}");
-                                                }
-                                                else
-                                                {
-                                                    // 如果图像搜索也没找到，设置默认范围（起点+80px）
-                                                    searchWebOriginalY_End = searchWebOriginalY_Start + 80;
-                                                    System.Diagnostics.Debug.WriteLine($"🚫 [CheckSearchResult] 未找到search图标，使用默认范围EndY={searchWebOriginalY_End}");
-                                                }
-                                            }
-                                        }
-                                    }
-                                    else
-                                    {
-                                        // search.png 不存在时，设置默认范围
-                                        if (searchWebOriginalY_Start >= 0)
-                                        {
-                                            searchWebOriginalY_End = searchWebOriginalY_Start + 80;
-                                            System.Diagnostics.Debug.WriteLine($"⚠️ [CheckSearchResult] search.png 不存在，使用默认范围EndY={searchWebOriginalY_End}");
-                                        }
-                                    }
-                                }
-                                catch (Exception ex)
-                                {
-                                    System.Diagnostics.Debug.WriteLine($"⚠️ [CheckSearchResult] 图像搜索出错: {ex.Message}");
-                                    // 出错时设置默认范围
-                                    if (searchWebOriginalY_Start >= 0 && searchWebOriginalY_End < searchWebOriginalY_Start)
-                                    {
-                                        searchWebOriginalY_End = searchWebOriginalY_Start + 80;
-                                    }
-                                }
-
-                                // ✅ 步骤 2: 在安全区域内查找目标
-                                bool foundInSafeZone = false;
-
-                                foreach (var item in result.OcrResult.SingleResult)
-                                {
-                                    if (item != null && !string.IsNullOrEmpty(item.SingleStrUtf8))
-                                    {
-                                        if (IsFuzzyMatch(expectedText, item.SingleStrUtf8))
-                                        {
-                                            float itemOriginalTop = item.Top / 3.0f;
-                                            float itemOriginalCenterY = (item.Top + item.Bottom) / 2.0f / 3.0f;
-
-                                            // 安全检查：确保不在网络搜索区域内
-                                            bool isInDangerZone = false;
-                                            if (searchWebOriginalY_Start >= 0 && searchWebOriginalY_End > searchWebOriginalY_Start)
-                                            {
-                                                // 精确区间排除：只排除 [起点-5, 终点+5] 区间内的内容
-                                                if (itemOriginalCenterY >= searchWebOriginalY_Start - 5 && itemOriginalCenterY <= searchWebOriginalY_End + 5)
-                                                {
-                                                    isInDangerZone = true;
-                                                }
-                                            }
-
-                                            if (isInDangerZone)
-                                            {
-                                                System.Diagnostics.Debug.WriteLine($"🚫 [CheckSearchResult] 目标 '{item.SingleStrUtf8}' 在网络搜索区域内 (Y={itemOriginalTop})，忽略");
-                                                continue; // 继续查找其他匹配项
-                                            }
-
-                                            System.Diagnostics.Debug.WriteLine($"✅ [CheckSearchResult] 在安全区域找到目标: '{item.SingleStrUtf8}' (Y={itemOriginalTop})");
-                                            foundInSafeZone = true;
-                                            break;
-                                        }
-                                    }
-                                }
-
-                                if (!foundInSafeZone)
-                                {
-                                    System.Diagnostics.Debug.WriteLine($"❌ [CheckSearchResult] 未在安全区域找到目标 '{expectedText}'");
-                                }
-
-                                tcs.TrySetResult(foundInSafeZone);
-                            }
-                            catch (Exception ex)
-                            {
-                                System.Diagnostics.Debug.WriteLine($"💥 [CheckSearchResult] OCR 处理异常: {ex.Message}");
-                                tcs.TrySetException(ex);
-                            }
-                            finally
-                            {
-                                try { if (File.Exists(path)) File.Delete(path); } catch { }
-                            }
-                        });
-
-                        var completedTask = await Task.WhenAny(tcs.Task, Task.Delay(8000));
-                        
-                        // ✅ [防止GC] 保持 ocr 对象存活，防止在回调回来之前被回收导致 native crash
-                        GC.KeepAlive(ocr);
-
-                        if (completedTask == tcs.Task)
-                        {
-                            return await tcs.Task;
-                        }
-                        
-                        System.Diagnostics.Debug.WriteLine("⚠️ [CheckSearchResult] OCR 超时");
-                        return false;
+                        System.Diagnostics.Debug.WriteLine($"❌ [FindAndVerify] YOLO 未检测到任何搜索结果标签");
+                        return (false, null);
                     }
+
+                    System.Diagnostics.Debug.WriteLine($"✅ [FindAndVerify] YOLO 检测到 {targets.Count} 个潜在结果");
+
+                    // 3. 验证文本
+                    foreach (var target in targets)
+                    {
+                        // 裁剪出该结果区域进行 OCR
+                        var bbox = target.BBox;
+                        
+                        if (bbox.Width <= 0 || bbox.Height <= 0) continue;
+                        
+                        using (var crop = new Bitmap(bbox.Width, bbox.Height))
+                        using (var g = Graphics.FromImage(crop))
+                        {
+                            g.DrawImage(bitmap, new Rectangle(0, 0, bbox.Width, bbox.Height), bbox, GraphicsUnit.Pixel);
+                            
+                            // 🚀 [优化] 预处理：放大并添加白边 (Padding)
+                            // 纯数字或短文本易受边缘干扰，加白边显著提升准确率
+                            using (var processed = PreprocessForOcr(crop, 3)) 
+                            {
+                                // 📷 [调试] 保存预处理后的图，帮助分析乱码原因
+                                // string debugOcrFile = Path.Combine(debugDir, $"OCR_Pre_{DateTime.Now:HHmmss_fff}_{target.LabelName}.png");
+                                // processed.Save(debugOcrFile, ImageFormat.Png);
+
+                                string ocrText = await PerformOcrAsync(processed);
+                                System.Diagnostics.Debug.WriteLine($"🔍 [FindAndVerify] 候选: '{ocrText}' (Conf: {target.Confidence:F2})");
+                                
+                                if (IsFuzzyMatch(expectedText, ocrText))
+                                {
+                                    System.Diagnostics.Debug.WriteLine($"✅ [FindAndVerify] 目标匹配成功: '{expectedText}'");
+                                    
+                                    // 计算点击坐标 (屏幕坐标)
+                                    int clickX = screenX + bbox.X + bbox.Width / 2;
+                                    int clickY = screenY + bbox.Y + bbox.Height / 2;
+                                    
+                                    return (true, new Point(clickX, clickY));
+                                }
+                            }
+                        }
+                    }
+                    
+                    System.Diagnostics.Debug.WriteLine($"❌ [FindAndVerify] 检测到结果但不匹配期望文本 '{expectedText}'");
+                    return (false, null);
                 }
             }
             catch (Exception ex)
             {
-                _logAction?.Invoke($"💥 搜索验证出错: {ex.Message}");
-                return false;
-            }
-            finally
-            {
-                 System.Diagnostics.Debug.WriteLine("🏁 [DEBUG_TRACE] CheckSearchResultAsync 方法结束 (Finally)");
+                _logAction?.Invoke($"💥 搜索验证合并版出错: {ex.Message}");
+                return (false, null);
             }
         }
 
@@ -902,6 +946,7 @@ namespace moshushou
                 if (targetHwnd == IntPtr.Zero || !GetWindowRect(targetHwnd, out RECT rect)) return null;
 
                 // 默认搜索区域：整个窗口的左侧 (例如前 400px，高度覆盖全部)
+                // 默认搜索区域：整个窗口的左侧 (例如前 400px，高度覆盖全部)
                 int relX = relativeSearchArea?[0] ?? 0;
                 int relY = relativeSearchArea?[1] ?? 60; // 避开顶栏
                 int width = relativeSearchArea?[2] ?? 400; // 搜索栏通常在左侧
@@ -910,6 +955,14 @@ namespace moshushou
                 // 越界保护
                 if (width <= 0) width = 200;
                 if (height <= 0) height = 200;
+
+                // 🛡️ [防御] 防止截取到桌面
+                if (IsDesktopPixelSize(rect) || IsSystemWindowClass(targetHwnd))
+                {
+                    // FindKeyword 比较特殊，有时候也许是在桌面找东西？但本项目应该都是在微信窗口找
+                    _logAction?.Invoke($"⚠️ [FindKeyword] 拦截到桌面/系统窗口截取请求: {targetHwnd}");
+                    return null;
+                }
 
                 int screenX = rect.Left + relX;
                 int screenY = rect.Top + relY;
@@ -980,29 +1033,123 @@ namespace moshushou
         }
         
         /// <summary>
-        /// ✅ [新增] 专门用于查找弹窗上的文字坐标 (如 "使用原文件")
+        /// ✅ [核心功能] 查找弹窗上的文字坐标 (如 "使用原文件")
+        /// 🚫 改版：截取窗口大部分区域，由 YOLO 在大图中检测
         /// </summary>
         public async Task<Point?> FindPopupTextPositionAsync(IntPtr targetHwnd, string keyword)
         {
-            // 弹窗通常在屏幕中央，或者作为子窗口在父窗口中央
-            // 如果我们能获取 targetHwnd (主窗口)，可以截取主窗口中心区域
-            // 或者简单点，截取整个主窗口，因为弹窗一定在上面
-            
-            // 为了效率，假设弹窗在主窗口的中心区域 (50% 宽, 50% 高)
-            if (targetHwnd == IntPtr.Zero || !GetWindowRect(targetHwnd, out RECT rect)) return null;
-            
-            int w = rect.Right - rect.Left;
-            int h = rect.Bottom - rect.Top;
-            
-            // 搜索区域：中心 60% 区域
-            int searchW = (int)(w * 0.8);
-            int searchH = (int)(h * 0.8);
-            int marginX = (w - searchW) / 2;
-            int marginY = (h - searchH) / 2;
-            
-            int[] area = new int[] { marginX, marginY, searchW, searchH };
-            
-            return await FindKeywordPositionAsync(targetHwnd, keyword, area);
+            try
+            {
+                if (_yoloDetector == null) return null;
+                if (targetHwnd == IntPtr.Zero || !GetWindowRect(targetHwnd, out RECT rect)) return null;
+
+                // 🚀 [改版] 截取整个窗口 (Full Window)
+                int width = rect.Right - rect.Left;
+                int height = rect.Bottom - rect.Top;
+                int screenX = rect.Left;
+                int screenY = rect.Top;
+
+                if (width <= 0 || height <= 0) return null;
+
+                // 🛡️ [防御] 防止截取到桌面
+                if (IsDesktopPixelSize(rect) || IsSystemWindowClass(targetHwnd))
+                {
+                    _logAction?.Invoke($"⚠️ [FindPopup] 拦截到桌面/系统窗口截取请求: {targetHwnd}");
+                    return null;
+                }
+
+                using (var bitmap = new Bitmap(width, height, PixelFormat.Format32bppArgb))
+                {
+                    using (var g = Graphics.FromImage(bitmap))
+                    {
+                        g.CopyFromScreen(screenX, screenY, 0, 0, new Size(width, height), CopyPixelOperation.SourceCopy);
+                    }
+
+                    // 1. YOLO 识别
+                    var yoloResults = _yoloDetector.Detect(bitmap);
+                    
+                    // 2. 保存调试图 [新增]
+                    string debugDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Debug_Yolo", DateTime.Now.ToString("yyyyMMdd"));
+                    Directory.CreateDirectory(debugDir);
+                    string debugFile = Path.Combine(debugDir, $"Search_{DateTime.Now:HHmmss_fff}.png");
+                    _yoloDetector.InferenceWrapper.SaveDebugImage(bitmap, yoloResults, debugFile);
+                    _logAction?.Invoke($"🖼️ YOLO 识别图已存: {debugFile}");
+
+                    // 3. 筛选 "在线文档"
+                    var popupRect = _yoloDetector.FindOnlineDocPopupBBox(bitmap);
+                    
+                    if (popupRect.HasValue)
+                    {
+                        var rectVal = popupRect.Value;
+                        _logAction?.Invoke($"✅ YOLO 定位到弹窗区域: {rectVal}");
+
+                        // 裁剪出弹窗区域
+                        using (var crop = bitmap.Clone(rectVal, bitmap.PixelFormat))
+                        using (var scaled = ScaleImage(crop, 2)) // 2倍放大 OCR
+                        {
+                            var tcs = new TaskCompletionSource<Point?>(TaskCreationOptions.RunContinuationsAsynchronously);
+                            var bytes = ImageToBytes(scaled);
+                            var ocr = new ImageOcr();
+
+                            try
+                            {
+                                ocr.Run(bytes, (path, result) =>
+                                {
+                                    try
+                                    {
+                                        if (result?.OcrResult?.SingleResult != null)
+                                        {
+                                            foreach (var item in result.OcrResult.SingleResult)
+                                            {
+                                                if (!string.IsNullOrEmpty(item.SingleStrUtf8) &&
+                                                    IsFuzzyMatch("使用原文件", item.SingleStrUtf8))
+                                                {
+                                                    // 找到文字！
+                                                    // 坐标转换: OCR坐标 -> crop坐标 -> 全图坐标 -> 屏幕坐标
+                                                    float centerX = (item.Left + item.Right) / 2.0f / 2.0f; // /2.0f 因为缩放了2倍
+                                                    float centerY = (item.Top + item.Bottom) / 2.0f / 2.0f;
+
+                                                    int finalX = screenX + rectVal.X + (int)centerX;
+                                                    int finalY = screenY + rectVal.Y + (int)centerY;
+
+                                                    _logAction?.Invoke($"🎯 OCR 精确定位 '使用原文件': ({finalX}, {finalY})");
+                                                    tcs.TrySetResult(new Point(finalX, finalY));
+                                                    return;
+                                                }
+                                            }
+                                        }
+                                        tcs.TrySetResult(null);
+                                    }
+                                    catch (Exception ex) { tcs.TrySetException(ex); }
+                                    finally
+                                    {
+                                        try { if (File.Exists(path)) File.Delete(path); } catch { }
+                                    }
+                                });
+
+                                await Task.WhenAny(tcs.Task, Task.Delay(3000));
+                                if (tcs.Task.IsCompleted && tcs.Task.Result != null)
+                                {
+                                    return tcs.Task.Result;
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                _logAction?.Invoke($"⚠️ OCR 识别异常: {ex.Message}");
+                            }
+                        }
+                        
+                        _logAction?.Invoke("🚫 未在弹窗中识别到 '使用原文件'，放弃点击。");
+                        return null;
+                    }
+                }
+                return null;
+            }
+            catch (Exception ex)
+            {
+                _logAction?.Invoke($"💥 FindPopupTextPositionAsync 异常: {ex.Message}");
+                return null;
+            }
         }
 
 
@@ -1010,117 +1157,29 @@ namespace moshushou
 
         /// <summary>
         /// ✅ [优化版] 动态定位群聊点击位置
-        /// 策略优先级:
-        /// 1. 查找"最常使用"或"群聊"锚点，点击其下方
-        /// 2. 如果没有锚点，直接搜索目标群聊名称并点击
-        /// 3. 排除"搜索网络结果"下方的内容
+        /// 🚫 改版：完全移除固定坐标配置，改为自适应检测
         /// </summary>
-        /// <param name="targetHwnd">微信/企业微信窗口句柄</param>
-        /// <param name="targetGroupName">要搜索的目标群聊名称 (可选)</param>
-        /// <param name="isWework">是否为企业微信</param>
-        /// <returns>屏幕点击坐标, null 表示未找到</returns>
         public async Task<Point?> FindGroupChatClickPositionAsync(IntPtr targetHwnd, string targetGroupName = null, bool isWework = false)
         {
-            System.Diagnostics.Debug.WriteLine($"🔍 [FindGroupChat] 方法入口, hwnd={targetHwnd}, 目标群聊='{targetGroupName}', isWework={isWework}");
             try
             {
-                if (targetHwnd == IntPtr.Zero)
-                {
-                    System.Diagnostics.Debug.WriteLine("❌ [FindGroupChat] hwnd 为 Zero，返回 null");
-                    return null;
-                }
+                if (_yoloDetector == null) return null;
+                if (targetHwnd == IntPtr.Zero || !GetWindowRect(targetHwnd, out RECT rect)) return null;
 
-                bool rectResult = GetWindowRect(targetHwnd, out RECT rect);
-                System.Diagnostics.Debug.WriteLine($"🔍 [FindGroupChat] GetWindowRect 结果: {rectResult}");
-                
-                if (!rectResult)
-                {
-                    System.Diagnostics.Debug.WriteLine("❌ [FindGroupChat] GetWindowRect 失败，返回 null");
-                    return null;
-                }
-                
-                // 🛡️ [自动纠错] 根据进程名强制修正 isWework 标志
-                try
-                {
-                    GetWindowThreadProcessId(targetHwnd, out uint processId);
-                    using (var process = Process.GetProcessById((int)processId))
-                    {
-                        string processName = process.ProcessName;
-                        bool isRealWework = "WXWork".Equals(processName, StringComparison.OrdinalIgnoreCase);
-                        bool isRealWeChat = "WeChat".Equals(processName, StringComparison.OrdinalIgnoreCase);
-
-                        if (isRealWework && !isWework)
-                        {
-                            System.Diagnostics.Debug.WriteLine($"⚠️ [FindGroupChat] 检测到窗口是企业微信，但参数为微信。自动修正 isWework=True");
-                            isWework = true;
-                        }
-                        else if (isRealWeChat && isWework)
-                        {
-                            System.Diagnostics.Debug.WriteLine($"⚠️ [FindGroupChat] 检测到窗口是微信，但参数为企业微信。自动修正 isWework=False");
-                            isWework = false;
-                        }
-                    }
-                }
-                catch (Exception ex)
-                {
-                    System.Diagnostics.Debug.WriteLine($"⚠️ [FindGroupChat] 进程名检测/纠错失败: {ex.Message}");
-                }
-
-                // 搜索下拉区域：根据是微信还是企业微信使用不同的配置
-                int relX, relY, width, height;
-                
-                if (isWework)
-                {
-                    // 🏢 企业微信配置
-                    relX = 78;
-                    relY = 90; // 用户回退了之前的修改，保持 90
-                    width = 394;
-                    height = 400;
-                    System.Diagnostics.Debug.WriteLine("🏢 [FindGroupChat] 使用企业微信截图区域配置");
-                }
-                else
-                {
-                    // 💬 微信配置
-                    // ⚠️ 强制使用用户指定坐标，屏蔽可能存在的旧 Config (如 0 或 53)
-                    // int[] userRects = _config.WeChatSearchResultRect;
-                    int[] userRects = null; // FORCE NULL to skip config block
-                    
-                    if (userRects != null && userRects.Length >= 4)
-                    {
-                        relX = userRects[0];
-                        relY = userRects[1]; 
-                        width = userRects[2];
-                        height = 350;
-                        System.Diagnostics.Debug.WriteLine($"💬 [FindGroupChat] 使用用户 Config 坐标: X={relX}, Y={relY}, W={width}");
-                    }
-                    else
-                    {
-                        relX = 74;
-                        relY = 57;
-                        width = 326; // 400 - 74
-                        height = 350;
-                        System.Diagnostics.Debug.WriteLine($"💬 [FindGroupChat] 强制使用用户指定坐标: X=74, Y=57, W=326 (已屏蔽Config)");
-                    }
-                }
-
-
-
-                // � [DEBUG 核心示踪剂] 强制弹窗，证明新代码在运行
-                // 验证完后必须删除！
-                // 🔔 [DEBUG 核心示踪剂] 已移除
-                // MessageBox.Show(...)
-
-                int screenX = rect.Left + relX;
-                int screenY = rect.Top + relY;
-
-                // 🔧 DEBUG: 输出到 VS 输出窗口
-                System.Diagnostics.Debug.WriteLine($"🔍 [FindGroupChat] 窗口坐标: rect.Left={rect.Left}, rect.Top={rect.Top}, rect.Right={rect.Right}, rect.Bottom={rect.Bottom}");
-                System.Diagnostics.Debug.WriteLine($"🔍 [FindGroupChat] 窗口尺寸: {rect.Right - rect.Left}x{rect.Bottom - rect.Top}");
-                System.Diagnostics.Debug.WriteLine($"🔍 [FindGroupChat] 截图区域: 相对(relX={relX}, relY={relY}) -> 屏幕({screenX},{screenY}) {width}x{height}");
-                _logAction?.Invoke($"🔍 [FindGroupChat] 窗口坐标: rect.Left={rect.Left}, rect.Top={rect.Top}");
-                _logAction?.Invoke($"🔍 [FindGroupChat] 截图区域: 屏幕({screenX},{screenY}) {width}x{height}");
+                // 🚀 [改版] 截取整个窗口 (Full Window)
+                int width = rect.Right - rect.Left;
+                int height = rect.Bottom - rect.Top;
+                int screenX = rect.Left;
+                int screenY = rect.Top;
 
                 if (width <= 0 || height <= 0) return null;
+
+                // 🛡️ [防御] 防止截取到桌面
+                if (IsDesktopPixelSize(rect) || IsSystemWindowClass(targetHwnd))
+                {
+                    _logAction?.Invoke($"⚠️ [FindGroup] 拦截到桌面/系统窗口截取请求: {targetHwnd}");
+                    return null;
+                }
 
                 using (var bitmap = new Bitmap(width, height, PixelFormat.Format32bppArgb))
                 {
@@ -1129,355 +1188,70 @@ namespace moshushou
                         graphics.CopyFromScreen(screenX, screenY, 0, 0, new Size(width, height), CopyPixelOperation.SourceCopy);
                     }
 
-                    // ✅ [已禁用调试] 不再保存截图到 Debug_GroupChat 目录
-                    /*
-                    // 🔧 DEBUG: 保存原始截图供调试
-                    string debugDir = Path.Combine(_baseDirectory, "Debug_GroupChat");
-                    try
+                    // 1. YOLO 第一轮识别
+                    var yoloResults = _yoloDetector.Detect(bitmap);
+                    
+                    // 2. 保存调试图 [新增]
+                    string debugDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Debug_Yolo", DateTime.Now.ToString("yyyyMMdd"));
+                    Directory.CreateDirectory(debugDir);
+                    string debugFile = Path.Combine(debugDir, $"GroupClick_{DateTime.Now:HHmmss_fff}.png");
+                    _yoloDetector.InferenceWrapper.SaveDebugImage(bitmap, yoloResults, debugFile);
+                    _logAction?.Invoke($"🖼️ YOLO 群聊识别图已存: {debugFile}");
+
+                    // 3. 筛选目标：搜索群聊 或 最近搜索群聊
+                    var targets = yoloResults
+                        .Where(r => r.LabelName == YoloWindowDetector.Label_SearchGroup || 
+                                    r.LabelName == YoloWindowDetector.Label_RecentGroup)
+                        .OrderByDescending(r => r.Confidence)
+                        .ToList();
+
+                    if (targets.Count == 0)
                     {
-                        Directory.CreateDirectory(debugDir);
-                        string origFilename = $"GroupChat_原图_{DateTime.Now:HHmmss_fff}.png";
-                        bitmap.Save(Path.Combine(debugDir, origFilename), ImageFormat.Png);
-                        _logAction?.Invoke($"🧐 [调试] 原始截图已保存: {origFilename}");
-                    }
-                    catch { }
-                    */
-
-                    // ✅ 关键优化：使用 3 倍放大提高 OCR 准确率
-                    using (var scaledBitmap = ScaleImage(bitmap, 3))
-                    {
-                        // ✅ [已禁用调试] 不再保存放大截图
-                        /*
-                        // 🔧 DEBUG: 保存放大后截图供调试
-                        try
-                        {
-                            string scaledFilename = $"GroupChat_放大3x_{DateTime.Now:HHmmss_fff}.png";
-                            scaledBitmap.Save(Path.Combine(debugDir, scaledFilename), ImageFormat.Png);
-                            _logAction?.Invoke($"🧐 [调试] 放大3x截图已保存: {scaledFilename}");
-                        }
-                        catch { }
-                        */
-
-                        var bytes = ImageToBytes(scaledBitmap);
-                        // ✅ [修复] 强制异步延续
-                        var tcs = new TaskCompletionSource<Point?>(TaskCreationOptions.RunContinuationsAsynchronously);
-                        var ocr = new ImageOcr();
-
-                        ocr.Run(bytes, (path, result) =>
-                        {
-                            try
-                            {
-                                if (result?.OcrResult?.SingleResult == null)
-                                {
-                                    System.Diagnostics.Debug.WriteLine("❌ [FindGroupChat] OCR 结果为空");
-                                    tcs.TrySetResult(null);
-                                    return;
-                                }
-
-                                // 🔧 DEBUG: 输出所有 OCR 识别结果
-                                System.Diagnostics.Debug.WriteLine($"📋 [FindGroupChat] OCR 识别到 {result.OcrResult.SingleResult.Count} 个文本块:");
-                                foreach (var item in result.OcrResult.SingleResult)
-                                {
-                                    if (item != null && !string.IsNullOrEmpty(item.SingleStrUtf8))
-                                    {
-                                        // 注意：坐标是放大后的，需要除以 3 才是原图坐标
-                                        System.Diagnostics.Debug.WriteLine($"   - '{item.SingleStrUtf8}' at ({item.Left/3},{item.Top/3})-({item.Right/3},{item.Bottom/3})");
-                                    }
-                                }
-
-                                // 🚫 排除逻辑：先找"搜索网络结果"的位置，及其下方的图标结束位置
-                                float searchWebOriginalY_Start = -1; // 原图坐标系的排除起点
-                                float searchWebOriginalY_End = -1;   // 原图坐标系的排除终点
-
-                                // 1. 先定位"搜索网络结果"文字位置
-                                foreach (var item in result.OcrResult.SingleResult)
-                                {
-                                    if (item != null && !string.IsNullOrEmpty(item.SingleStrUtf8))
-                                    {
-                                        string text = item.SingleStrUtf8;
-                                        // 增加更多关键词
-                                        if (text.Contains("搜索网络结果") || text.Contains("搜索网络") || text.Contains("搜一搜") || text.Contains("网络搜索") || text.Contains("网络结果"))
-                                        {
-                                            searchWebOriginalY_Start = item.Top / 3.0f; // 转换为原图坐标
-                                            System.Diagnostics.Debug.WriteLine($"🚫 [FindGroupChat] 发现网络搜索标记 '{text}'，原图StartY={searchWebOriginalY_Start}");
-                                            break;
-                                        }
-                                    }
-                                }
-
-                                    try 
-                                    {
-                                        string iconPath = System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "search.png");
-                                        if (System.IO.File.Exists(iconPath))
-                                        {
-                                            using (var iconBmp = new Bitmap(iconPath))
-                                            {
-                                                // 🅰️ 如果 OCR 没找到文本起点，尝试用图像搜索找第一个 search.png 作为起点
-                                                if (searchWebOriginalY_Start < 0)
-                                                {
-                                                    var firstRect = FindFirstImageOccurrence(bitmap, iconBmp);
-                                                    if (firstRect.HasValue)
-                                                    {
-                                                        searchWebOriginalY_Start = firstRect.Value.Top - 10; 
-                                                        System.Diagnostics.Debug.WriteLine($"🚫 [FindGroupChat] (图像兜底) 找到第一个search图标，设定排除起点Y={searchWebOriginalY_Start}");
-                                                    }
-                                                }
-
-                                                // 🅱️ ✅ 修复：无论起点来源，都要用图像搜索找终点
-                                                if (searchWebOriginalY_Start >= 0)
-                                                {
-                                                    var lastRect = FindLastImageOccurrence(bitmap, iconBmp);
-                                                    if (lastRect.HasValue)
-                                                    {
-                                                        searchWebOriginalY_End = lastRect.Value.Bottom; 
-                                                        System.Diagnostics.Debug.WriteLine($"🚫 [FindGroupChat] 找到最后一个search图标，原图EndY={searchWebOriginalY_End}");
-                                                    }
-                                                    else
-                                                    {
-                                                        // 如果图像搜索也没找到，设置默认范围（起点+80px）
-                                                        searchWebOriginalY_End = searchWebOriginalY_Start + 80;
-                                                        System.Diagnostics.Debug.WriteLine($"🚫 [FindGroupChat] 未找到search图标，使用默认范围EndY={searchWebOriginalY_End}");
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        else
-                                        {
-                                            System.Diagnostics.Debug.WriteLine($"⚠️ [FindGroupChat] search.png 不存在于 {iconPath}");
-                                            // search.png 不存在时，设置默认范围
-                                            if (searchWebOriginalY_Start >= 0)
-                                            {
-                                                searchWebOriginalY_End = searchWebOriginalY_Start + 80;
-                                            }
-                                        }
-                                    }
-                                    catch (Exception ex)
-                                    {
-                                        System.Diagnostics.Debug.WriteLine($"⚠️ [FindGroupChat] 图像搜索出错: {ex.Message}");
-                                        // 出错时设置默认范围
-                                        if (searchWebOriginalY_Start >= 0 && searchWebOriginalY_End < searchWebOriginalY_Start)
-                                        {
-                                            searchWebOriginalY_End = searchWebOriginalY_Start + 80;
-                                        }
-                                    }
-                                    
-                                    // ✅ 企业微信特殊处理：优先匹配目标名称
-                                if (isWework)
-                                {
-                                    System.Diagnostics.Debug.WriteLine($"🏢 [FindGroupChat] 企业微信模式，目标: '{targetGroupName}'");
-                                    
-                                    dynamic bestItem = null;
-                                    float minY = float.MaxValue;
-                                    dynamic firstItem = null;
-
-                                    foreach (var item in result.OcrResult.SingleResult)
-                                    {
-                                        if (item != null && !string.IsNullOrEmpty(item.SingleStrUtf8))
-                                        {
-                                            string text = item.SingleStrUtf8;
-                                            
-                                            if (item.Top < minY)
-                                            {
-                                                minY = item.Top;
-                                                firstItem = item;
-                                            }
-
-                                            // 尝试匹配目标
-                                            if (!string.IsNullOrEmpty(targetGroupName) && IsFuzzyMatch(targetGroupName, text))
-                                            {
-                                                bestItem = item;
-                                                System.Diagnostics.Debug.WriteLine($"✅ [FindGroupChat] 企业微信匹配成功: '{text}'");
-                                                break; // 找到就停
-                                            }
-                                        }
-                                    }
-
-                                    if (bestItem != null)
-                                    {
-                                        // 命中目标
-                                        int itemCenterX = (int)((bestItem.Left + bestItem.Right) / 2 / 3);
-                                        int itemCenterY = (int)((bestItem.Top + bestItem.Bottom) / 2 / 3);
-                                        int weworkClickX = screenX + itemCenterX;
-                                        int weworkClickY = screenY + itemCenterY;
-
-                                        System.Diagnostics.Debug.WriteLine($"✅ [FindGroupChat] 锁定目标坐标: Screen({weworkClickX},{weworkClickY})");
-                                        tcs.TrySetResult(new Point(weworkClickX, weworkClickY));
-                                        return;
-                                    }
-                                    else
-                                    {
-                                         // ❌ 未找到目标
-                                         System.Diagnostics.Debug.WriteLine($"❌ [FindGroupChat] 企业微信未找到与 '{targetGroupName}' 匹配的项，停止操作防误触。");
-                                         
-                                         if (firstItem != null)
-                                            System.Diagnostics.Debug.WriteLine($"ℹ️ [FindGroupChat] 排首位的项是: '{firstItem.SingleStrUtf8}' (未命中目标)");
-
-                                         tcs.TrySetResult(null);
-                                         return;
-                                    }
-                                }
-
-                                // --- 以下是微信 (WeChat) 的逻辑 --- 
-
-                                // [重复代码已移除] 之前已经在上方查找过 searchWebOriginalY_Start
-                                
-                                // 📊 如果没找到搜索网络结果，输出调试信息
-                                if (searchWebOriginalY_Start < 0)
-                                {
-                                    System.Diagnostics.Debug.WriteLine("⚠️ [FindGroupChat] 未识别到'搜索网络结果'文字");
-                                }
-
-                                // ✅ 1. [直接匹配] 尝试直接查找目标群聊名称 (必须在"搜索网络结果"上方)
-                                // 这可以解决锚点(如"最常使用")OCR识别失败导致无法点击的问题
-                                if (!string.IsNullOrEmpty(targetGroupName))
-                                {
-                                    foreach (var item in result.OcrResult.SingleResult)
-                                    {
-                                        if (item != null && !string.IsNullOrEmpty(item.SingleStrUtf8))
-                                        {
-                                             // 这里的 item 是放大3倍后的坐标
-                                             if (IsFuzzyMatch(targetGroupName, item.SingleStrUtf8))
-                                             {
-                                                 float itemOriginalBottom = item.Bottom / 3.0f;
-                                                 float itemOriginalTop = item.Top / 3.0f;
-                                                 float itemOriginalCenterY = (item.Top + item.Bottom) / 2.0f / 3.0f;
-                                                 
-                                                 // 安全检查：确保不在网络搜索区域 [起点, 终点] 内
-                                                 bool isSafe = true;
-                                                 if (searchWebOriginalY_Start >= 0 && searchWebOriginalY_End > searchWebOriginalY_Start)
-                                                 {
-                                                     // 精确区间排除：只排除 [起点-5, 终点+5] 区间内的内容
-                                                     if (itemOriginalCenterY >= searchWebOriginalY_Start - 5 && itemOriginalCenterY <= searchWebOriginalY_End + 5)
-                                                     {
-                                                         System.Diagnostics.Debug.WriteLine($"🚫 [FindGroupChat] (直接匹配) 目标 '{item.SingleStrUtf8}' 在网络搜索区间内 (Y={itemOriginalCenterY}, 区间=[{searchWebOriginalY_Start}, {searchWebOriginalY_End}])，禁止点击。");
-                                                         isSafe = false;
-                                                     }
-                                                 }
-
-                                                 if (isSafe)
-                                                 {
-                                                      int itemCenterX = (int)((item.Left + item.Right) / 2 / 3);
-                                                      int itemCenterY = (int)((item.Top + item.Bottom) / 2 / 3);
-                                                      int directClickX = screenX + itemCenterX; 
-                                                      int directClickY = screenY + itemCenterY;
-
-                                                      // 🎯 [优化] 如果目标在最顶部 (Top < 80px)，通常是"最常使用"或最佳匹配，直接回车更稳
-                                                      if (itemOriginalTop < 80)
-                                                      {
-                                                          System.Diagnostics.Debug.WriteLine($"🎯 [FindGroupChat] (微信) 目标 '{item.SingleStrUtf8}' 位于顶部 (Y={itemOriginalTop}<80)，返回特殊坐标(-1,-1)表示直接回车");
-                                                          tcs.TrySetResult(new Point(-1, -1));
-                                                      }
-                                                      else
-                                                      {
-                                                          System.Diagnostics.Debug.WriteLine($"✅ [FindGroupChat] (微信) 直接命中目标: '{item.SingleStrUtf8}' Screen({directClickX},{directClickY})");
-                                                          tcs.TrySetResult(new Point(directClickX, directClickY));
-                                                      }
-                                                      return;
-                                                 }
-                                             }
-                                        }
-                                    }
-                                }
-
-                                // 2. [锚点定位] 按优先级查找锚点关键词 (必须在"搜索网络结果"上方)
-                                string[] anchorKeywords = { "最常使用", "群聊" };
-                                dynamic anchorItem = null;
-                                string foundKeyword = null;
-
-                                foreach (var keyword in anchorKeywords)
-                                {
-                                    foreach (var item in result.OcrResult.SingleResult)
-                                    {
-                                        if (item != null && !string.IsNullOrEmpty(item.SingleStrUtf8))
-                                        {
-                                            // ⬇️ 排除逻辑：只排除 [Start, End] 区间内的内容
-                                            // item.Top 是放大后的，先转回原图
-                                            float itemOriginalTop = item.Top / 3.0f;
-                                            float itemOriginalBottom = item.Bottom / 3.0f;
-                                            float itemOriginalCenterY = (itemOriginalTop + itemOriginalBottom) / 2.0f;
-
-                                            if (searchWebOriginalY_Start >= 0 && searchWebOriginalY_End > searchWebOriginalY_Start)
-                                            {
-                                                // 精确区间排除：只排除 [起点-5, 终点+5] 区间内的内容
-                                                if (itemOriginalCenterY >= searchWebOriginalY_Start - 5 && itemOriginalCenterY <= searchWebOriginalY_End + 5)
-                                                {
-                                                    System.Diagnostics.Debug.WriteLine($"🚫 [FindGroupChat] 排除位于网络搜索区间的项: '{item.SingleStrUtf8}' (Y={itemOriginalCenterY})");
-                                                    continue;
-                                                }
-                                            }
-
-                                            if (item.SingleStrUtf8.Contains(keyword))
-                                            {
-                                                anchorItem = item;
-                                                foundKeyword = keyword;
-                                                System.Diagnostics.Debug.WriteLine($"✅ [FindGroupChat] 找到锚点: '{item.SingleStrUtf8}' at 原图坐标({item.Left/3},{item.Top/3})-({item.Right/3},{item.Bottom/3})");
-                                                
-                                                // 🎯 关键优化：如果是"最常使用"，直接回车即可进入
-                                                if (keyword == "最常使用")
-                                                {
-                                                    System.Diagnostics.Debug.WriteLine("🎯 [FindGroupChat] 检测到'最常使用'，返回特殊坐标(-1,-1)表示直接回车");
-                                                    tcs.TrySetResult(new Point(-1, -1));  // 特殊标记
-                                                    return;
-                                                }
-                                                
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    if (anchorItem != null) break;
-                                }
-
-                                if (anchorItem == null)
-                                {
-                                    System.Diagnostics.Debug.WriteLine("❌ [FindGroupChat] 未找到 '最常使用' 或 '群聊' 锚点。");
-                                    System.Diagnostics.Debug.WriteLine("🛑 [安全模式] 为防止误点网络搜索结果，严格禁止无锚点点击。");
-                                    _logAction?.Invoke("⚠️ 未找到'群聊'或'最常使用'分类，判定为未搜到目标，停止操作。");
-                                    
-                                    tcs.TrySetResult(null);
-                                    return;
-                                }
-
-                                // 计算点击位置（注意：OCR 坐标是放大后的，需要除以 3）
-                                // 修正：X坐标不再取中心，而是取左侧靠右一点的位置，防止偏右
-                                // 锚点本身在左侧，所以 safeClickX 应该是 截图左边界 + 锚点文本的一半宽度
-                                int ocrAnchorCenterX = (int)((anchorItem.Left + anchorItem.Right) / 2 / 3);
-                                int clickX = screenX + ocrAnchorCenterX; 
-
-                                // 兜底：如果算出来太偏右，强制限制在左侧 150px 范围内
-                                int maxOffset = 150;
-                                if (clickX > rect.Left + maxOffset) clickX = rect.Left + 100;
-                                
-                                int originalBottom = (int)(anchorItem.Bottom / 3);
-                                int clickY = screenY + originalBottom + 20;
-
-                                _logAction?.Invoke($"✅ [FindGroupChat] 锚点 '{foundKeyword}' 原图Bottom={originalBottom}, 计算点击坐标: Screen({clickX}, {clickY})");
-                                tcs.TrySetResult(new Point(clickX, clickY));
-                            }
-                            catch (Exception ex)
-                            {
-                                _logAction?.Invoke($"💥 [FindGroupChat] OCR 处理异常: {ex.Message}");
-                                tcs.TrySetException(ex);
-                            }
-                            finally
-                            {
-                                try { if (File.Exists(path)) File.Delete(path); } catch { }
-                            }
-                        });
-
-                        var completedTask = await Task.WhenAny(tcs.Task, Task.Delay(5000));
-                        
-                        GC.KeepAlive(ocr); // ✅ 防止过早回收
-
-                        if (completedTask == tcs.Task) return await tcs.Task;
-                        
-                        _logAction?.Invoke("⚠️ [FindGroupChat] OCR 超时");
+                        _logAction?.Invoke("❌ YOLO 未在当前区域检测到群聊列表项");
                         return null;
+                    }
+
+                    // 4. 匹配逻辑
+                    if (!string.IsNullOrEmpty(targetGroupName))
+                    {
+                        _logAction?.Invoke($"🔍 目标群聊: '{targetGroupName}'，尝试 OCR 匹配...");
+                         foreach (var target in targets)
+                        {
+                            var bbox = target.BBox;
+                            using (var crop = new Bitmap(bbox.Width, bbox.Height))
+                            using (var g = Graphics.FromImage(crop))
+                            {
+                                g.DrawImage(bitmap, new Rectangle(0, 0, bbox.Width, bbox.Height), bbox, GraphicsUnit.Pixel);
+                                // 🚀 [优化] 统一使用 PreprocessForOcr，解决纯数字识别难点
+                                using (var processed = PreprocessForOcr(crop, 3))
+                                {
+                                    string ocrText = await PerformOcrAsync(processed);
+                                    bool match = IsFuzzyMatch(targetGroupName, ocrText);
+                                    
+                                    _logAction?.Invoke($"   - [{target.LabelName}] OCR:'{ocrText}' -> {(match ? "✅ 匹配" : "❌ 忽略")}");
+                                    
+                                    if (match)
+                                    {
+                                         return new Point(screenX + bbox.X + bbox.Width / 2, screenY + bbox.Y + bbox.Height / 2);
+                                    }
+                                }
+                            }
+                        }
+                        return null;
+                    }
+                    else
+                    {
+                        // 无指定名字，返回置信度最高的
+                        var best = targets.FirstOrDefault(t => t.LabelName == YoloWindowDetector.Label_SearchGroup) ?? targets.First();
+                        var bbox = best.BBox;
+                        _logAction?.Invoke($"✅ 自动锁定最高置信度目标: {best.LabelName} ({best.Confidence:P0})");
+                        return new Point(screenX + bbox.X + bbox.Width / 2, screenY + bbox.Y + bbox.Height / 2);
                     }
                 }
             }
             catch (Exception ex)
             {
-                _logAction?.Invoke($"💥 [FindGroupChat] 异常: {ex.Message}");
+                _logAction?.Invoke($"💥 FindGroupChatClickPositionAsync 异常: {ex.Message}");
                 return null;
             }
         }
@@ -1737,15 +1511,85 @@ namespace moshushou
              int tIdx = ty * tStride + tx * 4;
 
              byte ta = templateBytes[tIdx + 3];
-             if (ta < 10) return true;
+             if (ta < 10) return true; // 透明跳过
 
              if (Math.Abs(sourceBytes[sIdx] - templateBytes[tIdx]) > tolerance ||       // B
-                 Math.Abs(sourceBytes[sIdx+1] - templateBytes[tIdx+1]) > tolerance ||   // G
-                 Math.Abs(sourceBytes[sIdx+2] - templateBytes[tIdx+2]) > tolerance)     // R
+                 Math.Abs(sourceBytes[sIdx + 1] - templateBytes[tIdx + 1]) > tolerance ||   // G
+                 Math.Abs(sourceBytes[sIdx + 2] - templateBytes[tIdx + 2]) > tolerance)     // R
              {
                  return false;
              }
              return true;
+        }
+
+        public void Dispose()
+        {
+            _yoloDetector?.Dispose();
+        }
+        
+
+        /// <summary>
+        /// 判断是否为全屏桌面尺寸
+        /// </summary>
+        private bool IsDesktopPixelSize(RECT rect)
+        {
+            int w = rect.Right - rect.Left;
+            int h = rect.Bottom - rect.Top;
+            int screenW = System.Windows.Forms.Screen.PrimaryScreen.Bounds.Width;
+            int screenH = System.Windows.Forms.Screen.PrimaryScreen.Bounds.Height;
+            // 如果尺寸完全等于屏幕分辨率，极有可能是桌面
+            // (虽然全屏应用也是，但在我们的场景下 WeWork 极少全屏，且如果是全屏通常也不会正好是桌面句柄)
+            return w == screenW && h == screenH;
+        }
+
+        /// <summary>
+        /// 判断是否为系统窗口 (桌面/任务栏)
+        /// </summary>
+        private bool IsSystemWindowClass(IntPtr hwnd)
+        {
+            try
+            {
+                StringBuilder sb = new StringBuilder(256);
+                GetClassName(hwnd, sb, sb.Capacity);
+                string cls = sb.ToString();
+                return cls == "Progman" || cls == "WorkerW" || cls == "Shell_TrayWnd";
+            }
+            catch (Exception ex)
+            {
+                _logAction?.Invoke($"⚠️ [IsSystemWindowClass] 异常: {ex.Message}");
+                return false;
+            }
+        }
+        /// <summary>
+        /// ✅ [图像预处理] 放大并添加白边，提升 OCR 识别率
+        /// </summary>
+        private Bitmap PreprocessForOcr(Bitmap original, int scaleFactor)
+        {
+            int newWidth = original.Width * scaleFactor;
+            int newHeight = original.Height * scaleFactor;
+            
+            // 添加 padding (每边 20px)
+            int padding = 20;
+            int paddedWidth = newWidth + padding * 2;
+            int paddedHeight = newHeight + padding * 2;
+
+            var processed = new Bitmap(paddedWidth, paddedHeight, PixelFormat.Format32bppArgb); // 使用 32bppArgb 并在 Graphics 中填充白色背景
+            
+            using (var g = Graphics.FromImage(processed))
+            {
+                // 1. 填充纯白背景 (防止透明背景导致的 OCR 干扰)
+                g.Clear(Color.White);
+
+                // 2. 高质量插值放大
+                g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+                g.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.HighQuality;
+                g.CompositingQuality = System.Drawing.Drawing2D.CompositingQuality.HighQuality;
+
+                // 3. 绘制到中心
+                g.DrawImage(original, new Rectangle(padding, padding, newWidth, newHeight));
+            }
+            
+            return processed;
         }
     }
 }

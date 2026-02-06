@@ -6,17 +6,11 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <UseWPF>true</UseWPF>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
 
   <ItemGroup>
-    <None Remove="search.png" />
     <None Remove="search_config.json" />
-  </ItemGroup>
-
-  <ItemGroup>
-    <EmbeddedResource Include="search.png">
-      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
-    </EmbeddedResource>
   </ItemGroup>
 
   <ItemGroup>
@@ -24,6 +18,7 @@
     <PackageReference Include="FlaUI.Core" Version="5.0.0" />
     <PackageReference Include="FlaUI.UIA3" Version="5.0.0" />
     <PackageReference Include="InputSimulator" Version="1.0.4" />
+    <PackageReference Include="Microsoft.ML.OnnxRuntime" Version="1.16.0" />
     <PackageReference Include="System.Drawing.Common" Version="9.0.10" />
     <PackageReference Include="System.Reactive.Windows.Forms" Version="6.1.0" />
     <PackageReference Include="WeChatOcr" Version="1.0.4" />
@@ -42,6 +37,16 @@
     <None Update="search_config.json">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
+    <None Update="wxonnx\yolo11n_wxscreen_fixed.onnx">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Include="..\wxonnx\**\*">
+        <Link>wxonnx\%(RecursiveDir)%(Filename)%(Extension)</Link>
+        <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
   </ItemGroup>
 
 </Project>

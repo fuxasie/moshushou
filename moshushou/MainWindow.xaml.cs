@@ -1093,26 +1093,44 @@ namespace moshushou
                 IntPtr searchHwnd = GetForegroundWindow();
                 bool isListMatch = false;
 
+      
+                System.Drawing.Point? clickPos = null;
+
                 for (int i = 0; i < 3; i++)
                 {
                     // ✅ 循环中检查取消
                     if (token.IsCancellationRequested) return false;
 
-                    System.Diagnostics.Debug.WriteLine($"🔍 [DEBUG_TRACE] 步骤A-验证列表(第{i+1}次), AutoMode={isAutoMode}");
+                    System.Diagnostics.Debug.WriteLine($"🔍 [DEBUG_TRACE] 步骤AB-验证与定位(第{i+1}次), AutoMode={isAutoMode}");
                     try 
                     {
-                        isListMatch = await _screenshotHelper.CheckSearchResultAsync(searchHwnd, snapshot.SearchText, snapshot.IsWework);
-                        System.Diagnostics.Debug.WriteLine($"🔍 [DEBUG_TRACE] 步骤A-验证列表 返回: {isListMatch}");
+                        // 🛡️ [防御] 每次验证前确保窗口是前台
+                        if (searchHwnd != GetForegroundWindow())
+                        {
+                            System.Diagnostics.Debug.WriteLine("⚠️ [DEBUG_TRACE] 验证前发现窗口失焦，尝试重新激活...");
+                            RobustActivateWindow(searchHwnd);
+                            await Task.Delay(200, token);
+                        }
+
+                        // 调用合并后的方法：验证 + 获取坐标
+                        var result = await _screenshotHelper.FindAndVerifySearchResultAsync(searchHwnd, snapshot.SearchText, snapshot.IsWework);
+                        
+                        if (result.success && result.clickPoint.HasValue)
+                        {
+                            isListMatch = true;
+                            clickPos = result.clickPoint;
+                            System.Diagnostics.Debug.WriteLine($"✅ [DEBUG_TRACE] 验证并定位成功: {clickPos}");
+                            break;
+                        }
+                        
+                        System.Diagnostics.Debug.WriteLine($"🔍 [DEBUG_TRACE] 步骤AB尝试失败");
                     }
                     catch (Exception ex)
                     {
-                        System.Diagnostics.Debug.WriteLine($"💥 [DEBUG_TRACE] 步骤A 发生异常: {ex.ToString()}");
-                        // ❌ [修复] 必须使用 Dispatcher，否则后台线程会崩
+                        System.Diagnostics.Debug.WriteLine($"💥 [DEBUG_TRACE] 步骤AB 发生异常: {ex.ToString()}");
                         Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = $"💥 验证过程异常: {ex.Message}");
                         return false;
                     }
-
-                    if (isListMatch) break;
 
                     if (i < 2)
                     {
@@ -1120,52 +1138,47 @@ namespace moshushou
                     }
                 }
 
-                if (!isListMatch)
+                if (!isListMatch || !clickPos.HasValue)
                 {
-                    System.Diagnostics.Debug.WriteLine($"❌ [DEBUG_TRACE] 验证失败，准备退出。AutoMode={isAutoMode}");
+                    System.Diagnostics.Debug.WriteLine($"❌ [DEBUG_TRACE] 验证或定位最终失败，准备退出。AutoMode={isAutoMode}");
+                    
+                    // 🚨 [关键修复] 如果验证彻底失败，说明可能截错图或者窗口状态异常
+                    _searchHelper.ClearWindowCache(snapshot.IsWework ? "企业微信" : "微信");
+                    System.Diagnostics.Debug.WriteLine("🧹 [DEBUG_TRACE] 已清除窗口缓存，防止死循环。");
+
                     Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = "❌ 搜索列表超时或未找到目标，停止。");
                     return false;
                 }
 
-                System.Diagnostics.Debug.WriteLine($"✅ [DEBUG_TRACE] 验证成功，准备进入点击流程... AutoMode={isAutoMode}");
+                System.Diagnostics.Debug.WriteLine($"✅ [DEBUG_TRACE] 流程继续... AutoMode={isAutoMode}");
 
                 // --------------------------------------------------------
-                // 🔥 步骤 B: OCR 动态定位 + 鼠标点击群聊 (优先方案)
+                // 🔥 步骤 B (后半): 鼠标点击群聊
                 // --------------------------------------------------------
                 
-                Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = "🔍 [OCR] 正在定位群聊位置...");
+                Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = "🔍 [OCR] 正在点击群聊...");
                 
-                // ⏳ 等待搜索下拉菜单显示 (优化 300 → 200ms)
-                await Task.Delay(200);
-                
-                IntPtr hwndForClick = GetForegroundWindow();
-                System.Diagnostics.Debug.WriteLine($"🔍 [DEBUG_TRACE] 准备调用 FindGroupChatClickPositionAsync, hwnd={hwndForClick}, 目标='{snapshot.SearchText}'");
-                
-                // 🔄 [重试机制] 增加重试以防列表渲染延迟导致"遗漏"
-                System.Drawing.Point? clickPos = null;
-                for (int ft = 0; ft < 3; ft++)
-                {
-                    if (ft > 0)
-                    {
-                        System.Diagnostics.Debug.WriteLine($"⏳ [DEBUG_TRACE] 定位重试 ({ft}/3)...");
-                        await Task.Delay(300, token); 
-                    }
-                    
-                    clickPos = await _screenshotHelper.FindGroupChatClickPositionAsync(hwndForClick, snapshot.SearchText, snapshot.IsWework);
-                    if (clickPos.HasValue) break;
-                    
-                    if (token.IsCancellationRequested) return false;
-                }
-                
-                System.Diagnostics.Debug.WriteLine($"🔍 [DEBUG_TRACE] FindGroupChatClickPositionAsync 返回: {(clickPos.HasValue ? clickPos.Value.ToString() : "null")}");
+                IntPtr hwndForClick = searchHwnd;
+                // 复用 clickPos, 无需再次查找
                 
                 bool enteredSuccess = false;
                 string cleanTarget = snapshot.SearchText.Replace(" ", "").ToLower();
 
-                if (clickPos.HasValue)
-                {
-                    int clickX = clickPos.Value.X;
-                    int clickY = clickPos.Value.Y;
+                    if (clickPos.HasValue)
+                    {
+                        int clickX = clickPos.Value.X;
+                        int clickY = clickPos.Value.Y;
+
+                        // 🔍 [Debug] 获取窗口位置用于安全检查
+                        RECT debugRect;
+                        GetWindowRect(hwndForClick, out debugRect);
+                        System.Diagnostics.Debug.WriteLine($"🔍 [DEBUG_TRACE] 准备点击: ({clickX}, {clickY}), 窗口范围: [{debugRect.Left},{debugRect.Top} - {debugRect.Right},{debugRect.Bottom}]");
+
+                        // ⚠️ [Debug] 警告：点击位置过于靠近顶部 (可能是标题栏/关闭按钮)
+                        if (clickY - debugRect.Top < 50)
+                        {
+                             System.Diagnostics.Debug.WriteLine($"⚠️⚠️ [DEBUG_TRACE] 严重警告！点击位置 ({clickY}) 距离窗口顶部 ({debugRect.Top}) 过近 (<50px)，可能误触标题栏！");
+                        }
                     
                     // 🎯 检查是否为特殊坐标：(-1, -1) 表示"最常使用"，直接回车
                     if (clickX == -1 && clickY == -1)
@@ -1177,33 +1190,65 @@ namespace moshushou
                         _inputSimulator.Keyboard.KeyPress(VirtualKeyCode.RETURN);
                         await Task.Delay(300);
                     }
-                    else if (snapshot.IsWework)
-                    {
-                        // ✅ [优化] 企业微信使用回车代替鼠标点击，降低风控触发风险
-                        Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = "⌨️ [企业微信] 使用回车进入群聊...");
-                        System.Diagnostics.Debug.WriteLine("⌨️ [MainWindow] 企业微信模式，使用回车代替鼠标点击");
-                        
-                        _inputSimulator.Keyboard.KeyPress(VirtualKeyCode.RETURN);
-                        await Task.Delay(300);
-                    }
+
                     else
                     {
-                        // 微信：正常坐标，执行鼠标点击
-                        Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = $"🖱️ [微信] 点击坐标: ({clickX}, {clickY})");
+                        // 通用：正常坐标，执行鼠标点击
+                        Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = $"🖱️ 点击坐标: ({clickX}, {clickY})");
                         
-                        SetCursorPos(clickX, clickY);
-                        await Task.Delay(50);
-                        mouse_event(MOUSEEVENTF_LEFTDOWN, clickX, clickY, 0, 0);
-                        await Task.Delay(30);
-                        mouse_event(MOUSEEVENTF_LEFTUP, clickX, clickY, 0, 0);
+                        try
+                        {
+                            SetCursorPos(clickX, clickY);
+                            System.Diagnostics.Debug.WriteLine($"🔍 [DEBUG_TRACE] SetCursorPos 完成");
+                            await Task.Delay(50);
+                            
+                            mouse_event(MOUSEEVENTF_LEFTDOWN, clickX, clickY, 0, 0);
+                            System.Diagnostics.Debug.WriteLine($"🔍 [DEBUG_TRACE] LeftDown 完成");
+                            await Task.Delay(30);
+                            
+                            mouse_event(MOUSEEVENTF_LEFTUP, clickX, clickY, 0, 0);
+                            System.Diagnostics.Debug.WriteLine($"🔍 [DEBUG_TRACE] LeftUp 完成");
+                        }
+                        catch (Exception clickEx)
+                        {
+                            System.Diagnostics.Debug.WriteLine($"💥 [DEBUG_TRACE] 鼠标点击过程异常: {clickEx.Message}");
+                        }
                         
                         // 等待窗口切换 (优化 400 → 300ms)
                         await Task.Delay(300);
                     }
                     
+                    System.Diagnostics.Debug.WriteLine("🔍 [DEBUG_TRACE] 延迟结束，准备调用 GetWeChatWindowTitleTextAsync...");
+
                     // 验证是否进入了正确的群聊
                     IntPtr chatHwnd = GetForegroundWindow();
-                    string rawTitle = await _screenshotHelper.GetWeChatWindowTitleTextAsync(chatHwnd, snapshot.IsWework);
+                    string rawTitle = "";
+                    
+                    // 🔄 [增强] 标题验证重试机制 (最多 3 次，每次间隔 500ms)
+                    // 原因：点击后 UI 刷新需要时间，严苛的场景验证(GetWeChatWindowTitleTextAsync)可能会因为
+                    // "新页面还未渲染出的 Label_ChatInfo" 而直接返回 null。给它一点时间加载。
+                    for (int v = 0; v < 3; v++)
+                    {
+                        try
+                        {
+                             rawTitle = await _screenshotHelper.GetWeChatWindowTitleTextAsync(chatHwnd, snapshot.IsWework);
+                             System.Diagnostics.Debug.WriteLine($"🔍 [DEBUG_TRACE] GetWeChatWindowTitleTextAsync (尝试 {v+1}/3) 返回: '{rawTitle}'");
+                             
+                             // 如果获取到了标题，且不为空，直接跳出
+                             if (!string.IsNullOrEmpty(rawTitle)) break;
+                        }
+                        catch (Exception titleEx)
+                        {
+                             System.Diagnostics.Debug.WriteLine($"💥 [DEBUG_TRACE] 获取窗口标题异常: {titleEx.Message}");
+                        }
+                        
+                        // 如果还没成功，等待 UI 渲染
+                        if (v < 2) 
+                        {
+                            System.Diagnostics.Debug.WriteLine("⏳ [DEBUG_TRACE] 标题验证未通过/为空，等待 UI 渲染...");
+                            await Task.Delay(500);
+                        }
+                    }
                     
                     if (!string.IsNullOrEmpty(rawTitle) && _screenshotHelper.IsFuzzyMatch(snapshot.SearchText, rawTitle))
                     {
@@ -1219,10 +1264,10 @@ namespace moshushou
                     else
                     {
                         // ❌ OCR 点击后标题不匹配，直接返回失败（不再使用键盘导航，减少侵入操作）
-                        Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = $"❌ [OCR] 标题不匹配: {rawTitle}，搜索失败");
-                        // 按 ESC 返回
-                        _inputSimulator.Keyboard.KeyPress(VirtualKeyCode.ESCAPE);
-                        await Task.Delay(200);
+                        Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = $"❌ [OCR] 标题不匹配: '{rawTitle}'，搜索失败");
+                        
+                        // ⚠️ [修复] 移除 ESC 键，因为在企业微信中 ESC 可能会直接关闭窗口！
+                        
                         _lastEnteredGroupName = null;
                         return false;
                     }
@@ -1837,19 +1882,21 @@ namespace moshushou
                 if (_currentSelectedNode != null) isWework = "企业微信".Equals(_currentSelectedNode.Source);
             });
 
-            // ✅ Fix: 使用 OCR 获取精准点击坐标，而不是硬编码
-            int clickX, clickY;
-            if (_screenshotHelper.GetInputBoxClickCoordinates(targetHwnd, isWework, out clickX, out clickY))
+            int clickX = 0, clickY = 0;
+            // ✅ Fix: 使用 YOLO 获取精准点击坐标，而不是硬编码
+            var inputRes = await _screenshotHelper.GetInputBoxClickCoordinatesAsync(targetHwnd, isWework);
+            if (inputRes.success)
             {
-                Log($"[SendVerify] OCR 锁定输入框坐标: ({clickX}, {clickY})");
+                clickX = inputRes.x;
+                clickY = inputRes.y;
+                Log($"[SendVerify] YOLO 锁定输入框坐标: ({clickX}, {clickY})");
             }
             else
             {
-                // 兜底策略：如果 OCR 失败，回退到硬编码
-                int xOffset = 270 + 30 + (isWework ? 70 : 0);
-                clickX = rect.Left + xOffset;
+                // 兜底策略：如果检测失败，回退到原有估算坐标
+                clickX = rect.Left + (isWework ? 380 : 310);
                 clickY = rect.Bottom - 70;
-                Log($"⚠️ [SendVerify] OCR 失败，使用硬编码坐标: ({clickX}, {clickY})");
+                Log($"⚠️ [SendVerify] YOLO 失败，使用硬编码坐标: ({clickX}, {clickY})");
             }
 
             // === 动作 A: 激活输入框并粘贴 ===
@@ -2320,9 +2367,11 @@ namespace moshushou
                     await Task.Delay(50);
                 }
 
-                int clickX, clickY;
-                if (_screenshotHelper.GetInputBoxClickCoordinates(targetHwnd, isWework, out clickX, out clickY))
+                var inputRes = await _screenshotHelper.GetInputBoxClickCoordinatesAsync(targetHwnd, isWework);
+                if (inputRes.success)
                 {
+                    int clickX = inputRes.x;
+                    int clickY = inputRes.y;
                     Log($"点击坐标: ({clickX}, {clickY})");
                     SetCursorPos(clickX, clickY);
                     mouse_event(MOUSEEVENTF_LEFTDOWN, clickX, clickY, 0, 0);
@@ -2331,7 +2380,7 @@ namespace moshushou
                 }
                 else
                 {
-                    Log("⚠️ 坐标计算失败");
+                    Log("⚠️ 坐标检测失败");
                 }
 
                 bool result = false;
@@ -2499,12 +2548,13 @@ namespace moshushou
                 }
 
                 // 5. 坐标计算与点击
-                int clickX = 0, clickY = 0;
-                bool gotCoords = _screenshotHelper.GetInputBoxClickCoordinates(targetHwnd, isWework, out clickX, out clickY);
-                Log($"获取点击坐标: {gotCoords}, X={clickX}, Y={clickY}");
+                var inputRes = await _screenshotHelper.GetInputBoxClickCoordinatesAsync(targetHwnd, isWework);
+                Log($"获取点击坐标: {inputRes.success}, X={inputRes.x}, Y={inputRes.y}");
 
-                if (gotCoords)
+                if (inputRes.success)
                 {
+                    int clickX = inputRes.x;
+                    int clickY = inputRes.y;
                     Log($"执行鼠标点击: ({clickX}, {clickY})");
                     SetCursorPos(clickX, clickY);
                     mouse_event(MOUSEEVENTF_LEFTDOWN, clickX, clickY, 0, 0);

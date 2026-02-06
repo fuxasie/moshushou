@@ -39,15 +39,19 @@ namespace moshushou
         public string WechatWindowClassName { get; set; } = "WeChatMainWndForPC"; // 3.0 旧版类名 (保留备用)
         public string WeworkWindowClassName { get; set; } = "WeWorkWindow";
 
-        // ✅ 新增：可配置的截图参数 (适配 Qt 版本)
+        // 🚫 以下属性已弃用，系统现在完全基于 YOLO 动态识别
+        [Obsolete("Use YOLO detection instead")]
         public int WeChatCropLeft { get; set; } = 270;
+        [Obsolete("Use YOLO detection instead")]
         public int WeChatCropHeight { get; set; } = 53;
+        [Obsolete("Use YOLO detection instead")]
         public int WeChatRightCrop { get; set; } = 125;
+        [Obsolete("Use YOLO detection instead")]
         public int WeWorkRightCrop { get; set; } = 100;
 
-        // ✅ 新增：搜索结果列表坐标 (相对坐标 X, Y, W, H)
-        // 微信 4.0 (Qt) 搜索下拉列表：X=0 起始，Y=60 (跳过搜索栏), W=350, H=400 (覆盖完整列表)
+        [Obsolete("Use YOLO detection instead")]
         public int[] WeChatSearchResultRect { get; set; } = new int[] { 0, 60, 350, 400 }; 
+        [Obsolete("Use YOLO detection instead")]
         public int[] WeWorkSearchResultRect { get; set; } = new int[] { 78, 90, 394, 58 };
 
         // ✅ 新增：记住上次打开的文件和选中位置 (向后兼容，加载时会迁移到 LastFileState)
