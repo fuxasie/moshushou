@@ -103,6 +103,9 @@ namespace moshushou
         // ✅ 新增：问题件模式标志 (True=发送完整表格行, False=发送运单号+固定话术)
         private bool _isIssueMode = false;
 
+        // ✅ 新增：保存状态防抖计时器
+        private System.Windows.Threading.DispatcherTimer _saveDebounceTimer;
+
 
 
         // ✅ 新增：F1/F2 热键 ID
@@ -241,6 +244,19 @@ namespace moshushou
                     StatusTextBlock.Text = msg;
                 });
             });
+
+            // ✅ 初始化防抖计时器 (延迟 1秒 保存)
+            _saveDebounceTimer = new System.Windows.Threading.DispatcherTimer();
+            _saveDebounceTimer.Interval = TimeSpan.FromSeconds(1);
+            _saveDebounceTimer.Tick += (s, e) =>
+            {
+                _saveDebounceTimer.Stop();
+                // 在后台线程执行保存操作，避免阻塞 UI
+                Task.Run(() => 
+                { 
+                    try { _searchConfig?.Save(); } catch { }
+                });
+            };
 
             StoreTreeView.SelectedItemChanged += StoreTreeView_SelectedItemChanged;
             this.Loaded += MainWindow_Loaded;
@@ -700,10 +716,10 @@ namespace moshushou
                             }
                         }
 
-                        if (consecutiveFailures >= 5)
+                        if (consecutiveFailures >= 3)
                         {
                             _isAutoRunning = false;
-                            StatusTextBlock.Text += " 🛑 [熔断] 连续失败 5 次，已自动停止！";
+                            StatusTextBlock.Text += " 🛑 [熔断] 连续失败 3 次，已自动停止！";
                         }
                     }
                 });
@@ -736,7 +752,7 @@ namespace moshushou
 
             await Application.Current.Dispatcher.InvokeAsync(() =>
             {
-                if (!_isAutoRunning && consecutiveFailures < 5)
+                if (!_isAutoRunning && consecutiveFailures < 3)
                     StatusTextBlock.Text += " (已停止)";
             });
         }
@@ -2280,23 +2296,13 @@ namespace moshushou
 
             // 剪贴板
             Log("设置文件到剪贴板...");
-            bool clipboardSuccess = await Application.Current.Dispatcher.InvokeAsync(() =>
-            {
-                try
-                {
-                    var data = new DataObject();
-                    data.SetData(DataFormats.FileDrop, new string[] { filePath });
-                    Clipboard.SetDataObject(data, true);
-                    return true;
-                }
-                catch (Exception ex)
-                {
-                    Log($"剪贴板异常: {ex.Message}");
-                    return false;
-                }
-            });
 
-            if (!clipboardSuccess)
+            // ✅ 准备数据对象
+            var data = new DataObject();
+            data.SetData(DataFormats.FileDrop, new string[] { filePath });
+
+            // ✅ 使用重试机制
+            if (!await SetClipboardWithRetryAsync(data))
             {
                 Log("❌ 剪贴板设置失败");
                 return false;
@@ -2899,7 +2905,9 @@ namespace moshushou
             // 向后兼容：同步旧字段
             _searchConfig.LastSelectedStoreName = state.LastSelectedStoreName;
             
-            _searchConfig.Save();
+            // ✅ [优化] 防抖保存：延迟 1秒 执行写入，避免连续点击卡顿
+            _saveDebounceTimer?.Stop();
+            _saveDebounceTimer?.Start();
         }
 
 
@@ -3453,7 +3461,7 @@ namespace moshushou
             });
         }
 
-        private async Task<bool> SetClipboardWithRetryAsync(string text)
+        private async Task<bool> SetClipboardWithRetryAsync(object data)
         {
             for (int i = 0; i < 25; i++)
             {
@@ -3463,7 +3471,7 @@ namespace moshushou
                     {
                         try
                         {
-                            Clipboard.SetDataObject(text, true);
+                            Clipboard.SetDataObject(data, true);
                             return true;
                         }
                         catch (Exception ex)

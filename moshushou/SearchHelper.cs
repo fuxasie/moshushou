@@ -23,6 +23,12 @@ namespace moshushou
         [DllImport("kernel32.dll")] private static extern uint GetCurrentThreadId();
         [DllImport("user32.dll")] private static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
         [DllImport("user32.dll")][return: MarshalAs(UnmanagedType.Bool)] private static extern bool IsWindow(IntPtr hWnd);
+        [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool IsWindowVisible(IntPtr hWnd);
+        [DllImport("user32.dll")] private static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+        [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)] private static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+        [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Auto)] private static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
+
+        private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
 
         [DllImport("user32.dll", SetLastError = true)] private static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
 
@@ -129,19 +135,26 @@ namespace moshushou
 
         private IntPtr FindAndCacheWindowHandle(string appName, string processName, string className)
         {
-            if (_windowHandleCache.TryGetValue(appName, out IntPtr cachedHwnd) && IsWindow(cachedHwnd))
+            // 1. 缓存命中检查
+            if (_windowHandleCache.TryGetValue(appName, out IntPtr cachedHwnd))
             {
-                return cachedHwnd;
+                if (IsWindow(cachedHwnd) && IsWindowVisible(cachedHwnd))
+                {
+                    // 额外检查：再次确认进程名，防止PID复用导致的误判（虽然概率极低）
+                    return cachedHwnd;
+                }
+                else
+                {
+                    Log($"ℹ️ 缓存的 {appName} 窗口句柄已失效，重新搜索...");
+                    _windowHandleCache.Remove(appName);
+                }
             }
 
             IntPtr foundHwnd = IntPtr.Zero;
 
-            // 1. 优先尝试进程名查找 (适用于 WeChat 4.0 Qt)
-            // 策略：先尝试配置的名称，如果失败，尝试常见名称 "Weixin", "WeChat"
+            // 2. 确定目标进程名称集合
             var targetNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { processName };
-            
-            // ⚠️ 修正：仅当目标确实是微信时，才添加微信的别名
-            // 之前的逻辑会导致在搜企业微信时(WXWork)如果没找到，会自动fallback到微信，导致逻辑错乱
+            // WXWork 通常不需要别名，但 Weixin 需要
             if (processName.IndexOf("WeChat", StringComparison.OrdinalIgnoreCase) >= 0 || 
                 processName.IndexOf("Weixin", StringComparison.OrdinalIgnoreCase) >= 0)
             {
@@ -149,65 +162,89 @@ namespace moshushou
                 targetNames.Add("WeChat");
             }
 
+            // 3. 获取所有目标进程的 PID
+            var targetPids = new HashSet<int>();
             foreach (var targetName in targetNames)
             {
-                try
+                var processes = Process.GetProcessesByName(targetName);
+                foreach (var p in processes)
                 {
-                    var processes = Process.GetProcessesByName(targetName);
-                    if (processes.Length == 0) continue;
-
-                    Log($"  -> 尝试查找进程: {targetName} (找到 {processes.Length} 个)");
-
-                    foreach (var p in processes)
-                    {
-                        // 调试日志
-                        Log($"     - PID: {p.Id}, Title: '{p.MainWindowTitle}', Handle: {p.MainWindowHandle}");
-
-                        // 宽松检查：只要有句柄就行，Qt 窗口有时候 Title 为空或读取不到
-                        if (p.MainWindowHandle != IntPtr.Zero)
-                        {
-                            foundHwnd = p.MainWindowHandle;
-                            // 如果找到了有标题的，优先用它（更可能是主窗口）
-                            if (!string.IsNullOrEmpty(p.MainWindowTitle))
-                            {
-                                Log($"     ✅ 命中主窗口 (有标题): {p.MainWindowTitle}");
-                                break; 
-                            }
-                            else
-                            {
-                                Log($"     ⚠️ 命中窗口 (无标题)，作为备选...");
-                            }
-                        }
-                    }
-
-                    if (foundHwnd != IntPtr.Zero) break; // 找到了就跳出
-                }
-                catch (Exception ex)
-                {
-                    Log($"  -> 进程查找出错 ({targetName}): {ex.Message}");
+                    targetPids.Add(p.Id);
                 }
             }
 
-            // 2. 如果进程没找到，回退到 FlaUI / 类名查找 (适用于 企业微信 或 旧版微信)
-            if (foundHwnd == IntPtr.Zero && !string.IsNullOrEmpty(className))
+            if (targetPids.Count == 0)
             {
-                try
-                {
-                    using (var automation = new UIA3Automation())
-                    {
-                        var window = automation.GetDesktop().FindFirstChild(cf => cf.ByClassName(className))?.AsWindow();
-                        if (window != null && window.IsAvailable)
-                        {
-                            foundHwnd = window.Properties.NativeWindowHandle.ValueOrDefault;
-                        }
-                    }
-                }
-                catch (Exception ex)
-                {
-                    Log($"  -> FlaUI 查找时出错: {ex.Message}");
-                }
+                Log($"❌ 未在运行任务列表中找到进程: {string.Join(", ", targetNames)}");
+                return IntPtr.Zero;
             }
 
+            Log($"🔍 开始全局扫描窗口，目标PID数量: {targetPids.Count}...");
+
+            // 4. 使用 EnumWindows 进行全量扫描 (解决 "Process.MainWindowHandle 为 0" 或 "先开软件找不到窗口" 的问题)
+            // 核心思路：Qt/CEF 应用的主窗口经常不是 Process.MainWindowHandle 指向的那个，通过枚举所有窗口并匹配 PID 是最稳健的方法。
+            IntPtr bestCandidate = IntPtr.Zero;
+            int bestScore = -1; // 评分机制：标题匹配 > 类名匹配 > 仅PID匹配
+
+            EnumWindows((hwnd, lParam) =>
+            {
+                // A. 基础过滤：必须可见
+                if (!IsWindowVisible(hwnd)) return true;
+
+                // B. PID 匹配
+                GetWindowThreadProcessId(hwnd, out uint processId);
+                if (!targetPids.Contains((int)processId)) return true;
+
+                // C. 获取窗口信息
+                StringBuilder sbTitle = new StringBuilder(256);
+                GetWindowText(hwnd, sbTitle, 256);
+                string title = sbTitle.ToString();
+
+                StringBuilder sbClass = new StringBuilder(256);
+                GetClassName(hwnd, sbClass, 256);
+                string clazz = sbClass.ToString();
+
+                // D. 评分逻辑
+                int currentScore = 0;
+
+                // [企业微信特有逻辑]
+                // 企业微信主窗口类名通常是 "WeWorkWindow"，标题通常包含 "企业微信"
+                // 也有可能标题就是具体的聊天对象名，但类名通常不变
+                if (processName.Equals("WXWork", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (clazz.Equals("WeWorkWindow", StringComparison.OrdinalIgnoreCase)) currentScore += 50;
+                    if (title.Contains("企业微信")) currentScore += 20;
+                    // 排除掉托盘气泡、悬浮球等小窗口（通过尺寸判断，暂略，简单场景可见性+类名通常够了）
+                }
+                // [个人微信特有逻辑]
+                else 
+                {
+                    if (clazz.Equals("WeChatMainWndForPC", StringComparison.OrdinalIgnoreCase)) currentScore += 50;
+                    if (title.Equals("微信") || title.Equals("WeChat")) currentScore += 20;
+                }
+
+                // 只有分数高的才替换
+                if (currentScore > bestScore)
+                {
+                    bestScore = currentScore;
+                    bestCandidate = hwnd;
+                    Log($"   -> [候选] 评分:{currentScore} | 标题:'{title}' | 类名:'{clazz}' | Hwnd:{hwnd}");
+                }
+
+                return true; // 继续枚举
+            }, IntPtr.Zero);
+
+            if (bestCandidate != IntPtr.Zero)
+            {
+                foundHwnd = bestCandidate;
+                Log($"✅ 最终锁定窗口: {foundHwnd}");
+            }
+            else
+            {
+                Log("⚠️ 扫描结束，未找到符合条件的窗口。");
+            }
+
+            // 5. 缓存结果
             if (foundHwnd != IntPtr.Zero)
             {
                 _windowHandleCache[appName] = foundHwnd;
@@ -270,7 +307,7 @@ namespace moshushou
         private async Task<bool> SetClipboardWithRetryAsync(string text, CancellationToken token)
         {
             const int maxRetries = 20;
-            const int delayMs = 25;
+            const int delayMs = 50; // ✅ [优化] 稍微增加重试间隔
 
             for (int i = 0; i < maxRetries; i++)
             {
@@ -281,8 +318,18 @@ namespace moshushou
                 {
                     try
                     {
+                        // ✅ [修复] 显式清空剪贴板，防止旧数据残留或无法写入
+                        try { Clipboard.Clear(); } catch { }
+
+                        // 写入新数据
                         Clipboard.SetDataObject(text, true);
-                        success = true;
+
+                        // ✅ [修复] 立即读取校验，确保写入成功
+                        // 注意：有时 SetDataObject 不抛异常但实际没写入，所以必须校验
+                        if (Clipboard.ContainsText() && Clipboard.GetText() == text)
+                        {
+                            success = true;
+                        }
                     }
                     catch (COMException) { success = false; }
                     catch { success = false; }
