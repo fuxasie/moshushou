@@ -144,6 +144,23 @@ namespace moshushou
             return SearchInAppAsync(searchText, isWework, CancellationToken.None).GetAwaiter().GetResult();
         }
 
+        /// <summary>
+        /// 为外部提供稳健的窗口查找能力（进程+EnumWindows），避免仅按类名查找失败。
+        /// </summary>
+        public IntPtr TryGetAppWindowHandle(bool isWework, bool clearCache = false)
+        {
+            string appName = isWework ? "企业微信" : "微信";
+            string className = isWework ? _config.WeworkWindowClassName : _config.WechatWindowClassName;
+            string processName = isWework ? "WXWork" : _config.WeChatProcessName;
+
+            if (clearCache && _windowHandleCache.ContainsKey(appName))
+            {
+                _windowHandleCache.Remove(appName);
+            }
+
+            return FindAndCacheWindowHandle(appName, processName, className);
+        }
+
 
         private IntPtr FindAndCacheWindowHandle(string appName, string processName, string className)
         {
@@ -267,18 +284,33 @@ namespace moshushou
         }
 
         /// <summary>
-        /// ✅ [优化版] 简化激活逻辑，不使用 AttachThreadInput
+        /// ✅ [优化版] 增强激活逻辑，添加重试机制
         /// </summary>
         private async Task<bool> ForceActivateWindowAsync(IntPtr hwnd, CancellationToken token)
         {
             if (hwnd == GetForegroundWindow()) return true;
 
-            if (IsIconic(hwnd)) ShowWindow(hwnd, SW_RESTORE);
-            else ShowWindow(hwnd, SW_SHOW);
+            // ✅ 增加重试次数，解决有时无法调用企业微信的问题
+            for (int attempt = 0; attempt < 3; attempt++)
+            {
+                if (token.IsCancellationRequested) return false;
 
-            // ✅ [优化] 不再使用 AttachThreadInput，只调用一次 SetForegroundWindow
-            SetForegroundWindow(hwnd);
-            await Task.Delay(100, token);
+                if (IsIconic(hwnd)) ShowWindow(hwnd, SW_RESTORE);
+                else ShowWindow(hwnd, SW_SHOW);
+
+                SetForegroundWindow(hwnd);
+                
+                // ✅ 增加等待时间，让系统有足够时间切换窗口
+                await Task.Delay(150, token);
+
+                if (GetForegroundWindow() == hwnd)
+                {
+                    return true;
+                }
+
+                Log($"⚠️ 窗口激活尝试 {attempt + 1}/3 失败，重试中...");
+                await Task.Delay(100, token);
+            }
 
             return GetForegroundWindow() == hwnd;
         }
