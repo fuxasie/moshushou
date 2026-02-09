@@ -40,8 +40,6 @@ namespace moshushou
         // ✅ 新增：保存进入筛选前的选中项（用于清空筛选时恢复）
         private string _preFilterSelectedStoreName = null;
         private int _preFilterSelectedIndex = -1;
-        // ✅ 新增：搜素模式状态 (false=群名, true=商家)
-        private bool _isStoreMode = false;
         private readonly ScreenshotHelper _screenshotHelper;
 
 
@@ -89,14 +87,6 @@ namespace moshushou
 
         // ✅ [新增] 记录上一次成功的聊天窗口句柄 (用于极速模式抢焦点)
         private IntPtr _lastChatWindowHandle = IntPtr.Zero; // <--- 新增行
-        // ✅ [新增] 记录本轮搜索阶段拿到的目标窗口句柄（用于失败后布局验证）
-        private IntPtr _lastSearchWindowHandle = IntPtr.Zero;
-        private bool _lastSearchWindowIsWework = false;
-
-        // 防止自动化搜索阶段被“选中即复制”逻辑污染剪贴板
-        private int _clipboardSearchGuard = 0;
-        // 标记最近一次自动流程失败是否发生在“已进入群聊并执行发送”阶段
-        private int _lastFailureReachedPasteStage = 0;
 
         // 固定话术 (已迁移至 SearchConfig.FixedMessage 可配置)
 
@@ -155,10 +145,6 @@ namespace moshushou
 
         [DllImport("user32.dll")]
         private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
-
-
-
-
 
         [DllImport("kernel32.dll")]
         private static extern uint GetCurrentThreadId();
@@ -283,7 +269,6 @@ namespace moshushou
             _windowHandle = new WindowInteropHelper(this).Handle;
             _source = HwndSource.FromHwnd(_windowHandle);
             _source.AddHook(HwndHook);
-            UpdatePollingModeButtonState();
         }
 
         private void MainWindow_Closing(object sender, System.ComponentModel.CancelEventArgs e)
@@ -369,34 +354,6 @@ namespace moshushou
             this.Topmost = false;
             UnregisterGlobalHotkeys();
             StatusTextBlock.Text = "窗口置顶已取消，全局快捷键已禁用";
-        }
-
-        private void TogglePollingModeButton_Click(object sender, RoutedEventArgs e)
-        {
-            _isStoreMode = !_isStoreMode;
-            UpdatePollingModeButtonState();
-        }
-
-        private void UpdatePollingModeButtonState()
-        {
-            if (TogglePollingModeButton == null) return;
-
-            if (_isStoreMode)
-            {
-                TogglePollingModeButton.Content = "🏪";
-                TogglePollingModeButton.ToolTip = "当前模式：优先搜索商家名\n点击切换为群名模式";
-                // 橙色表示商家模式
-                TogglePollingModeButton.Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#F59E0B")); 
-                StatusTextBlock.Text = "已切换为 [商家搜索] 模式";
-            }
-            else
-            {
-                TogglePollingModeButton.Content = "💬";
-                TogglePollingModeButton.ToolTip = "当前模式：优先搜索群聊名\n点击切换为商家模式";
-                // 蓝色表示群名模式
-                TogglePollingModeButton.Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#3B82F6")); 
-                StatusTextBlock.Text = "已切换为 [群名搜索] 模式";
-            }
         }
 
 
@@ -563,22 +520,13 @@ namespace moshushou
                     Application.Current.Dispatcher.Invoke(() => PasteCurrentStoreName());
                     shouldHandle = true;
                 }
-                else if (id == HOTKEY_RIGHT)
+                else if (id == HOTKEY_RIGHT || id == HOTKEY_QUOTE)
                 {
-                    // ✅ Ctrl+Right: 调用粘贴流程
+                    // ✅ Ctrl+Right / Ctrl+;: 调用新的独立粘贴流程
                     // (写入剪贴板 -> 盲粘贴 -> 自动发送 -> 后置补全群名)
                     Application.Current.Dispatcher.InvokeAsync(async () =>
                     {
                         await ManualPasteProcessAsync();
-                    });
-                    shouldHandle = true;
-                }
-                else if (id == HOTKEY_QUOTE)
-                {
-                    // ✅ Ctrl+': 仅 OCR 识别当前窗口群名，不粘贴不发送
-                    Application.Current.Dispatcher.InvokeAsync(async () =>
-                    {
-                        await OcrRecognizeGroupNameOnlyAsync();
                     });
                     shouldHandle = true;
                 }
@@ -700,7 +648,7 @@ namespace moshushou
                     }
 
                     // D. 检查是否有群名
-                    if (string.IsNullOrWhiteSpace(_currentSelectedNode.GroupName))
+                    if (string.IsNullOrEmpty(_currentSelectedNode.GroupName))
                     {
                         StatusTextBlock.Text = $"🛑 商家 '{_currentSelectedNode.StoreName}' 无群名，自动停止。";
                         shouldStop = true;
@@ -727,7 +675,7 @@ namespace moshushou
 
                 if (!_isAutoRunning) break;
 
-                var autoLoopUiTask = await Application.Current.Dispatcher.InvokeAsync(async () =>
+                await Application.Current.Dispatcher.InvokeAsync(() =>
                 {
                     if (WindowState == WindowState.Minimized) WindowState = WindowState.Normal;
                     this.Activate();
@@ -749,204 +697,48 @@ namespace moshushou
                     }
                     else
                     {
-                        bool reachedPasteStage = Volatile.Read(ref _lastFailureReachedPasteStage) == 1;
-                        bool shouldVerifyLayout = true;
-                        bool isLayoutValid = true;
-                        bool? matchedAppIsWework = null;
-                        IntPtr matchedHwnd = IntPtr.Zero;
-                        IntPtr lastCheckedHwnd = IntPtr.Zero;
+                        consecutiveFailures++;
 
-                        if (shouldVerifyLayout)
+                        var node = _currentSelectedNode;
+                        if (node != null)
                         {
-                            // 任何失败在进入重试处理前都必须做布局验证。
-                            // 规则：布局正常 -> 允许移动到重试区；布局异常 -> 立即停止自动化。
-                            TreeViewNode activeNode = _currentSelectedNode;
-                            bool? preferredAppIsWework = null;
-                            if (activeNode != null)
+                            if (_failedStores.Contains(node.StoreName))
                             {
-                                string src = activeNode.Source?.Trim() ?? string.Empty;
-                                if (string.Equals(src, "企业微信", StringComparison.OrdinalIgnoreCase))
-                                {
-                                    preferredAppIsWework = true;
-                                }
-                                else if (string.Equals(src, "微信", StringComparison.OrdinalIgnoreCase))
-                                {
-                                    preferredAppIsWework = false;
-                                }
-                            }
+                                // --- 第二次失败（重试区） ---
+                                StatusTextBlock.Text += $" [重试失败 {consecutiveFailures}] 标记需人工...";
 
-                            var appCandidates = new List<bool>();
-                            if (preferredAppIsWework.HasValue)
-                            {
-                                // Source 明确时，仅验证该应用；失败即停，不再跨应用兜底。
-                                appCandidates.Add(preferredAppIsWework.Value);
-                            }
-                            else if (_lastSearchWindowHandle != IntPtr.Zero)
-                            {
-                                // Source 缺失时，优先使用本轮搜索窗口所属应用。
-                                appCandidates.Add(_lastSearchWindowIsWework);
+                                // ✅ [修复] 记录到人工名单
+                                _manualReviewStores.Add(node.StoreName);
+                                SaveFileState(); // ✅ 保存状态
+
+                                if (!node.Header.StartsWith("❌"))
+                                {
+                                    node.Header = "❌ [需人工] " + node.Header;
+                                }
+                                if (!TryNavigateToNextNodeForAuto())
+                                {
+                                    _isAutoRunning = false;
+                                    StatusTextBlock.Text += " 🏁 自动重试区已处理完毕，自动化停止。";
+                                }
                             }
                             else
                             {
-                                // 最后兜底：Source 缺失且无搜索句柄时，才两端都试。
-                                appCandidates.Add(false);
-                                appCandidates.Add(true);
-                            }
-                            string nodeSource = activeNode?.Source?.Trim() ?? "<null>";
-                            string candidateLog = string.Join(" -> ", appCandidates.Select(x => x ? "企业微信" : "微信"));
-                            string failureStage = reachedPasteStage ? "发送阶段失败" : "搜索/进群阶段失败";
-                            System.Diagnostics.Debug.WriteLine($"[AutoLoop] 失败后布局验证候选: Stage={failureStage}, Source='{nodeSource}', Candidates={candidateLog}");
-                            System.Diagnostics.Debug.WriteLine(
-                                $"[AutoLoop] 布局验证策略: Source明确={(preferredAppIsWework.HasValue ? "是" : "否")}, " +
-                                $"仅当前应用={(preferredAppIsWework.HasValue ? "是" : "否")}");
+                                // --- 第一次失败 ---
+                                StatusTextBlock.Text += $" [初次失败 {consecutiveFailures}] 移入重试区...";
 
-                            // VerifyChatWindowLayoutAsync 内部已包含 3 次重试，这里不再重复外层轮询。
-                            const int layoutRoundsPerApp = 1;
-                            isLayoutValid = false;
-
-                            foreach (bool appIsWework in appCandidates.Distinct())
-                            {
-                                string targetClass = appIsWework ? _searchConfig.WeworkWindowClassName : _searchConfig.WechatWindowClassName;
-                                string appName = appIsWework ? "企业微信" : "微信";
-                                var handleCandidates = new List<IntPtr>();
-
-                                // 1) 优先使用本轮搜索阶段记录的窗口句柄（最可信）
-                                if (_lastSearchWindowHandle != IntPtr.Zero && _lastSearchWindowIsWework == appIsWework)
-                                {
-                                    if (IsTargetChatWindow(_lastSearchWindowHandle, out string cachedProcessName) &&
-                                        IsProcessNameForApp(cachedProcessName, appIsWework))
-                                    {
-                                        handleCandidates.Add(_lastSearchWindowHandle);
-                                        System.Diagnostics.Debug.WriteLine(
-                                            $"[AutoLoop] 布局验证命中搜索阶段句柄: App={appName}, Hwnd={_lastSearchWindowHandle}, Proc={cachedProcessName}");
-                                    }
-                                    else
-                                    {
-                                        System.Diagnostics.Debug.WriteLine(
-                                            $"[AutoLoop] 搜索阶段句柄不可用: App={appName}, Hwnd={_lastSearchWindowHandle}");
-                                    }
-                                }
-
-                                // 2) 使用 SearchHelper 的稳健查找（按进程+枚举窗口）
-                                IntPtr robustHwnd = _searchHelper?.TryGetAppWindowHandle(appIsWework) ?? IntPtr.Zero;
-                                if (robustHwnd != IntPtr.Zero)
-                                {
-                                    handleCandidates.Add(robustHwnd);
-                                    System.Diagnostics.Debug.WriteLine(
-                                        $"[AutoLoop] 布局验证稳健查找命中: App={appName}, Hwnd={robustHwnd}");
-                                }
-
-                                // 3) 最后回退类名直查（兼容旧窗口类）
-                                IntPtr classHwnd = FindWindow(targetClass, null);
-                                if (classHwnd != IntPtr.Zero)
-                                {
-                                    handleCandidates.Add(classHwnd);
-                                    System.Diagnostics.Debug.WriteLine(
-                                        $"[AutoLoop] 布局验证类名查找命中: App={appName}, Class={targetClass}, Hwnd={classHwnd}");
-                                }
-
-                                var distinctHandles = handleCandidates
-                                    .Where(h => h != IntPtr.Zero)
-                                    .Distinct()
-                                    .ToList();
-
-                                if (distinctHandles.Count == 0)
-                                {
-                                    System.Diagnostics.Debug.WriteLine(
-                                        $"[AutoLoop] 布局验证前未找到窗口: App={appName}, Class={targetClass} (无可用句柄)");
-                                    continue;
-                                }
-
-                                foreach (IntPtr targetHwnd in distinctHandles)
-                                {
-                                    lastCheckedHwnd = targetHwnd;
-
-                                    for (int round = 0; round < layoutRoundsPerApp; round++)
-                                    {
-                                        RobustActivateWindow(targetHwnd);
-                                        await Task.Delay(300);
-
-                                        bool oneRoundValid = await Task.Run(async () => await _screenshotHelper.VerifyChatWindowLayoutAsync(targetHwnd, appIsWework));
-                                        if (oneRoundValid)
-                                        {
-                                            isLayoutValid = true;
-                                            matchedAppIsWework = appIsWework;
-                                            matchedHwnd = targetHwnd;
-                                            break;
-                                        }
-
-                                        if (round < layoutRoundsPerApp - 1)
-                                        {
-                                            await Task.Delay(350);
-                                        }
-                                    }
-
-                                    if (isLayoutValid) break;
-                                }
-
-                                if (isLayoutValid) break;
+                                _failedStores.Add(node.StoreName);
+                                MoveCurrentToFailureNode();
+                                SaveFileState(); // ✅ 保存状态
                             }
                         }
 
-                        if (!isLayoutValid)
+                        if (consecutiveFailures >= 3)
                         {
-                            // 🛑 布局验证失败 -> 认为是严重异常 (窗口关闭/退出登录/被挡住)
-                            // 此时直接停止自动化，不进入重试区
-                            this.Activate();
-                            
                             _isAutoRunning = false;
-                            StatusTextBlock.Text = "🛑 [严重] 窗口布局异常(检测不到群名/消息/输入框)，自动化已停止！";
-                            System.Diagnostics.Debug.WriteLine($"[AutoLoop] 布局验证失败 (LastHwnd={lastCheckedHwnd})，停止自动化。");
-                        }
-                        else
-                        {
-                            string matchedAppName = matchedAppIsWework == true ? "企业微信" : "微信";
-                            System.Diagnostics.Debug.WriteLine($"[AutoLoop] 布局验证通过: App={matchedAppName}, Hwnd={matchedHwnd}");
-
-                            consecutiveFailures++;
-
-                            var node = _currentSelectedNode;
-                            if (node != null)
-                            {
-                                if (_failedStores.Contains(node.StoreName))
-                                {
-                                    // --- 第二次失败（重试区） ---
-                                    StatusTextBlock.Text += $" [重试失败 {consecutiveFailures}] 标记需人工...";
-
-                                    // ✅ [修复] 记录到人工名单
-                                    _manualReviewStores.Add(node.StoreName);
-                                    SaveFileState(); // ✅ 保存状态
-
-                                    if (!node.Header.StartsWith("❌"))
-                                    {
-                                        node.Header = "❌ [需人工] " + node.Header;
-                                    }
-                                    if (!TryNavigateToNextNodeForAuto())
-                                    {
-                                        _isAutoRunning = false;
-                                        StatusTextBlock.Text += " 🏁 自动重试区已处理完毕，自动化停止。";
-                                    }
-                                }
-                                else
-                                {
-                                    // --- 第一次失败 ---
-                                    StatusTextBlock.Text += $" [初次失败 {consecutiveFailures}] 移入重试区...";
-
-                                    _failedStores.Add(node.StoreName);
-                                    MoveCurrentToFailureNode();
-                                    SaveFileState(); // ✅ 保存状态
-                                }
-                            }
-
-                            if (consecutiveFailures >= 3)
-                            {
-                                _isAutoRunning = false;
-                                StatusTextBlock.Text += " 🛑 [熔断] 连续失败 3 次，已自动停止！";
-                            }
+                            StatusTextBlock.Text += " 🛑 [熔断] 连续失败 3 次，已自动停止！";
                         }
                     }
                 });
-                await autoLoopUiTask;
 
                 if (!_isAutoRunning) break;
 
@@ -1063,7 +855,7 @@ namespace moshushou
             try
             {
                 // 使用 Dispatcher 确保 UI 访问安全
-                var smartFlowUiTask = await Application.Current.Dispatcher.InvokeAsync(async () =>
+                await Application.Current.Dispatcher.InvokeAsync(async () =>
                 {
                     if (_currentSelectedNode == null || string.IsNullOrEmpty(_currentSelectedNode.StoreName))
                     {
@@ -1100,7 +892,6 @@ namespace moshushou
                     // 3. ✅ 调用处理函数，传入 token
                     await ManualSmartProcessAsync(token);
                 });
-                await smartFlowUiTask;
             }
             catch (OperationCanceledException)
             {
@@ -1174,10 +965,8 @@ namespace moshushou
             // 1. 基础检查
             if (_currentSelectedNode == null) return;
 
-            // ✅ [优化] 无群聊商家 或 强制轮询模式 -> 轻量级轮询搜索模式
-            // ✅ [修改] 使用新的模式变量代替 CheckBox
-            bool forcePolling = _isStoreMode;
-            if (string.IsNullOrEmpty(_currentSelectedNode.GroupName) || forcePolling)
+            // ✅ [优化] 无群聊商家 -> 轻量级轮询搜索模式
+            if (string.IsNullOrEmpty(_currentSelectedNode.GroupName))
             {
                 await PerformLightweightSearchAsync(NormalizeStoreNameForSearch(_currentSelectedNode.StoreName));
                 return;
@@ -1208,75 +997,63 @@ namespace moshushou
             // 🔍 [调试日志]
             System.Diagnostics.Debug.WriteLine($"\n[{DateTime.Now:HH:mm:ss.fff}] ============== [调试] 开始搜索流程 ==============");
 
-            if (isAutoMode)
-            {
-                Interlocked.Exchange(ref _lastFailureReachedPasteStage, 0);
-                _lastSearchWindowHandle = IntPtr.Zero;
-                _lastSearchWindowIsWework = false;
-            }
-
-            Interlocked.Increment(ref _clipboardSearchGuard);
-
             // 1. 获取数据快照
             string storeName = null;
             string groupName = null;
             string source = null;
             bool isFileNode = false;
 
-            try
+            await Application.Current.Dispatcher.InvokeAsync(() =>
+            {
+                if (_currentSelectedNode != null)
+                {
+                    storeName = _currentSelectedNode.StoreName;
+                    groupName = _currentSelectedNode.GroupName;
+                    source = _currentSelectedNode.Source;
+                    isFileNode = _currentSelectedNode.IsFileNode;
+                }
+            });
+
+            if (string.IsNullOrEmpty(storeName)) return false;
+            string normalizedStoreName = NormalizeStoreNameForSearch(storeName);
+            if (string.IsNullOrWhiteSpace(normalizedStoreName))
+            {
+                normalizedStoreName = storeName.Trim();
+            }
+
+            // ✅ [修复] 无群聊商家早期检查（仅自动模式生效，手动模式由入口处理）
+            if (isAutoMode && string.IsNullOrEmpty(groupName))
             {
                 await Application.Current.Dispatcher.InvokeAsync(() =>
                 {
-                    if (_currentSelectedNode != null)
-                    {
-                        storeName = _currentSelectedNode.StoreName;
-                        groupName = _currentSelectedNode.GroupName;
-                        source = _currentSelectedNode.Source;
-                        isFileNode = _currentSelectedNode.IsFileNode;
-                    }
+                    StatusTextBlock.Text = $"⏭️ 商家 '{normalizedStoreName}' 无群聊，跳过搜索。";
                 });
+                return false;
+            }
 
-                if (string.IsNullOrEmpty(storeName)) return false;
-                string normalizedStoreName = NormalizeStoreNameForSearch(storeName);
-                if (string.IsNullOrWhiteSpace(normalizedStoreName))
-                {
-                    normalizedStoreName = storeName.Trim();
-                }
+            var snapshot = new
+            {
+                StoreName = storeName,
+                GroupName = groupName?.Trim(),
+                SearchText = !string.IsNullOrEmpty(groupName) ? groupName.Trim() : normalizedStoreName,
+                HasGroupName = !string.IsNullOrEmpty(groupName),
+                IsWework = !string.IsNullOrEmpty(groupName) ? "企业微信".Equals(source) : _isWeworkTurn
+            };
 
-                string normalizedGroupName = groupName?.Trim();
-                bool hasValidGroupName = !string.IsNullOrWhiteSpace(normalizedGroupName);
+            string appName = snapshot.IsWework ? "企业微信" : "微信";
+            Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = $"🔍 正在 [{appName}] 搜索: {snapshot.SearchText}...");
 
-                // F1 自动化：强制只按群名搜索，不允许退化为商家名
-                if (isAutoMode && !hasValidGroupName)
-                {
-                    await Application.Current.Dispatcher.InvokeAsync(() =>
-                    {
-                        StatusTextBlock.Text = $"⏭️ 商家 '{normalizedStoreName}' 无群聊，跳过搜索。";
-                    });
-                    return false;
-                }
+            // 定义粘贴动作
+            Func<Task<bool>> performPasteAsync = async () =>
+            {
+                if (isFileNode)
+                    return await PasteExcelFileAsync(snapshot.StoreName, snapshot.IsWework);
+                else
+                    return await PasteFullStoreInfoAsync(snapshot.StoreName, snapshot.IsWework);
+            };
 
-                var snapshot = new
-                {
-                    StoreName = storeName,
-                    GroupName = normalizedGroupName,
-                    SearchText = hasValidGroupName ? normalizedGroupName : normalizedStoreName,
-                    HasGroupName = hasValidGroupName,
-                    IsWework = hasValidGroupName ? "企业微信".Equals(source, StringComparison.OrdinalIgnoreCase) : _isWeworkTurn
-                };
-
-                string appName = snapshot.IsWework ? "企业微信" : "微信";
-                Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = $"🔍 正在 [{appName}] 搜索: {snapshot.SearchText}...");
-
-                // 定义粘贴动作
-                Func<Task<bool>> performPasteAsync = async () =>
-                {
-                    if (isFileNode)
-                        return await PasteExcelFileAsync(snapshot.StoreName, snapshot.IsWework);
-                    else
-                        return await PasteFullStoreInfoAsync(snapshot.StoreName, snapshot.IsWework);
-                };
-
+            try
+            {
                 // ✅ 检查取消
                 if (token.IsCancellationRequested) return false;
 
@@ -1335,13 +1112,6 @@ namespace moshushou
                 // 🔥 步骤 A: 搜索列表 OCR 验证
                 // --------------------------------------------------------
                 IntPtr searchHwnd = GetForegroundWindow();
-                if (isAutoMode && searchHwnd != IntPtr.Zero)
-                {
-                    _lastSearchWindowHandle = searchHwnd;
-                    _lastSearchWindowIsWework = snapshot.IsWework;
-                    System.Diagnostics.Debug.WriteLine(
-                        $"[AutoLoop] 已记录搜索阶段窗口: App={(snapshot.IsWework ? "企业微信" : "微信")}, Hwnd={searchHwnd}");
-                }
                 bool isListMatch = false;
 
       
@@ -1735,12 +1505,7 @@ namespace moshushou
                 {
                     // 粘贴前最后检查一次
                     if (token.IsCancellationRequested) return false;
-                    bool pasteSuccess = await performPasteAsync();
-                    if (isAutoMode && !pasteSuccess)
-                    {
-                        Interlocked.Exchange(ref _lastFailureReachedPasteStage, 1);
-                    }
-                    return pasteSuccess;
+                    return await performPasteAsync();
                 }
                 else
                 {
@@ -1758,14 +1523,6 @@ namespace moshushou
             {
                 Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = $"💥 流程异常: {ex.Message}");
                 return false;
-            }
-            finally
-            {
-                int after = Interlocked.Decrement(ref _clipboardSearchGuard);
-                if (after < 0)
-                {
-                    Interlocked.Exchange(ref _clipboardSearchGuard, 0);
-                }
             }
         }
 
@@ -1851,88 +1608,6 @@ namespace moshushou
             else
             {
                 StatusTextBlock.Text = $"⚠️ [轮询] {appName} 搜索失败，下次轮询: {nextApp}";
-            }
-        }
-
-        /// <summary>
-        /// ✅ [Ctrl+' 专用] 仅 OCR 识别当前窗口群名，不粘贴不发送
-        /// 沿用三倍放大等处理逻辑
-        /// </summary>
-        private async Task OcrRecognizeGroupNameOnlyAsync()
-        {
-            // 1. 基础检查
-            if (_currentSelectedNode == null)
-            {
-                StatusTextBlock.Text = "⚠️ 请先选择一个商家";
-                return;
-            }
-
-            string storeName = _currentSelectedNode.StoreName;
-            StatusTextBlock.Text = "👁️ 正在 OCR 识别群名...";
-
-            // 2. 识别当前窗口身份
-            IntPtr currentHwnd = GetForegroundWindow();
-            string currentClassName = GetWindowClass(currentHwnd);
-            bool isWework = false;
-
-            if (currentClassName == _searchConfig.WeworkWindowClassName)
-            {
-                isWework = true;
-            }
-            else if (currentClassName != _searchConfig.WechatWindowClassName)
-            {
-                // 兜底：通过进程名判断
-                try
-                {
-                    GetWindowThreadProcessId(currentHwnd, out uint pid);
-                    if (pid > 0)
-                    {
-                        using (var p = Process.GetProcessById((int)pid))
-                        {
-                            if (p.ProcessName.Equals("WXWork", StringComparison.OrdinalIgnoreCase))
-                            {
-                                isWework = true;
-                            }
-                        }
-                    }
-                }
-                catch { }
-            }
-
-            string appName = isWework ? "企业微信" : "微信";
-            StatusTextBlock.Text = $"👁️ 正在 OCR [{appName}] 群名...";
-
-            // 3. 执行 OCR（沿用 ScreenshotHelper 的三倍放大等处理逻辑）
-            try
-            {
-                string recognizedTitle = await _screenshotHelper.GetWeChatWindowTitleTextAsync(currentHwnd, isWework);
-
-                // 如果第一次没识别到，尝试反向识别一次
-                if (string.IsNullOrWhiteSpace(recognizedTitle))
-                {
-                    recognizedTitle = await _screenshotHelper.GetWeChatWindowTitleTextAsync(currentHwnd, !isWework);
-                    if (!string.IsNullOrWhiteSpace(recognizedTitle))
-                    {
-                        isWework = !isWework;
-                        appName = isWework ? "企业微信" : "微信";
-                    }
-                }
-
-                if (!string.IsNullOrWhiteSpace(recognizedTitle) && recognizedTitle.Length > 1)
-                {
-                    // ✅ 识别成功：保存并更新
-                    string sourceToSave = isWework ? "企业微信" : "微信";
-                    UpdateBusInfo(storeName, recognizedTitle, sourceToSave);
-                    StatusTextBlock.Text = $"✅ [OCR] 已识别并保存 [{sourceToSave}]: {recognizedTitle}";
-                }
-                else
-                {
-                    StatusTextBlock.Text = "⚠️ [OCR] 未识别到有效群名";
-                }
-            }
-            catch (Exception ex)
-            {
-                StatusTextBlock.Text = $"❌ [OCR] 识别失败: {ex.Message}";
             }
         }
 
@@ -2786,11 +2461,6 @@ namespace moshushou
         {
             if (string.IsNullOrEmpty(node.StoreName)) return;
 
-            if (_isAutoRunning || Volatile.Read(ref _clipboardSearchGuard) > 0)
-            {
-                return;
-            }
-
             _currentSelectedNode = node;
             ResetSearchState();
 
@@ -2963,17 +2633,6 @@ namespace moshushou
                             StatusTextBlock.Text += " + 正在追加预警...";
                             await PasteAndVerifySendAsync(_searchConfig.FixedMessage, false);
                         }
-                        // ✅ 自定义话术模式：发送文件后追加发送 B 列话术
-                        else if (payloadMode == StorePayloadMode.CustomMessage)
-                        {
-                            if (TryParseCustomStoreKey(storeName, out _, out var customMessage) && !string.IsNullOrWhiteSpace(customMessage))
-                            {
-                                await Task.Delay(200);
-                                Log($"➕ 追加发送自定义话术: {customMessage}");
-                                StatusTextBlock.Text += " + 正在追加话术...";
-                                await PasteAndVerifySendAsync(customMessage, false);
-                            }
-                        }
                     }
                     else Log("❌ 发送失败");
                 }
@@ -2985,13 +2644,52 @@ namespace moshushou
 
                     if (isWework)
                     {
-                         // ✅ 修复：手动模式下不自动点击"使用原文件"，让用户自己操作
-                         StatusTextBlock.Text = $"📋 [手动] 已粘贴文件至企业微信: {displayStoreName}";
+                         Log("🔎 [手动模式] 检测企业微信弹窗(OCR)...");
+                         
+                         System.Drawing.Point? clickPoint = null;
+                         for(int k=0; k<5; k++)
+                         {
+                             clickPoint = await _screenshotHelper.FindPopupTextPositionAsync(targetHwnd, "使用原文件");
+                             if (clickPoint != null) break;
+                             await Task.Delay(300);
+                         }
+
+                         if (clickPoint != null)
+                         {
+                              int cx = (int)clickPoint.Value.X;
+                              int cy = (int)clickPoint.Value.Y;
+                              Log($"⚡ [手动] OCR 点击 '使用原文件' ({cx}, {cy})");
+
+                              await MouseHelper.HumanLikeClickAsync(cx, cy, 90);
+                              
+                              StatusTextBlock.Text = $"⚡ [快捷] 已点击'使用原文件' (自动发送): {displayStoreName}";
+
+                              // 仅普通未发货模式追加固定话术
+                              if (shouldAppendFixedMessage)
+                              {
+                                  await Task.Delay(200);
+                                  Log("➕ [手动->自动] 追加发送未发货预警...");
+                                  StatusTextBlock.Text += " + 正在追加预警...";
+                                  await PasteAndVerifySendAsync(_searchConfig.FixedMessage, false);
+                              }
+                         }
+                         else
+                         {
+                              StatusTextBlock.Text = $"📋 [快捷] 已粘贴文件: {displayStoreName}";
+                         }
                     }
                     else
                     {
-                        // ✅ 修复：手动模式仅粘贴，不自动发送话术
-                        StatusTextBlock.Text = $"📋 [手动] 已粘贴文件: {displayStoreName}";
+                        StatusTextBlock.Text = $"📋 [自动] 已粘贴文件: {displayStoreName}";
+
+                        // 仅普通未发货模式追加固定话术
+                        if (shouldAppendFixedMessage)
+                        {
+                            await Task.Delay(500); 
+                            Log("➕ [微信-手动] 追加发送未发货预警...");
+                            StatusTextBlock.Text += " + 正在追加预警...";
+                            await PasteAndVerifySendAsync(_searchConfig.FixedMessage, false);
+                        }
                     }
                     _currentItemPasted = true;
                     _lastPastedStoreName = storeName;
@@ -3831,37 +3529,21 @@ namespace moshushou
             string suffix = payloadMode switch
             {
                 StorePayloadMode.Issue => "问题件明细",
-                StorePayloadMode.CustomMessage => "",  // ✅ 自定义话术模式：文件名仅用店铺名
+                StorePayloadMode.CustomMessage => "自定义话术",
                 _ => "未发货明细"
             };
-            string worksheetName = SanitizeWorksheetName(payloadMode == StorePayloadMode.CustomMessage ? "明细" : suffix, "明细");
-
-            // ✅ 统计条数用于文件名
-            int itemCount = trackingNumbers?.Count ?? 0;
-            string countSuffix = $"(共{itemCount}条)";
+            string worksheetName = SanitizeWorksheetName(suffix, "明细");
 
             string fileName;
             if (payloadMode == StorePayloadMode.CustomMessage)
             {
-                // ✅ 自定义话术模式：文件名使用"店铺名(共XX条)-话术"
-                string safeStorePart = SanitizeFileNamePart(displayStoreName, "未命名商家");
-                string safeMessagePart = SanitizeFileNamePart(customMessage, "");
-                
-                if (!string.IsNullOrWhiteSpace(safeMessagePart))
-                {
-                    // 完整格式：店铺名(共XX条)-话术
-                    string combined = $"{safeStorePart}{countSuffix}-{safeMessagePart}";
-                    fileName = TruncateWithEllipsis(combined, 120) + ".xlsx";
-                }
-                else
-                {
-                    // 无话术时仅用店铺名
-                    fileName = $"{safeStorePart}{countSuffix}.xlsx";
-                }
+                // ✅ 自定义话术模式：文件名使用“店铺名-话术”
+                string customFileName = BuildCustomStoreMessageFileName(displayStoreName, customMessage);
+                fileName = $"{customFileName}.xlsx";
             }
             else
             {
-                fileName = $"{safeFileName}{suffix}{countSuffix}.xlsx";
+                fileName = $"{safeFileName}{suffix}.xlsx";
             }
 
             string filePath = Path.Combine(outputDir, fileName);
@@ -4224,11 +3906,6 @@ namespace moshushou
                     SaveFileState(node.StoreName);
                 }
 
-                if (_isAutoRunning || Volatile.Read(ref _clipboardSearchGuard) > 0)
-                {
-                    return;
-                }
-
                 if (Interlocked.CompareExchange(ref _copyingFlag, 1, 0) == 1) return;
 
                 if (node.IsFileNode)
@@ -4301,8 +3978,6 @@ namespace moshushou
             {
                 try
                 {
-                    if (_isAutoRunning || Volatile.Read(ref _clipboardSearchGuard) > 0) return;
-
                     string displayStoreName = storeName;
                     if (TryParseCustomStoreKey(storeName, out var parsedStoreName, out _))
                     {
@@ -4329,8 +4004,6 @@ namespace moshushou
             {
                 try
                 {
-                    if (_isAutoRunning || Volatile.Read(ref _clipboardSearchGuard) > 0) return;
-
                     List<string> trackingNumbers;
                     lock (_dataLock)
                     {
@@ -4563,7 +4236,6 @@ namespace moshushou
             {
                 var process = System.Diagnostics.Process.GetProcessById((int)pid);
                 if (process.ProcessName.Equals("WeChat", StringComparison.OrdinalIgnoreCase) ||
-                    process.ProcessName.Equals("Weixin", StringComparison.OrdinalIgnoreCase) ||
                     process.ProcessName.Equals("WXWork", StringComparison.OrdinalIgnoreCase))
                 {
                     processName = process.ProcessName;
@@ -4577,22 +4249,6 @@ namespace moshushou
             }
 
             return false;
-        }
-
-        private static bool IsProcessNameForApp(string processName, bool isWework)
-        {
-            if (string.IsNullOrWhiteSpace(processName))
-            {
-                return false;
-            }
-
-            if (isWework)
-            {
-                return processName.Equals("WXWork", StringComparison.OrdinalIgnoreCase);
-            }
-
-            return processName.Equals("WeChat", StringComparison.OrdinalIgnoreCase) ||
-                   processName.Equals("Weixin", StringComparison.OrdinalIgnoreCase);
         }
 
         private static bool TryParseCustomStoreKey(string storeKey, out string realStoreName, out string message)

@@ -203,15 +203,6 @@
                         Style="{StaticResource IconButton}"
                          Click="EditBusInfoButton_Click"/>
 
-                        <!-- ✅ [移动] 搜索模式切换按钮 -->
-                        <Button x:Name="TogglePollingModeButton" 
-                                Content="💬" 
-                                ToolTip="当前模式：优先搜索群聊名&#xA;点击切换为商家模式"
-                                Background="#3B82F6"
-                                Margin="4,0,0,0"
-                                Style="{StaticResource IconButton}"
-                                Click="TogglePollingModeButton_Click"/>
-
                         <!-- 折叠筛选栏按钮 -->
                         <ToggleButton x:Name="FilterToggleButton"
                                       Content="🔍"
@@ -232,11 +223,9 @@
                                   Unchecked="AlwaysOnTopCheckBox_Unchecked"/>
 
                         <CheckBox x:Name="AutoSendCheckBox"
-                                  Content="⚡ 发送"
-                                  Margin="8,0,0,0"
+                                  Content="⚡ 自动发送"
+                                  Margin="12,0,0,0"
                                   Style="{StaticResource ModernCheckBox}"/>
-
-
                     </StackPanel>
                 </Grid>
             </Border>
