@@ -95,11 +95,11 @@ namespace moshushou
                     // 1. YOLO 识别
                     var yoloResults = _yoloDetector.Detect(bitmap);
                     
-                    // 2. 保存调试图 [已注释]
-                    // string debugDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Debug_Yolo", DateTime.Now.ToString("yyyyMMdd"));
-                    // Directory.CreateDirectory(debugDir);
-                    // string debugFile = Path.Combine(debugDir, $"Title_{DateTime.Now:HHmmss_fff}.png");
-                    // _yoloDetector.InferenceWrapper.SaveDebugImage(bitmap, yoloResults, debugFile);
+                    // 2. 保存调试图 [已启用]
+                    string debugDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Debug_Yolo", DateTime.Now.ToString("yyyyMMdd"));
+                    Directory.CreateDirectory(debugDir);
+                    string debugFile = Path.Combine(debugDir, $"Title_{DateTime.Now:HHmmss_fff}.png");
+                    _yoloDetector.InferenceWrapper.SaveDebugImage(bitmap, yoloResults, debugFile);
 
                     // 🚨 [调整] 场景宽松验证 (Relaxed Scene Validation)
                     // 原则：只要有 "群名" 和 "输入框" 且置信度及格，就认为是聊天窗口。
@@ -192,33 +192,34 @@ namespace moshushou
 
                             var results = _yoloDetector.Detect(bitmap);
                             
-                            // 调试保存 [已注释]
-                            // string debugDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Debug_Yolo", DateTime.Now.ToString("yyyyMMdd"));
-                            // Directory.CreateDirectory(debugDir);
-                            // string debugFile = Path.Combine(debugDir, $"InputBox_{DateTime.Now:HHmmss_fff}.png");
-                            // _yoloDetector.InferenceWrapper.SaveDebugImage(bitmap, results, debugFile);
+                            // 调试保存 [已启用]
+                            string debugDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Debug_Yolo", DateTime.Now.ToString("yyyyMMdd"));
+                            Directory.CreateDirectory(debugDir);
+                            string debugFile = Path.Combine(debugDir, $"InputBox_{DateTime.Now:HHmmss_fff}.png");
+                            _yoloDetector.InferenceWrapper.SaveDebugImage(bitmap, results, debugFile);
 
                             // 查找 "聊天框" (通常包含输入框)
                             var chatBox = results.Where(r => r.LabelName == YoloWindowDetector.Label_ChatBox).OrderByDescending(r => r.Confidence).FirstOrDefault();
                             if (chatBox != null)
                             {
                                 // 输入框通常在 ChatBox 识别框的底部上方一点点
-                                // 🚀 [优化] 随机点击输入框区域
+                                // 🚀 [优化] 输入框点击：微幅随机 (中心 ±5px)，更拟人化且节省时间
                                 int boxW = chatBox.BBox.Width;
                                 int boxH = chatBox.BBox.Height;
-                                // 输入区域大约在整个 ChatBox 的下半部分
-                                int inputAreaTop = chatBox.BBox.Y + (int)(boxH * 0.6); 
-                                int inputAreaH = (int)(boxH * 0.3); // 高度取 30%
+                                
+                                // 计算输入区域中心点
+                                int inputCenterX = chatBox.BBox.X + boxW / 2;
+                                int inputCenterY = chatBox.BBox.Y + (int)(boxH * 0.75); // 输入框大约在垂直方向 75% 的位置
                                 
                                 Random rnd = new Random();
-                                int safeMargin = 20;
-                                int safeInputW = boxW - 2 * safeMargin;
-                                if (safeInputW <= 0) safeInputW = 1;
+                                // 微幅随机偏移 (中心点 ±5 像素)
+                                int offsetX = rnd.Next(-5, 6);
+                                int offsetY = rnd.Next(-5, 6);
 
-                                int clickX = screenX + chatBox.BBox.X + safeMargin + rnd.Next(0, safeInputW);
-                                int clickY = screenY + inputAreaTop + rnd.Next(0, inputAreaH);
+                                int clickX = screenX + inputCenterX + offsetX;
+                                int clickY = screenY + inputCenterY + offsetY;
                                 
-                                _logAction?.Invoke($"🎯 YOLO 定位输入框成功(随机): ({clickX}, {clickY})");
+                                _logAction?.Invoke($"🎯 YOLO 定位输入框成功(微幅随机): ({clickX}, {clickY})");
                                 return (true, clickX, clickY);
                             }
                         }
@@ -839,6 +840,11 @@ namespace moshushou
         /// ✅ [合并版] 验证搜索结果并返回点击坐标 (合并 StepA 和 StepB)
         /// 避免 StepA 成功但 StepB 重新截图导致失败的问题
         /// </summary>
+        /// <summary>
+        /// ✅ [合并版] 验证搜索结果并返回点击坐标 (合并 StepA 和 StepB)
+        /// 避免 StepA 成功但 StepB 重新截图导致失败的问题
+        /// 🔄 [增强] 引入多侦测 (Multi-Frame Detection) 机制，过滤闪烁误报
+        /// </summary>
         public async Task<(bool success, Point? clickPoint, Rectangle? matchedScreenBBox)> FindAndVerifySearchResultAsync(IntPtr targetHwnd, string expectedText, bool isWework)
         {
             try
@@ -849,119 +855,177 @@ namespace moshushou
                     return (false, null, null);
                 }
 
-                if (targetHwnd == IntPtr.Zero || !GetWindowRect(targetHwnd, out RECT rect)) return (false, null, null);
-
-                // 🛡️ [防御] 防止截取到桌面 (当窗口失焦时)
-                if (IsDesktopPixelSize(rect) || IsSystemWindowClass(targetHwnd))
+                // 定义多帧结果容器
+                var frameResults = new List<List<(YoloResult Result, Rectangle ScreenBBox, Rectangle LocalBBox)>>();
+                Bitmap finalBitmap = null;
+                int finalScreenX = 0, finalScreenY = 0;
+                
+                const int stableFrameCount = 3; // 连续检测 3 帧
+                
+                for (int i = 0; i < stableFrameCount; i++)
                 {
-                    System.Diagnostics.Debug.WriteLine($"⚠️ [FindAndVerify] 拦截到桌面/系统窗口截取请求: {targetHwnd}");
-                    return (false, null, null);
-                }
+                    if (targetHwnd == IntPtr.Zero || !GetWindowRect(targetHwnd, out RECT rect)) 
+                    {
+                        if (finalBitmap != null) finalBitmap.Dispose();
+                        return (false, null, null);
+                    }
 
-                // 🚀 [改版] 截取整个窗口 (Full Window)
-                int width = rect.Right - rect.Left;
-                int height = rect.Bottom - rect.Top;
-                int screenX = rect.Left;
-                int screenY = rect.Top;
+                    // 🛡️ [防御] 防止截取到桌面
+                    if (IsDesktopPixelSize(rect) || IsSystemWindowClass(targetHwnd))
+                    {
+                        System.Diagnostics.Debug.WriteLine($"⚠️ [FindAndVerify] 拦截到桌面/系统窗口截取请求: {targetHwnd}");
+                        if (finalBitmap != null) finalBitmap.Dispose();
+                        return (false, null, null);
+                    }
 
-                if (width <= 0 || (rect.Bottom - rect.Top) < 100) return (false, null, null);
+                    // 截取窗口
+                    int width = rect.Right - rect.Left;
+                    int height = rect.Bottom - rect.Top;
+                    int screenX = rect.Left;
+                    int screenY = rect.Top;
 
-                using (var bitmap = new Bitmap(width, height, PixelFormat.Format32bppArgb))
-                {
+                    if (width <= 0 || (rect.Bottom - rect.Top) < 100) 
+                    {
+                         if (finalBitmap != null) finalBitmap.Dispose();
+                         return (false, null, null);
+                    }
+
+                    var bitmap = new Bitmap(width, height, PixelFormat.Format32bppArgb);
                     using (var graphics = Graphics.FromImage(bitmap))
                     {
                         graphics.CopyFromScreen(screenX, screenY, 0, 0, new Size(width, height), CopyPixelOperation.SourceCopy);
                     }
 
-                    // 1. YOLO 检测
+                    // YOLO 检测
                     var results = _yoloDetector.Detect(bitmap);
-                    
-                    // 2. 保存调试图 [已注释]
-                    // string debugDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Debug_Yolo", DateTime.Now.ToString("yyyyMMdd"));
-                    // Directory.CreateDirectory(debugDir);
-                    // string debugFile = Path.Combine(debugDir, $"MergerSearch_{DateTime.Now:HHmmss_fff}.png");
-                    // _yoloDetector.InferenceWrapper.SaveDebugImage(bitmap, results, debugFile);
-                    // _logAction?.Invoke($"🖼️ YOLO 识别图已存: {debugFile}");
-
-                    // 3. 筛选目标：搜索群聊 或 最近搜索群聊
-                    var targets = results
+                    var currentFrameTargets = results
                         .Where(r => r.LabelName == YoloWindowDetector.Label_SearchGroup || 
                                     r.LabelName == YoloWindowDetector.Label_RecentGroup)
-                        .OrderByDescending(r => r.Confidence)
+                        .Select(r => (r, new Rectangle(screenX + r.BBox.X, screenY + r.BBox.Y, r.BBox.Width, r.BBox.Height), r.BBox))
                         .ToList();
+                    
+                    frameResults.Add(currentFrameTargets);
 
-                    if (targets.Count == 0)
+                    // 如果是最后一帧，保留 Bitmap 用于后续 OCR 和坐标计算
+                    if (i == stableFrameCount - 1)
                     {
-                        System.Diagnostics.Debug.WriteLine($"❌ [FindAndVerify] YOLO 未检测到任何搜索结果标签");
+                        finalBitmap = bitmap;
+                        finalScreenX = screenX;
+                        finalScreenY = screenY;
+                    }
+                    else
+                    {
+                        bitmap.Dispose();
+                        // 帧间隔 (移除延迟，全速检测)
+                        // await Task.Delay(5);
+                    }
+                }
+
+                using (finalBitmap) // 确保 verify 完后释放
+                {
+                    // --- 稳定性分析 ---
+                    // 必须在最后一帧 (Index=2) 有结果，且该结果在之前的帧 (Index=0,1) 中出现过至少 1 次 (共命中 >=2 帧)
+                    var lastFrameTargets = frameResults.Last();
+                    if (lastFrameTargets.Count == 0)
+                    {
+                        System.Diagnostics.Debug.WriteLine($"❌ [FindAndVerify] 最后一帧未检测到任何结果，放弃");
                         return (false, null, null);
                     }
 
-                    System.Diagnostics.Debug.WriteLine($"✅ [FindAndVerify] YOLO 检测到 {targets.Count} 个潜在结果");
+                    (YoloResult Result, Rectangle ScreenBBox, Rectangle LocalBBox)? bestStableTarget = null;
+                    float bestConfidence = -1f;
 
-                    // 3. 验证文本
-                    foreach (var target in targets)
+                    foreach (var candidate in lastFrameTargets)
                     {
-                        // 裁剪出该结果区域进行 OCR
-                        var bbox = target.BBox;
+                        int appearanceCount = 1; // 最后一帧已出现
                         
-                        if (bbox.Width <= 0 || bbox.Height <= 0) continue;
-                        
-                        using (var crop = new Bitmap(bbox.Width, bbox.Height))
-                        using (var g = Graphics.FromImage(crop))
+                        // 在前几帧中查找匹配 (基于 IoU 或 中心距离)
+                        for (int i = 0; i < stableFrameCount - 1; i++)
                         {
-                            g.DrawImage(bitmap, new Rectangle(0, 0, bbox.Width, bbox.Height), bbox, GraphicsUnit.Pixel);
-                            
-                            // 🚀 [优化] 预处理：放大并添加白边 (Padding)
-                            // 纯数字或短文本易受边缘干扰，加白边显著提升准确率
-                            using (var processed = PreprocessForOcr(crop, 3)) 
+                            var prevTargets = frameResults[i];
+                            bool matchFound = prevTargets.Any(prev => 
                             {
-                                // 📷 [调试] 保存预处理后的图，帮助分析乱码原因
-                                // string debugOcrFile = Path.Combine(debugDir, $"OCR_Pre_{DateTime.Now:HHmmss_fff}_{target.LabelName}.png");
-                                // processed.Save(debugOcrFile, ImageFormat.Png);
+                                // 简单判定：中心点距离 < 30px 且 标签一致
+                                int cx1 = candidate.ScreenBBox.X + candidate.ScreenBBox.Width / 2;
+                                int cy1 = candidate.ScreenBBox.Y + candidate.ScreenBBox.Height / 2;
+                                int cx2 = prev.ScreenBBox.X + prev.ScreenBBox.Width / 2;
+                                int cy2 = prev.ScreenBBox.Y + prev.ScreenBBox.Height / 2;
+                                double dist = Math.Sqrt(Math.Pow(cx1 - cx2, 2) + Math.Pow(cy1 - cy2, 2));
+                                return dist < 30 && prev.Result.LabelName == candidate.Result.LabelName;
+                            });
 
-                                string ocrText = await PerformOcrAsync(processed);
-                                System.Diagnostics.Debug.WriteLine($"🔍 [FindAndVerify] 候选: '{ocrText}' (Conf: {target.Confidence:F2})");
-                                
-                                if (IsFuzzyMatch(expectedText, ocrText))
-                                {
-                                    System.Diagnostics.Debug.WriteLine($"✅ [FindAndVerify] 目标匹配成功: '{expectedText}'");
-                                    
-                                    // 🚀 [优化] 随机点计算：避开边缘 20%
-                                    int marginX = (int)(bbox.Width * 0.2);
-                                    int marginY = (int)(bbox.Height * 0.2);
-                                    
-                                    // 确保有点击空间
-                                    if (marginX < 2) marginX = 2;
-                                    if (marginY < 2) marginY = 2;
+                            if (matchFound) appearanceCount++;
+                        }
 
-                                    // 安全区域宽高
-                                    int safeW = bbox.Width - 2 * marginX;
-                                    int safeH = bbox.Height - 2 * marginY;
-                                    
-                                    if (safeW <= 0) safeW = 1;
-                                    if (safeH <= 0) safeH = 1;
-
-                                    Random rnd = new Random();
-                                    int offsetX = marginX + rnd.Next(0, safeW);
-                                    int offsetY = marginY + rnd.Next(0, safeH);
-
-                                    int clickX = screenX + bbox.X + offsetX;
-                                    int clickY = screenY + bbox.Y + offsetY;
-
-                                    var matchedScreenBBox = new Rectangle(
-                                        screenX + bbox.X,
-                                        screenY + bbox.Y,
-                                        bbox.Width,
-                                        bbox.Height
-                                    );
-
-                                    return (true, new Point(clickX, clickY), matchedScreenBBox);
-                                }
+                        // 判据：至少出现 2 次
+                        if (appearanceCount >= 2)
+                        {
+                            if (candidate.Result.Confidence > bestConfidence)
+                            {
+                                bestConfidence = candidate.Result.Confidence;
+                                bestStableTarget = candidate;
                             }
                         }
                     }
-                    
-                    System.Diagnostics.Debug.WriteLine($"❌ [FindAndVerify] 检测到结果但不匹配期望文本 '{expectedText}'");
+
+                    if (bestStableTarget == null)
+                    {
+                        System.Diagnostics.Debug.WriteLine($"❌ [FindAndVerify] 检测到目标但不稳定 (未连续出现)，放弃");
+                        return (false, null, null);
+                    }
+
+                    var target = bestStableTarget.Value;
+                    System.Diagnostics.Debug.WriteLine($"✅ [FindAndVerify] 捕获稳定目标: {target.Result.LabelName} (Conf:{target.Result.Confidence:F2})");
+
+                    // 4. OCR 验证
+                    var bbox = target.LocalBBox;
+                    if (bbox.Width <= 0 || bbox.Height <= 0) return (false, null, null);
+
+                    using (var crop = new Bitmap(bbox.Width, bbox.Height))
+                    using (var g = Graphics.FromImage(crop))
+                    {
+                        g.DrawImage(finalBitmap, new Rectangle(0, 0, bbox.Width, bbox.Height), bbox, GraphicsUnit.Pixel);
+                        
+                        using (var processed = PreprocessForOcr(crop, 3)) 
+                        {
+                            string ocrText = await PerformOcrAsync(processed);
+                            System.Diagnostics.Debug.WriteLine($"🔍 [FindAndVerify] 候选 OCR: '{ocrText}'");
+                            
+                            if (IsFuzzyMatch(expectedText, ocrText))
+                            {
+                                System.Diagnostics.Debug.WriteLine($"✅ [FindAndVerify] 文本匹配成功: '{expectedText}'");
+                                
+                                int marginX = (int)(bbox.Width * 0.2);
+                                int marginY = (int)(bbox.Height * 0.2);
+                                if (marginX < 2) marginX = 2;
+                                if (marginY < 2) marginY = 2;
+
+                                int safeW = bbox.Width - 2 * marginX;
+                                int safeH = bbox.Height - 2 * marginY;
+                                
+                                if (safeW <= 0) safeW = 1;
+                                if (safeH <= 0) safeH = 1;
+
+                                Random rnd = new Random();
+                                int offsetX = marginX + rnd.Next(0, safeW);
+                                int offsetY = marginY + rnd.Next(0, safeH);
+
+                                int clickX = finalScreenX + bbox.X + offsetX;
+                                int clickY = finalScreenY + bbox.Y + offsetY;
+
+                                var matchedScreenBBox = new Rectangle(
+                                    finalScreenX + bbox.X,
+                                    finalScreenY + bbox.Y,
+                                    bbox.Width,
+                                    bbox.Height
+                                );
+
+                                return (true, new Point(clickX, clickY), matchedScreenBBox);
+                            }
+                        }
+                    }
+
+                    System.Diagnostics.Debug.WriteLine($"❌ [FindAndVerify] 稳定目标文本不匹配: '{expectedText}'");
                     return (false, null, null);
                 }
             }

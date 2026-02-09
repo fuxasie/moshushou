@@ -334,6 +334,7 @@
                           VirtualizingStackPanel.IsVirtualizing="True"
                           VirtualizingStackPanel.VirtualizationMode="Standard"
                           VirtualizingStackPanel.ScrollUnit="Pixel"
+                          ScrollViewer.ScrollChanged="StoreTreeView_ScrollChanged"
                           ScrollViewer.VerticalScrollBarVisibility="Auto"
                           ScrollViewer.HorizontalScrollBarVisibility="Auto"
                           Background="Transparent"

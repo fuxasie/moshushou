@@ -39,6 +39,7 @@ namespace moshushou
         private List<string> _currentFilter = new List<string>();
         // ✅ 新增：保存进入筛选前的选中项（用于清空筛选时恢复）
         private string _preFilterSelectedStoreName = null;
+        private int _preFilterSelectedIndex = -1;
         private readonly ScreenshotHelper _screenshotHelper;
 
 
@@ -630,7 +631,11 @@ namespace moshushou
                     {
                         StatusTextBlock.Text = "⬇️ 进入自动重试区...";
                         consecutiveFailures = 0;
-                        NavigateTreeView(1);
+                        if (!TryNavigateToNextNodeForAuto())
+                        {
+                            StatusTextBlock.Text = "🏁 自动重试区已处理完毕，自动化停止。";
+                            shouldStop = true;
+                        }
                         return;
                     }
 
@@ -680,8 +685,15 @@ namespace moshushou
                     if (success)
                     {
                         consecutiveFailures = 0;
-                        StatusTextBlock.Text += " [成功] 下一条...";
-                        NavigateTreeView(1);
+                        if (TryNavigateToNextNodeForAuto())
+                        {
+                            StatusTextBlock.Text += " [成功] 下一条...";
+                        }
+                        else
+                        {
+                            _isAutoRunning = false;
+                            StatusTextBlock.Text = "🏁 列表已处理完毕，自动化停止。";
+                        }
                     }
                     else
                     {
@@ -703,7 +715,11 @@ namespace moshushou
                                 {
                                     node.Header = "❌ [需人工] " + node.Header;
                                 }
-                                NavigateTreeView(1);
+                                if (!TryNavigateToNextNodeForAuto())
+                                {
+                                    _isAutoRunning = false;
+                                    StatusTextBlock.Text += " 🏁 自动重试区已处理完毕，自动化停止。";
+                                }
                             }
                             else
                             {
@@ -1204,7 +1220,8 @@ namespace moshushou
                         bool clickCompleted = false;
                         const int maxClickAttempts = 3;
                         var currentMatchedRect = matchedSearchRect.Value;
-                        const int pointInRectTolerance = 6;
+                        // 🚨 [修改] 移除 6 像素误差，严格校验 (tolerance = 0)
+                        const int pointInRectTolerance = 0;
 
                         for (int clickAttempt = 0; clickAttempt < maxClickAttempts && !clickCompleted; clickAttempt++)
                         {
@@ -1242,6 +1259,55 @@ namespace moshushou
 
                                 var movedPoint = MouseHelper.GetCursorPosition();
                                 System.Diagnostics.Debug.WriteLine($"🔍 [DEBUG_TRACE] 鼠标已移动到: ({movedPoint.X}, {movedPoint.Y})，开始二次框内校验...");
+
+                                // 📸 [新增] 保存校验时的调试图片 (点击前) - 全窗口版
+                                try
+                                {
+                                    // 获取目标窗口的 Rect
+                                    RECT windowRect;
+                                    if (GetWindowRect(hwndForClick, out windowRect))
+                                    {
+                                        int width = windowRect.Right - windowRect.Left;
+                                        int height = windowRect.Bottom - windowRect.Top;
+
+                                        if (width > 0 && height > 0)
+                                        {
+                                            using (var bmp = new System.Drawing.Bitmap(width, height))
+                                            using (var g = System.Drawing.Graphics.FromImage(bmp))
+                                            {
+                                                // 截取整个窗口
+                                                g.CopyFromScreen(windowRect.Left, windowRect.Top, 0, 0, new System.Drawing.Size(width, height));
+                                                
+                                                // 画出目标框 (相对于窗口，蓝色)
+                                                // currentMatchedRect 是屏幕坐标
+                                                var relRect = new System.Drawing.Rectangle(
+                                                    currentMatchedRect.X - windowRect.Left, 
+                                                    currentMatchedRect.Y - windowRect.Top, 
+                                                    currentMatchedRect.Width, 
+                                                    currentMatchedRect.Height);
+                                                
+                                                g.DrawRectangle(new System.Drawing.Pen(System.Drawing.Color.Blue, 3), relRect);
+                                                
+                                                // 画出鼠标位置 (相对于窗口，红色)
+                                                var relPoint = new System.Drawing.Point(
+                                                    movedPoint.X - windowRect.Left, 
+                                                    movedPoint.Y - windowRect.Top);
+                                                
+                                                g.FillEllipse(System.Drawing.Brushes.Red, relPoint.X - 4, relPoint.Y - 4, 8, 8);
+                                                
+                                                // 保存
+                                                string debugDir = System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Debug_Yolo", DateTime.Now.ToString("yyyyMMdd"));
+                                                System.IO.Directory.CreateDirectory(debugDir);
+                                                string debugPath = System.IO.Path.Combine(debugDir, $"Verify_Full_{DateTime.Now:HHmmss_fff}.png");
+                                                bmp.Save(debugPath, System.Drawing.Imaging.ImageFormat.Png);
+                                            }
+                                        }
+                                    }
+                                }
+                                catch (Exception ex)
+                                {
+                                    System.Diagnostics.Debug.WriteLine($"[DebugImage] 全窗口保存失败: {ex.Message}");
+                                }
 
                                 bool secondPass =
                                     movedPoint.X >= currentMatchedRect.Left - pointInRectTolerance &&
@@ -1774,13 +1840,34 @@ namespace moshushou
         /// </summary>
         private void UpdateBusInfo(string storeName, string newGroupName, string source)
         {
+            string businessStoreName = NormalizeStoreNameForBusinessInfo(storeName);
+            if (string.IsNullOrWhiteSpace(businessStoreName))
+            {
+                businessStoreName = storeName?.Trim() ?? string.Empty;
+            }
+
             // 1. 更新内存列表 (_businessInfoList)
-            var info = _businessInfoList.FirstOrDefault(b => b.StoreName == storeName);
+            var info = _businessInfoList.FirstOrDefault(b => b.StoreName == businessStoreName);
+            if (info == null && !string.Equals(storeName, businessStoreName, StringComparison.Ordinal))
+            {
+                // 兼容旧数据：历史上可能把 "商家名##话术" 写进了 StoreName
+                info = _businessInfoList.FirstOrDefault(b => b.StoreName == storeName);
+            }
             if (info == null)
             {
-                info = new BusinessInfo { StoreName = storeName };
+                info = new BusinessInfo { StoreName = businessStoreName };
                 _businessInfoList.Add(info);
             }
+            else
+            {
+                // 迁移为标准键：仅保留真实商家名
+                info.StoreName = businessStoreName;
+            }
+
+            _businessInfoList.RemoveAll(b =>
+                b != info &&
+                (string.Equals(b.StoreName, businessStoreName, StringComparison.Ordinal) ||
+                 string.Equals(b.StoreName, storeName, StringComparison.Ordinal)));
 
             // 更新属性
             info.GroupName = newGroupName;
@@ -2164,6 +2251,49 @@ namespace moshushou
 
             // 执行选中
             FocusAndSelectItem(selectedNode);
+        }
+
+        /// <summary>
+        /// 自动化专用：前进到下一项；如果已经到达末尾则返回 false，并清空当前选中。
+        /// </summary>
+        private bool TryNavigateToNextNodeForAuto()
+        {
+            if (_flatNodeList.Count == 0)
+            {
+                RebuildFlatNodeList();
+            }
+
+            if (_flatNodeList.Count == 0)
+            {
+                _currentSelectedIndex = -1;
+                _currentSelectedNode = null;
+                return false;
+            }
+
+            // 兜底：索引异常时尝试由当前节点反查索引
+            if ((_currentSelectedIndex < 0 || _currentSelectedIndex >= _flatNodeList.Count) && _currentSelectedNode != null)
+            {
+                _currentSelectedIndex = _flatNodeList.IndexOf(_currentSelectedNode);
+            }
+
+            int nextIndex = _currentSelectedIndex + 1;
+            if (_currentSelectedIndex < 0)
+            {
+                nextIndex = 0;
+            }
+
+            if (nextIndex < 0 || nextIndex >= _flatNodeList.Count)
+            {
+                _currentSelectedIndex = _flatNodeList.Count;
+                _currentSelectedNode = null;
+                ClearAllTreeViewSelections();
+                return false;
+            }
+
+            _currentSelectedIndex = nextIndex;
+            var nextNode = _flatNodeList[nextIndex];
+            FocusAndSelectItem(nextNode);
+            return true;
         }
 
         /// <summary>
@@ -3117,8 +3247,11 @@ namespace moshushou
                     string storeNameToRestore = stateToRestore.LastSelectedStoreName;
                     Application.Current.Dispatcher.InvokeAsync(() =>
                     {
-                        RestoreSelection(storeNameToRestore, 0);
-                        StatusTextBlock.Text = $"已恢复到上次选中: {storeNameToRestore} (包括重试区 {_failedStores.Count} 个)";
+                        bool restored = RestoreSelection(storeNameToRestore, 0);
+                        if (restored)
+                        {
+                            StatusTextBlock.Text = $"已恢复到上次选中: {storeNameToRestore} (包括重试区 {_failedStores.Count} 个)";
+                        }
                     }, System.Windows.Threading.DispatcherPriority.Loaded);
                 }
 
@@ -3193,7 +3326,15 @@ namespace moshushou
         {
             List<KeyValuePair<string, List<string>>> sortedStores;
 
-            var infoMap = _businessInfoList.GroupBy(b => b.StoreName).ToDictionary(g => g.Key, g => g.FirstOrDefault());
+            var infoMap = _businessInfoList
+                .Select(b => new
+                {
+                    Key = NormalizeStoreNameForBusinessInfo(b.StoreName),
+                    Info = b
+                })
+                .Where(x => !string.IsNullOrWhiteSpace(x.Key))
+                .GroupBy(x => x.Key)
+                .ToDictionary(g => g.Key, g => g.Select(x => x.Info).FirstOrDefault());
 
             lock (_dataLock)
             {
@@ -3556,9 +3697,10 @@ namespace moshushou
             }
 
             // ✅ 进入筛选前，保存当前选中项（仅在首次进入筛选时保存）
-            if (string.IsNullOrEmpty(_preFilterSelectedStoreName) && _currentSelectedNode != null)
+            if (string.IsNullOrEmpty(_preFilterSelectedStoreName))
             {
-                _preFilterSelectedStoreName = _currentSelectedNode.StoreName;
+                _preFilterSelectedStoreName = GetCurrentSelectedStoreName(out int selectedIndex);
+                _preFilterSelectedIndex = selectedIndex;
             }
 
             // ✅ 筛选时重置选中状态
@@ -3575,9 +3717,11 @@ namespace moshushou
 
             // ✅ 保存需要恢复的商家名
             string storeNameToRestore = _preFilterSelectedStoreName;
+            int indexToRestore = _preFilterSelectedIndex;
             
             // ✅ 清空筛选前保存的商家名（已使用完毕）
             _preFilterSelectedStoreName = null;
+            _preFilterSelectedIndex = -1;
 
             // ✅ 先重置选中状态
             _currentSelectedIndex = -1;
@@ -3590,8 +3734,10 @@ namespace moshushou
             {
                 Application.Current.Dispatcher.InvokeAsync(() =>
                 {
-                    RestoreSelection(storeNameToRestore, -1);
-                    StatusTextBlock.Text = $"已恢复选中: '{storeNameToRestore}'";
+                    bool restored = RestoreSelection(storeNameToRestore, indexToRestore);
+                    StatusTextBlock.Text = restored
+                        ? $"已恢复选中: '{storeNameToRestore}'"
+                        : "已清空筛选，但未能恢复到先前选中项";
                 }, System.Windows.Threading.DispatcherPriority.Loaded);
             }
         }
@@ -3805,9 +3951,15 @@ namespace moshushou
                                 trackingCount = _storeData[storeName].Count;
                             }
                         }
-                        targetNode.Header = $"{storeName} ({trackingCount}条)";
 
-                        StatusTextBlock.Text = $"[OCR] ✅ 已更新商家 '{storeName}' 的群名为: {groupName}";
+                        string displayStoreName = storeName;
+                        if (TryParseCustomStoreKey(storeName, out var parsedStoreName, out _))
+                        {
+                            displayStoreName = parsedStoreName;
+                        }
+                        targetNode.Header = $"{displayStoreName} ({trackingCount}条)";
+
+                        StatusTextBlock.Text = $"[OCR] ✅ 已更新商家 '{displayStoreName}' 的群名为: {groupName}";
                     }
                 }
             });
@@ -3943,7 +4095,39 @@ namespace moshushou
             if (sender is TreeViewItem item)
             {
                 item.BringIntoView();
-                e.Handled = true;
+            }
+        }
+
+        /// <summary>
+        /// 滚动时防止虚拟化导致当前选中项状态被意外清空。
+        /// </summary>
+        private void StoreTreeView_ScrollChanged(object sender, ScrollChangedEventArgs e)
+        {
+            if (_currentSelectedNode == null || string.IsNullOrEmpty(_currentSelectedNode.StoreName))
+            {
+                return;
+            }
+
+            if (_currentSelectedNode.StoreName == "FAIL_SEPARATOR")
+            {
+                return;
+            }
+
+            if (_flatNodeList.Count == 0)
+            {
+                RebuildFlatNodeList();
+            }
+
+            if (!_flatNodeList.Contains(_currentSelectedNode))
+            {
+                return;
+            }
+
+            // 仅在状态被意外清掉时恢复，不主动滚动，避免打断用户拖动列表。
+            if (!_currentSelectedNode.IsSelected)
+            {
+                ClearAllTreeViewSelections();
+                _currentSelectedNode.IsSelected = true;
             }
         }
 
@@ -4103,6 +4287,11 @@ namespace moshushou
             return storeName.Trim();
         }
 
+        private static string NormalizeStoreNameForBusinessInfo(string storeName)
+        {
+            return NormalizeStoreNameForSearch(storeName);
+        }
+
         private static string BuildCustomStoreKey(string realStoreName, string message)
         {
             return $"{realStoreName}##{message}";
@@ -4253,13 +4442,29 @@ namespace moshushou
                 return;
             }
 
-            string storeName = _currentSelectedNode.StoreName;
-
-            BusinessInfo infoToEdit = _businessInfoList.FirstOrDefault(b => b.StoreName == storeName);
-            if (infoToEdit == null)
+            string storeName = _currentSelectedNode.StoreName; // 节点键（可能为 "商家名##话术"）
+            string businessStoreName = NormalizeStoreNameForBusinessInfo(storeName);
+            if (string.IsNullOrWhiteSpace(businessStoreName))
             {
-                infoToEdit = new BusinessInfo { StoreName = storeName };
+                businessStoreName = storeName?.Trim() ?? string.Empty;
             }
+
+            var existingInfo = _businessInfoList.FirstOrDefault(b => b.StoreName == businessStoreName);
+            if (existingInfo == null && !string.Equals(storeName, businessStoreName, StringComparison.Ordinal))
+            {
+                // 兼容旧数据：历史上可能存了复合键
+                existingInfo = _businessInfoList.FirstOrDefault(b => b.StoreName == storeName);
+            }
+
+            // 使用副本编辑，避免取消时意外污染内存对象
+            BusinessInfo infoToEdit = existingInfo != null
+                ? new BusinessInfo
+                {
+                    StoreName = businessStoreName,
+                    GroupName = existingInfo.GroupName,
+                    Source = existingInfo.Source
+                }
+                : new BusinessInfo { StoreName = businessStoreName };
 
             var editWindow = new EditBusInfoWindow(infoToEdit);
             bool? result = editWindow.ShowDialog();
@@ -4269,7 +4474,9 @@ namespace moshushou
                 BusinessInfo updatedInfo = editWindow.Info;
 
                 // ✅ 更新业务信息列表
-                _businessInfoList.RemoveAll(b => b.StoreName == updatedInfo.StoreName);
+                _businessInfoList.RemoveAll(b =>
+                    string.Equals(b.StoreName, updatedInfo.StoreName, StringComparison.Ordinal) ||
+                    string.Equals(b.StoreName, storeName, StringComparison.Ordinal));
 
                 if (!string.IsNullOrEmpty(updatedInfo.GroupName))
                 {
@@ -4290,7 +4497,7 @@ namespace moshushou
                     }, System.Windows.Threading.DispatcherPriority.Loaded);
                 }
 
-                StatusTextBlock.Text = $"✅ 已更新商家 '{storeName}' 的信息。";
+                StatusTextBlock.Text = $"✅ 已更新商家 '{updatedInfo.StoreName}' 的信息。";
             }
         }
 
@@ -4386,8 +4593,19 @@ namespace moshushou
                         return;
                     }
 
-                    var storeName = ocrResult.StoreName;
-                    var existingInfo = _businessInfoList.FirstOrDefault(b => b.StoreName == storeName);
+                    var storeName = ocrResult.StoreName; // 节点键（可能为 "商家名##话术"）
+                    var businessStoreName = NormalizeStoreNameForBusinessInfo(storeName);
+                    if (string.IsNullOrWhiteSpace(businessStoreName))
+                    {
+                        businessStoreName = storeName?.Trim() ?? string.Empty;
+                    }
+
+                    var existingInfo = _businessInfoList.FirstOrDefault(b => b.StoreName == businessStoreName);
+                    if (existingInfo == null && !string.Equals(storeName, businessStoreName, StringComparison.Ordinal))
+                    {
+                        // 兼容旧数据：历史上可能存了复合键
+                        existingInfo = _businessInfoList.FirstOrDefault(b => b.StoreName == storeName);
+                    }
 
                     if (existingInfo != null && !string.IsNullOrWhiteSpace(existingInfo.GroupName))
                     {
@@ -4395,15 +4613,28 @@ namespace moshushou
                         return;
                     }
 
+                    BusinessInfo targetInfo = existingInfo;
                     if (existingInfo != null)
                     {
+                        existingInfo.StoreName = businessStoreName;
                         existingInfo.GroupName = ocrResult.GroupName;
                         existingInfo.Source = ocrResult.Source;
                     }
                     else
                     {
-                        _businessInfoList.Add(ocrResult);
+                        targetInfo = new BusinessInfo
+                        {
+                            StoreName = businessStoreName,
+                            GroupName = ocrResult.GroupName,
+                            Source = ocrResult.Source
+                        };
+                        _businessInfoList.Add(targetInfo);
                     }
+
+                    _businessInfoList.RemoveAll(b =>
+                        b != targetInfo &&
+                        (string.Equals(b.StoreName, businessStoreName, StringComparison.Ordinal) ||
+                         string.Equals(b.StoreName, storeName, StringComparison.Ordinal)));
 
                     SaveBusinessInfo();
 
@@ -4420,7 +4651,7 @@ namespace moshushou
                         }, System.Windows.Threading.DispatcherPriority.Loaded);
                     }
 
-                    StatusTextBlock.Text = $"[OCR] ✅ 已保存商家 '{storeName}' 的群名";
+                    StatusTextBlock.Text = $"[OCR] ✅ 已保存商家 '{businessStoreName}' 的群名";
                 }
                 catch (Exception ex)
                 {
@@ -4462,7 +4693,7 @@ namespace moshushou
         /// </summary>
         /// <param name="storeName">要恢复选中的商家名</param>
         /// <param name="fallbackIndex">如果找不到商家名，使用的备用索引</param>
-        private void RestoreSelection(string storeName, int fallbackIndex)
+        private bool RestoreSelection(string storeName, int fallbackIndex)
         {
             if (string.IsNullOrEmpty(storeName))
             {
@@ -4473,8 +4704,9 @@ namespace moshushou
                     var node = _flatNodeList[fallbackIndex];
                     _currentSelectedNode = node;
                     FocusAndSelectItem(node);
+                    return true;
                 }
-                return;
+                return false;
             }
 
             // 重建扁平列表
@@ -4488,20 +4720,51 @@ namespace moshushou
                 _currentSelectedIndex = _flatNodeList.IndexOf(targetNode);
                 _currentSelectedNode = targetNode;
 
-                // 使用延迟确保UI已完全更新
-                Application.Current.Dispatcher.InvokeAsync(() =>
-                {
-                    FocusAndSelectItem(targetNode);
-                }, System.Windows.Threading.DispatcherPriority.Loaded);
+                FocusAndSelectItem(targetNode);
+                return true;
             }
-            else if (fallbackIndex >= 0 && fallbackIndex < _flatNodeList.Count)
+
+            if (fallbackIndex >= 0 && fallbackIndex < _flatNodeList.Count)
             {
                 // 如果找不到原商家，使用备用索引
                 _currentSelectedIndex = fallbackIndex;
                 var node = _flatNodeList[fallbackIndex];
                 _currentSelectedNode = node;
                 FocusAndSelectItem(node);
+                return true;
             }
+
+            return false;
+        }
+
+        /// <summary>
+        /// 获取当前可恢复的商家选中快照（优先当前节点，失败则使用当前索引）。
+        /// </summary>
+        private string GetCurrentSelectedStoreName(out int selectedIndex)
+        {
+            selectedIndex = -1;
+
+            TreeViewNode selectedNode = _currentSelectedNode;
+            if (selectedNode == null || string.IsNullOrEmpty(selectedNode.StoreName) || selectedNode.StoreName == "FAIL_SEPARATOR")
+            {
+                if (_flatNodeList.Count == 0)
+                {
+                    RebuildFlatNodeList();
+                }
+
+                if (_currentSelectedIndex >= 0 && _currentSelectedIndex < _flatNodeList.Count)
+                {
+                    selectedNode = _flatNodeList[_currentSelectedIndex];
+                }
+            }
+
+            if (selectedNode == null || string.IsNullOrEmpty(selectedNode.StoreName) || selectedNode.StoreName == "FAIL_SEPARATOR")
+            {
+                return null;
+            }
+
+            selectedIndex = _flatNodeList.IndexOf(selectedNode);
+            return selectedNode.StoreName;
         }
 
 
