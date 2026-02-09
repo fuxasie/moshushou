@@ -1,0 +1,132 @@
+﻿using System;
+using System.Drawing;
+using System.Runtime.InteropServices;
+using System.Threading.Tasks;
+
+namespace moshushou
+{
+    /// <summary>
+    /// Human-like mouse movement and click helpers.
+    /// </summary>
+    public static class MouseHelper
+    {
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool SetCursorPos(int x, int y);
+
+        [DllImport("user32.dll")]
+        private static extern void mouse_event(int dwFlags, int dx, int dy, int cButtons, int dwExtraInfo);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetCursorPos(out POINT lpPoint);
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct POINT
+        {
+            public int X;
+            public int Y;
+        }
+
+        private const int MOUSEEVENTF_LEFTDOWN = 0x02;
+        private const int MOUSEEVENTF_LEFTUP = 0x04;
+
+        private static readonly Random _random = new Random();
+
+        /// <summary>
+        /// Get current cursor position in screen coordinates.
+        /// </summary>
+        public static Point GetCursorPosition()
+        {
+            if (GetCursorPos(out POINT point))
+            {
+                return new Point(point.X, point.Y);
+            }
+
+            return Point.Empty;
+        }
+
+        /// <summary>
+        /// Move to target with smooth trajectory and click.
+        /// </summary>
+        public static async Task HumanLikeClickAsync(int x, int y, int moveDurationBase = 90)
+        {
+            int targetX = x + _random.Next(-2, 3);
+            int targetY = y + _random.Next(-2, 3);
+
+            await MoveMouseSmoothlyAsync(targetX, targetY, moveDurationBase);
+            await Task.Delay(_random.Next(10, 24));
+
+            mouse_event(MOUSEEVENTF_LEFTDOWN, targetX, targetY, 0, 0);
+            await Task.Delay(_random.Next(18, 36));
+            mouse_event(MOUSEEVENTF_LEFTUP, targetX, targetY, 0, 0);
+        }
+
+        /// <summary>
+        /// Click at current cursor position without moving.
+        /// </summary>
+        public static async Task LeftClickCurrentAsync()
+        {
+            if (!GetCursorPos(out POINT point))
+            {
+                return;
+            }
+
+            mouse_event(MOUSEEVENTF_LEFTDOWN, point.X, point.Y, 0, 0);
+            await Task.Delay(_random.Next(18, 36));
+            mouse_event(MOUSEEVENTF_LEFTUP, point.X, point.Y, 0, 0);
+        }
+
+        /// <summary>
+        /// Move cursor smoothly with a cubic Bezier path.
+        /// </summary>
+        public static async Task MoveMouseSmoothlyAsync(int targetX, int targetY, int durationMs)
+        {
+            GetCursorPos(out POINT startPoint);
+            int startX = startPoint.X;
+            int startY = startPoint.Y;
+
+            double distance = Math.Sqrt(Math.Pow(targetX - startX, 2) + Math.Pow(targetY - startY, 2));
+            if (distance < 4)
+            {
+                SetCursorPos(targetX, targetY);
+                return;
+            }
+
+            int actualDuration = durationMs + (int)(distance * 0.06);
+            if (actualDuration > 320) actualDuration = 320;
+            if (actualDuration < 45) actualDuration = 45;
+
+            int randomOffset = Math.Max(6, Math.Min((int)(distance * 0.18), 90));
+
+            int p1x = startX + (targetX - startX) / 3 + _random.Next(-randomOffset, randomOffset);
+            int p1y = startY + (targetY - startY) / 3 + _random.Next(-randomOffset, randomOffset);
+
+            int p2x = startX + 2 * (targetX - startX) / 3 + _random.Next(-randomOffset, randomOffset);
+            int p2y = startY + 2 * (targetY - startY) / 3 + _random.Next(-randomOffset, randomOffset);
+
+            int steps = actualDuration / 8;
+            if (steps < 7) steps = 7;
+
+            for (int i = 0; i <= steps; i++)
+            {
+                double t = (double)i / steps;
+                t = t * t * (3f - 2f * t);
+
+                double u = 1 - t;
+                double tt = t * t;
+                double uu = u * u;
+                double uuu = uu * u;
+                double ttt = tt * t;
+
+                double x = uuu * startX + 3 * uu * t * p1x + 3 * u * tt * p2x + ttt * targetX;
+                double y = uuu * startY + 3 * uu * t * p1y + 3 * u * tt * p2y + ttt * targetY;
+
+                SetCursorPos((int)x, (int)y);
+                await Task.Delay(_random.Next(4, 8));
+            }
+
+            SetCursorPos(targetX, targetY);
+        }
+    }
+}

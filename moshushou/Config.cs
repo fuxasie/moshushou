@@ -17,6 +17,7 @@ namespace moshushou
         public List<string> ManualReviewStores { get; set; } = new(); // 需人工列表
         public List<string> DeletedStores { get; set; } = new();     // 已删除的商家列表
         public bool IsIssueMode { get; set; } = false;               // 是否为问题件模式
+        public bool IsCustomMessageMode { get; set; } = false;       // 是否为自定义话术模式(4列)
     }
 
     public class SearchConfig
@@ -63,6 +64,9 @@ namespace moshushou
 
         // ✅ 新增：问题件模式的独立状态存储
         public FileState LastIssueFileState { get; set; } = new FileState();
+
+        // ✅ 新增：自定义话术模式(4列)的独立状态存储
+        public FileState LastCustomMessageFileState { get; set; } = new FileState();
 
         // ✅ 新增：固定话术（可配置）
         public string FixedMessage { get; set; } = "现同步未发货预警，超时未交件会考核处罚，请尽快处理转出,已售后的及时发起拦截。（注：未处理售后请勿虚假拦截，核实虚假正常考核处罚。字节超时未发出总部将发起拦截）";

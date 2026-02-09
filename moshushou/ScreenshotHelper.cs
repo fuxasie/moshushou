@@ -95,11 +95,11 @@ namespace moshushou
                     // 1. YOLO 识别
                     var yoloResults = _yoloDetector.Detect(bitmap);
                     
-                    // 2. 保存调试图 [新增]
-                    string debugDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Debug_Yolo", DateTime.Now.ToString("yyyyMMdd"));
-                    Directory.CreateDirectory(debugDir);
-                    string debugFile = Path.Combine(debugDir, $"Title_{DateTime.Now:HHmmss_fff}.png");
-                    _yoloDetector.InferenceWrapper.SaveDebugImage(bitmap, yoloResults, debugFile);
+                    // 2. 保存调试图 [已注释]
+                    // string debugDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Debug_Yolo", DateTime.Now.ToString("yyyyMMdd"));
+                    // Directory.CreateDirectory(debugDir);
+                    // string debugFile = Path.Combine(debugDir, $"Title_{DateTime.Now:HHmmss_fff}.png");
+                    // _yoloDetector.InferenceWrapper.SaveDebugImage(bitmap, yoloResults, debugFile);
 
                     // 🚨 [调整] 场景宽松验证 (Relaxed Scene Validation)
                     // 原则：只要有 "群名" 和 "输入框" 且置信度及格，就认为是聊天窗口。
@@ -137,8 +137,8 @@ namespace moshushou
                         using (var processed = PreprocessForOcr(crop, 3))
                         {
                             // 📷 [调试] 保存 OCR 识别用的裁切图
-                            string cropDebugFile = Path.Combine(debugDir, $"Title_Crop_{DateTime.Now:HHmmss_fff}.png");
-                            processed.Save(cropDebugFile, ImageFormat.Png);
+                            //string cropDebugFile = Path.Combine(debugDir, $"Title_Crop_{DateTime.Now:HHmmss_fff}.png");
+                            //processed.Save(cropDebugFile, ImageFormat.Png);
                             // _logAction?.Invoke($"🖼️ [OCR调试] 标题裁切图已存: {cropDebugFile}");
 
                             string ocrText = await PerformOcrAsync(processed);
@@ -192,21 +192,33 @@ namespace moshushou
 
                             var results = _yoloDetector.Detect(bitmap);
                             
-                            // 调试保存
-                            string debugDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Debug_Yolo", DateTime.Now.ToString("yyyyMMdd"));
-                            Directory.CreateDirectory(debugDir);
-                            string debugFile = Path.Combine(debugDir, $"InputBox_{DateTime.Now:HHmmss_fff}.png");
-                            _yoloDetector.InferenceWrapper.SaveDebugImage(bitmap, results, debugFile);
+                            // 调试保存 [已注释]
+                            // string debugDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Debug_Yolo", DateTime.Now.ToString("yyyyMMdd"));
+                            // Directory.CreateDirectory(debugDir);
+                            // string debugFile = Path.Combine(debugDir, $"InputBox_{DateTime.Now:HHmmss_fff}.png");
+                            // _yoloDetector.InferenceWrapper.SaveDebugImage(bitmap, results, debugFile);
 
                             // 查找 "聊天框" (通常包含输入框)
                             var chatBox = results.Where(r => r.LabelName == YoloWindowDetector.Label_ChatBox).OrderByDescending(r => r.Confidence).FirstOrDefault();
                             if (chatBox != null)
                             {
                                 // 输入框通常在 ChatBox 识别框的底部上方一点点
-                                int clickX = screenX + chatBox.BBox.X + chatBox.BBox.Width / 2;
-                                int clickY = screenY + chatBox.BBox.Bottom - 30; // 向上偏移以避开底部边缘
+                                // 🚀 [优化] 随机点击输入框区域
+                                int boxW = chatBox.BBox.Width;
+                                int boxH = chatBox.BBox.Height;
+                                // 输入区域大约在整个 ChatBox 的下半部分
+                                int inputAreaTop = chatBox.BBox.Y + (int)(boxH * 0.6); 
+                                int inputAreaH = (int)(boxH * 0.3); // 高度取 30%
                                 
-                                _logAction?.Invoke($"🎯 YOLO 定位输入框成功: ({clickX}, {clickY})");
+                                Random rnd = new Random();
+                                int safeMargin = 20;
+                                int safeInputW = boxW - 2 * safeMargin;
+                                if (safeInputW <= 0) safeInputW = 1;
+
+                                int clickX = screenX + chatBox.BBox.X + safeMargin + rnd.Next(0, safeInputW);
+                                int clickY = screenY + inputAreaTop + rnd.Next(0, inputAreaH);
+                                
+                                _logAction?.Invoke($"🎯 YOLO 定位输入框成功(随机): ({clickX}, {clickY})");
                                 return (true, clickX, clickY);
                             }
                         }
@@ -827,23 +839,23 @@ namespace moshushou
         /// ✅ [合并版] 验证搜索结果并返回点击坐标 (合并 StepA 和 StepB)
         /// 避免 StepA 成功但 StepB 重新截图导致失败的问题
         /// </summary>
-        public async Task<(bool success, Point? clickPoint)> FindAndVerifySearchResultAsync(IntPtr targetHwnd, string expectedText, bool isWework)
+        public async Task<(bool success, Point? clickPoint, Rectangle? matchedScreenBBox)> FindAndVerifySearchResultAsync(IntPtr targetHwnd, string expectedText, bool isWework)
         {
             try
             {
                 if (_yoloDetector == null)
                 {
                     _logAction?.Invoke("❌ YOLO Detector 未初始化");
-                    return (false, null);
+                    return (false, null, null);
                 }
 
-                if (targetHwnd == IntPtr.Zero || !GetWindowRect(targetHwnd, out RECT rect)) return (false, null);
+                if (targetHwnd == IntPtr.Zero || !GetWindowRect(targetHwnd, out RECT rect)) return (false, null, null);
 
                 // 🛡️ [防御] 防止截取到桌面 (当窗口失焦时)
                 if (IsDesktopPixelSize(rect) || IsSystemWindowClass(targetHwnd))
                 {
                     System.Diagnostics.Debug.WriteLine($"⚠️ [FindAndVerify] 拦截到桌面/系统窗口截取请求: {targetHwnd}");
-                    return (false, null);
+                    return (false, null, null);
                 }
 
                 // 🚀 [改版] 截取整个窗口 (Full Window)
@@ -852,7 +864,7 @@ namespace moshushou
                 int screenX = rect.Left;
                 int screenY = rect.Top;
 
-                if (width <= 0 || (rect.Bottom - rect.Top) < 100) return (false, null);
+                if (width <= 0 || (rect.Bottom - rect.Top) < 100) return (false, null, null);
 
                 using (var bitmap = new Bitmap(width, height, PixelFormat.Format32bppArgb))
                 {
@@ -864,11 +876,11 @@ namespace moshushou
                     // 1. YOLO 检测
                     var results = _yoloDetector.Detect(bitmap);
                     
-                    // 2. 保存调试图
-                    string debugDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Debug_Yolo", DateTime.Now.ToString("yyyyMMdd"));
-                    Directory.CreateDirectory(debugDir);
-                    string debugFile = Path.Combine(debugDir, $"MergerSearch_{DateTime.Now:HHmmss_fff}.png");
-                    _yoloDetector.InferenceWrapper.SaveDebugImage(bitmap, results, debugFile);
+                    // 2. 保存调试图 [已注释]
+                    // string debugDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Debug_Yolo", DateTime.Now.ToString("yyyyMMdd"));
+                    // Directory.CreateDirectory(debugDir);
+                    // string debugFile = Path.Combine(debugDir, $"MergerSearch_{DateTime.Now:HHmmss_fff}.png");
+                    // _yoloDetector.InferenceWrapper.SaveDebugImage(bitmap, results, debugFile);
                     // _logAction?.Invoke($"🖼️ YOLO 识别图已存: {debugFile}");
 
                     // 3. 筛选目标：搜索群聊 或 最近搜索群聊
@@ -881,7 +893,7 @@ namespace moshushou
                     if (targets.Count == 0)
                     {
                         System.Diagnostics.Debug.WriteLine($"❌ [FindAndVerify] YOLO 未检测到任何搜索结果标签");
-                        return (false, null);
+                        return (false, null, null);
                     }
 
                     System.Diagnostics.Debug.WriteLine($"✅ [FindAndVerify] YOLO 检测到 {targets.Count} 个潜在结果");
@@ -914,24 +926,150 @@ namespace moshushou
                                 {
                                     System.Diagnostics.Debug.WriteLine($"✅ [FindAndVerify] 目标匹配成功: '{expectedText}'");
                                     
-                                    // 计算点击坐标 (屏幕坐标)
-                                    int clickX = screenX + bbox.X + bbox.Width / 2;
-                                    int clickY = screenY + bbox.Y + bbox.Height / 2;
+                                    // 🚀 [优化] 随机点计算：避开边缘 20%
+                                    int marginX = (int)(bbox.Width * 0.2);
+                                    int marginY = (int)(bbox.Height * 0.2);
                                     
-                                    return (true, new Point(clickX, clickY));
+                                    // 确保有点击空间
+                                    if (marginX < 2) marginX = 2;
+                                    if (marginY < 2) marginY = 2;
+
+                                    // 安全区域宽高
+                                    int safeW = bbox.Width - 2 * marginX;
+                                    int safeH = bbox.Height - 2 * marginY;
+                                    
+                                    if (safeW <= 0) safeW = 1;
+                                    if (safeH <= 0) safeH = 1;
+
+                                    Random rnd = new Random();
+                                    int offsetX = marginX + rnd.Next(0, safeW);
+                                    int offsetY = marginY + rnd.Next(0, safeH);
+
+                                    int clickX = screenX + bbox.X + offsetX;
+                                    int clickY = screenY + bbox.Y + offsetY;
+
+                                    var matchedScreenBBox = new Rectangle(
+                                        screenX + bbox.X,
+                                        screenY + bbox.Y,
+                                        bbox.Width,
+                                        bbox.Height
+                                    );
+
+                                    return (true, new Point(clickX, clickY), matchedScreenBBox);
                                 }
                             }
                         }
                     }
                     
                     System.Diagnostics.Debug.WriteLine($"❌ [FindAndVerify] 检测到结果但不匹配期望文本 '{expectedText}'");
-                    return (false, null);
+                    return (false, null, null);
                 }
             }
             catch (Exception ex)
             {
                 _logAction?.Invoke($"💥 搜索验证合并版出错: {ex.Message}");
-                return (false, null);
+                return (false, null, null);
+            }
+        }
+
+        /// <summary>
+        /// 点击前二次校验：确认当前点击点仍落在 YOLO 识别的目标群聊项内，并通过 OCR 文本匹配
+        /// </summary>
+        public async Task<bool> ValidateSearchResultPointAsync(IntPtr targetHwnd, string expectedText, bool isWework, Point screenPoint, int tolerancePixels = 6)
+        {
+            try
+            {
+                if (_yoloDetector == null)
+                {
+                    _logAction?.Invoke("❌ YOLO Detector 未初始化");
+                    return false;
+                }
+
+                if (targetHwnd == IntPtr.Zero || !GetWindowRect(targetHwnd, out RECT rect)) return false;
+
+                // 🛡️ [防御] 防止截取到桌面
+                if (IsDesktopPixelSize(rect) || IsSystemWindowClass(targetHwnd))
+                {
+                    System.Diagnostics.Debug.WriteLine($"⚠️ [ValidatePoint] 拦截到桌面/系统窗口截取请求: {targetHwnd}");
+                    return false;
+                }
+
+                int width = rect.Right - rect.Left;
+                int height = rect.Bottom - rect.Top;
+                int screenX = rect.Left;
+                int screenY = rect.Top;
+
+                if (width <= 0 || height < 100) return false;
+
+                int localX = screenPoint.X - screenX;
+                int localY = screenPoint.Y - screenY;
+
+                using (var bitmap = new Bitmap(width, height, PixelFormat.Format32bppArgb))
+                {
+                    using (var graphics = Graphics.FromImage(bitmap))
+                    {
+                        graphics.CopyFromScreen(screenX, screenY, 0, 0, new Size(width, height), CopyPixelOperation.SourceCopy);
+                    }
+
+                    var targets = _yoloDetector.Detect(bitmap)
+                        .Where(r => r.LabelName == YoloWindowDetector.Label_SearchGroup ||
+                                    r.LabelName == YoloWindowDetector.Label_RecentGroup)
+                        .OrderByDescending(r => r.Confidence)
+                        .ToList();
+
+                    if (targets.Count == 0)
+                    {
+                        System.Diagnostics.Debug.WriteLine("❌ [ValidatePoint] YOLO 未检测到任何搜索结果标签");
+                        return false;
+                    }
+
+                    var pointTargets = targets.Where(t =>
+                    {
+                        var bbox = t.BBox;
+                        int left = bbox.X - tolerancePixels;
+                        int top = bbox.Y - tolerancePixels;
+                        int right = bbox.Right + tolerancePixels;
+                        int bottom = bbox.Bottom + tolerancePixels;
+                        return localX >= left && localX <= right && localY >= top && localY <= bottom;
+                    }).ToList();
+
+                    if (pointTargets.Count == 0)
+                    {
+                        System.Diagnostics.Debug.WriteLine($"❌ [ValidatePoint] 点击点({screenPoint.X},{screenPoint.Y}) 不在任何候选群聊框内");
+                        return false;
+                    }
+
+                    foreach (var target in pointTargets)
+                    {
+                        var bbox = target.BBox;
+                        if (bbox.Width <= 0 || bbox.Height <= 0) continue;
+
+                        using (var crop = new Bitmap(bbox.Width, bbox.Height))
+                        using (var g = Graphics.FromImage(crop))
+                        {
+                            g.DrawImage(bitmap, new Rectangle(0, 0, bbox.Width, bbox.Height), bbox, GraphicsUnit.Pixel);
+                            using (var processed = PreprocessForOcr(crop, 3))
+                            {
+                                string ocrText = await PerformOcrAsync(processed);
+                                bool match = IsFuzzyMatch(expectedText, ocrText);
+                                System.Diagnostics.Debug.WriteLine($"🔍 [ValidatePoint] 候选 OCR:'{ocrText}' -> {(match ? "✅ 匹配" : "❌ 不匹配")}");
+                                if (match)
+                                {
+                                    System.Diagnostics.Debug.WriteLine($"✅ [ValidatePoint] 点击点二次校验通过: ({screenPoint.X},{screenPoint.Y})");
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+
+                    System.Diagnostics.Debug.WriteLine($"❌ [ValidatePoint] 点击点命中目标框，但 OCR 不匹配期望文本 '{expectedText}'");
+                    return false;
+                }
+            }
+            catch (Exception ex)
+            {
+                _logAction?.Invoke($"💥 点击前二次校验失败: {ex.Message}");
+                return false;
             }
         }
 
@@ -1068,12 +1206,12 @@ namespace moshushou
                     // 1. YOLO 识别
                     var yoloResults = _yoloDetector.Detect(bitmap);
                     
-                    // 2. 保存调试图 [新增]
-                    string debugDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Debug_Yolo", DateTime.Now.ToString("yyyyMMdd"));
-                    Directory.CreateDirectory(debugDir);
-                    string debugFile = Path.Combine(debugDir, $"Search_{DateTime.Now:HHmmss_fff}.png");
-                    _yoloDetector.InferenceWrapper.SaveDebugImage(bitmap, yoloResults, debugFile);
-                    _logAction?.Invoke($"🖼️ YOLO 识别图已存: {debugFile}");
+                    // 2. 保存调试图 [已注释]
+                    // string debugDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Debug_Yolo", DateTime.Now.ToString("yyyyMMdd"));
+                    // Directory.CreateDirectory(debugDir);
+                    // string debugFile = Path.Combine(debugDir, $"Search_{DateTime.Now:HHmmss_fff}.png");
+                    // _yoloDetector.InferenceWrapper.SaveDebugImage(bitmap, yoloResults, debugFile);
+                    // _logAction?.Invoke($"🖼️ YOLO 识别图已存: {debugFile}");
 
                     // 3. 筛选 "在线文档"
                     var popupRect = _yoloDetector.FindOnlineDocPopupBBox(bitmap);
@@ -1191,12 +1329,12 @@ namespace moshushou
                     // 1. YOLO 第一轮识别
                     var yoloResults = _yoloDetector.Detect(bitmap);
                     
-                    // 2. 保存调试图 [新增]
-                    string debugDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Debug_Yolo", DateTime.Now.ToString("yyyyMMdd"));
-                    Directory.CreateDirectory(debugDir);
-                    string debugFile = Path.Combine(debugDir, $"GroupClick_{DateTime.Now:HHmmss_fff}.png");
-                    _yoloDetector.InferenceWrapper.SaveDebugImage(bitmap, yoloResults, debugFile);
-                    _logAction?.Invoke($"🖼️ YOLO 群聊识别图已存: {debugFile}");
+                    // 2. 保存调试图 [已注释]
+                    // string debugDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Debug_Yolo", DateTime.Now.ToString("yyyyMMdd"));
+                    // Directory.CreateDirectory(debugDir);
+                    // string debugFile = Path.Combine(debugDir, $"GroupClick_{DateTime.Now:HHmmss_fff}.png");
+                    // _yoloDetector.InferenceWrapper.SaveDebugImage(bitmap, yoloResults, debugFile);
+                    // _logAction?.Invoke($"🖼️ YOLO 群聊识别图已存: {debugFile}");
 
                     // 3. 筛选目标：搜索群聊 或 最近搜索群聊
                     var targets = yoloResults
@@ -1232,7 +1370,17 @@ namespace moshushou
                                     
                                     if (match)
                                     {
-                                         return new Point(screenX + bbox.X + bbox.Width / 2, screenY + bbox.Y + bbox.Height / 2);
+                                         // 🚀 [优化] 随机点
+                                     int mX = (int)(bbox.Width * 0.2);
+                                     int mY = (int)(bbox.Height * 0.2);
+                                     if (mX < 2) mX = 2;
+                                     if (mY < 2) mY = 2;
+                                     int sW = bbox.Width - 2 * mX; if (sW <= 0) sW = 1;
+                                     int sH = bbox.Height - 2 * mY; if (sH <= 0) sH = 1;
+                                     
+                                     Random rnd = new Random();
+                                     return new Point(screenX + bbox.X + mX + rnd.Next(0, sW), 
+                                                      screenY + bbox.Y + mY + rnd.Next(0, sH));
                                     }
                                 }
                             }
@@ -1243,9 +1391,23 @@ namespace moshushou
                     {
                         // 无指定名字，返回置信度最高的
                         var best = targets.FirstOrDefault(t => t.LabelName == YoloWindowDetector.Label_SearchGroup) ?? targets.First();
-                        var bbox = best.BBox;
-                        _logAction?.Invoke($"✅ 自动锁定最高置信度目标: {best.LabelName} ({best.Confidence:P0})");
-                        return new Point(screenX + bbox.X + bbox.Width / 2, screenY + bbox.Y + bbox.Height / 2);
+                        var safeBBox = best.BBox;
+                        int marginX = (int)(safeBBox.Width * 0.2);
+                        int marginY = (int)(safeBBox.Height * 0.2);
+                        if (marginX < 2) marginX = 2;
+                        if (marginY < 2) marginY = 2;
+
+                        int safeW = safeBBox.Width - 2 * marginX;
+                        int safeH = safeBBox.Height - 2 * marginY;
+                        if (safeW <= 0) safeW = 1;
+                        if (safeH <= 0) safeH = 1;
+
+                        Random rnd = new Random();
+                        int cx = screenX + safeBBox.X + marginX + rnd.Next(0, safeW);
+                        int cy = screenY + safeBBox.Y + marginY + rnd.Next(0, safeH);
+
+                        _logAction?.Invoke($"✅ 自动锁定最高置信度目标: {best.LabelName} ({best.Confidence:P0}) -> 随机点 ({cx},{cy})");
+                        return new Point(cx, cy);
                     }
                 }
             }
