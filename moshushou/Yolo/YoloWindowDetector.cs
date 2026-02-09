@@ -41,6 +41,12 @@ namespace moshushou.Yolo
             return results;
         }
 
+        public List<YoloResult> Detect(Bitmap bitmap, float confThreshold, float iouThreshold = 0.45f)
+        {
+            var results = _wrapper.Predict(bitmap, confThreshold, iouThreshold);
+            return results;
+        }
+
         /// <summary>
         /// 查找"在线文档"弹窗中心点 (用于点击 "使用原文件")
         /// </summary>
