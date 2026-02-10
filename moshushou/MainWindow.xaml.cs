@@ -2495,66 +2495,45 @@ namespace moshushou
             }
 
             // ============================================================
-            // 🌟 轮询验证结果 (宽松版)
+            // 🌟 YOLO 精准验证 (3屏快速截取 + 模糊匹配)
             // ============================================================
-            string debugInfo = "";
+            const int MAX_VERIFY_ROUNDS = 3; // 最多验证3轮（每轮3屏 = 最多9次截取）
 
-            for (int i = 0; i < 8; i++)
+            for (int round = 0; round < MAX_VERIFY_ROUNDS; round++)
             {
-                await Task.Delay(200);
+                await Task.Delay(200); // 等待 UI 渲染
 
-                // ✅ 【关键修复】这里不再调用严格的 CheckWindowReady
-                // 而是手动检查焦点。如果焦点丢了，视为用户切换了窗口，默认判定为“发送成功”
+                // 检查窗口焦点：焦点丢失视为发送失败，要求严格验证
                 IntPtr currentForeground = GetForegroundWindow();
                 if (currentForeground != targetHwnd)
                 {
-                    Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = "⚠️ 验证期间窗口失焦(视为发送成功)。");
-                    return true; // 👈 只要动作做完了，窗口丢了也算成功，不移除列表项
+                    Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = "❌ 验证期间窗口失焦，发送失败。");
+                    return false;
                 }
 
-                // 截图验证
-                var resultSend = await _screenshotHelper.CaptureSplitVerificationAsync(targetHwnd, isWework);
-                if (resultSend.topText == null || resultSend.bottomText == null) continue;
+                // 调用 YOLO 精准验证（内部快速截取3屏）
+                var verifyResult = await _screenshotHelper.VerifySendWithYoloAsync(targetHwnd, isWework, keyword);
 
-                // 判据
-                bool inputCleared = !_screenshotHelper.IsTextMatch(resultSend.bottomText, keyword);
-                bool messageAppeared = _screenshotHelper.IsTextMatch(resultSend.topText, keyword);
-
-                if (i == 7)
+                if (verifyResult.success)
                 {
-                    string top = resultSend.topText?.Replace("\n", "") ?? "";
-                    if (top.Length > 10) top = top.Substring(0, 10);
-                    debugInfo = $"Top:{top}.. / Clr:{inputCleared}";
-                }
-
-                // ✅ 成功情况 1: 上屏
-                if (messageAppeared)
-                {
-                    Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = "✅ [上屏验证] 发送成功。");
+                    Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = $"✅ [{verifyResult.verifyMethod}] 发送成功。");
                     return true;
                 }
 
-                // ✅ 成功情况 2: 清空
-                if (inputCleared)
+                // 补刀重试：发送未成功，再次点击输入框 + Enter
+                if (round < MAX_VERIFY_ROUNDS - 1)
                 {
-                    Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = "✅ [清空验证] 发送成功。");
-                    return true;
-                }
-
-                // ⚠️ 补刀重试
-                if (!inputCleared && i == 3)
-                {
-                    Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text += " (再次重试Enter)...");
+                    Log($"⚠️ 第{round + 1}轮验证未通过，补刀重试...");
+                    Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = $"⚠️ 第{round + 1}轮未通过，补刀Enter重试...");
                     await MouseHelper.HumanLikeClickAsync(clickX, clickY, 80);
                     await Task.Delay(35);
                     SimulateEnter();
                 }
             }
 
-            // ✅ 兜底: 流程走完了但OCR没验证到。
-            // 为了防止“已发送但被移除”的悲剧，这里返回 TRUE (或者你可以选择返回 false 但不移除，目前为了体验建议返回 true)
-            Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = $"⚠️ 验证超时(OCR未确认)，视为潜在成功。");
-            return true;
+            // 所有轮次验证均未通过 → 发送失败
+            Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = $"❌ [YOLO验证] 发送失败: 未检测到发送内容。");
+            return false;
         }
 
 

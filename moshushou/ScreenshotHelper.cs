@@ -767,76 +767,167 @@ namespace moshushou
 
 
         /// <summary>
-        /// ✅ 解决报错：宽松匹配方法
+        /// ✅ [YOLO 精准版] 发送验证保险机制
+        /// 通过 YOLO 定位 ChatInfo（聊天信息区）和 ChatBox（聊天框）的精确区域，
+        /// 快速截取 3 屏防刷屏，OCR 识别后使用模糊匹配对比我们发送的关键词。
+        /// 只有 3 屏中完全找不到我们发送的文本才判定为失败。
         /// </summary>
-        public bool IsTextMatch(string fullText, string keyword)
+        /// <param name="hwnd">目标聊天窗口句柄</param>
+        /// <param name="isWework">是否企业微信</param>
+        /// <param name="keyword">我们发送的关键词（用于对比验证）</param>
+        /// <returns>
+        /// success: 是否验证成功
+        /// verifyMethod: 验证方式描述
+        /// chatInfoText: 聊天信息区 OCR 文本（最后一屏）
+        /// chatBoxText: 聊天框 OCR 文本（最后一屏）
+        /// </returns>
+        public async Task<(bool success, string verifyMethod, string chatInfoText, string chatBoxText)> VerifySendWithYoloAsync(
+            IntPtr hwnd, bool isWework, string keyword)
         {
-            if (string.IsNullOrEmpty(fullText) || string.IsNullOrEmpty(keyword)) return false;
+            Action<string> Log = (msg) => System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [YoloVerify] {msg}");
 
-            // 移除空白和标点，忽略大小写
-            string Clean(string s) => Regex.Replace(s, @"\s+|[.,;:'""()（）]", "").ToLower();
-
-            return Clean(fullText).Contains(Clean(keyword));
-        }
-
-        /// <summary>
-        /// ✅ [修改版] 截取右侧窗口，并按高度分割验证
-        /// 改动：移除放大逻辑，直接使用原图进行神经网络OCR识别
-        /// </summary>
-        public async Task<(string topText, string bottomText)> CaptureSplitVerificationAsync(IntPtr targetHwnd, bool isWework)
-        {
-            try
+            if (hwnd == IntPtr.Zero)
             {
-                if (targetHwnd == IntPtr.Zero || !GetWindowRect(targetHwnd, out RECT rect)) return (null, null);
-
-                string appIdentifier = isWework ? "企业微信" : "微信";
-                int rightCrop = GetRightCropAmount(appIdentifier);
-                int leftCrop = _config.WeChatCropLeft;
-                
-                int leftStart = rect.Left + leftCrop;
-                int totalWidth = (rect.Right - rect.Left) - leftCrop - rightCrop;
-                int totalHeight = rect.Bottom - rect.Top;
-
-                if (totalWidth <= 0 || totalHeight <= 0) return (null, null);
-
-                // 分割线：离底部 250px (涵盖输入框)
-                int splitHeightFromBottom = 250;
-                if (totalHeight < 500) splitHeightFromBottom = (int)(totalHeight * 0.4);
-
-                int topHeight = totalHeight - splitHeightFromBottom;
-                int bottomHeight = splitHeightFromBottom;
-
-                string tText = "", bText = "";
-
-                // --- 截取上半部分 (聊天区) ---
-                using (var bmpTop = new Bitmap(totalWidth, topHeight, PixelFormat.Format32bppArgb))
-                {
-                    using (var g = Graphics.FromImage(bmpTop))
-                    {
-                        g.CopyFromScreen(leftStart, rect.Top, 0, 0, new Size(totalWidth, topHeight), CopyPixelOperation.SourceCopy);
-                    }
-                    // ⚡ 原图直接识别 (不放大)
-                    tText = await PerformOcrAsync(bmpTop);
-                }
-
-                // --- 截取下半部分 (输入区) ---
-                using (var bmpBottom = new Bitmap(totalWidth, bottomHeight, PixelFormat.Format32bppArgb))
-                {
-                    using (var g = Graphics.FromImage(bmpBottom))
-                    {
-                        g.CopyFromScreen(leftStart, rect.Top + topHeight, 0, 0, new Size(totalWidth, bottomHeight), CopyPixelOperation.SourceCopy);
-                    }
-                    // ⚡ 原图直接识别 (不放大)
-                    bText = await PerformOcrAsync(bmpBottom);
-                }
-
-                return (tText, bText);
+                Log("❌ 窗口句柄无效");
+                return (false, "窗口无效", null, null);
             }
-            catch (Exception ex)
+
+            if (_yoloDetector == null)
             {
-                _logAction?.Invoke($"💥 分割验证截图失败: {ex.Message}");
-                return (null, null);
+                Log("❌ YOLO 未初始化，无法验证");
+                return (false, "YOLO未初始化", null, null);
             }
+
+            // 快速连续截取 3 屏，几乎无间隔，防止消息被刷屏上去识别不到
+            const int FRAME_COUNT = 3;
+            const int FRAME_INTERVAL_MS = 30; // 极短间隔，保证速度
+
+            string lastChatInfoText = null;
+            string lastChatBoxText = null;
+
+            for (int frame = 0; frame < FRAME_COUNT; frame++)
+            {
+                if (frame > 0) await Task.Delay(FRAME_INTERVAL_MS);
+
+                try
+                {
+                    if (!GetWindowRect(hwnd, out RECT rect)) continue;
+                    int w = rect.Right - rect.Left;
+                    int h = rect.Bottom - rect.Top;
+                    if (w <= 0 || h <= 0) continue;
+
+                    // 截取整个窗口
+                    using (var bitmap = new Bitmap(w, h, PixelFormat.Format32bppArgb))
+                    {
+                        using (var g = Graphics.FromImage(bitmap))
+                        {
+                            g.CopyFromScreen(rect.Left, rect.Top, 0, 0, new Size(w, h), CopyPixelOperation.SourceCopy);
+                        }
+
+                        // YOLO 检测
+                        var results = _yoloDetector.Detect(bitmap);
+
+                        var chatInfo = results
+                            .Where(r => r.LabelName == YoloWindowDetector.Label_ChatInfo)
+                            .OrderByDescending(r => r.Confidence)
+                            .FirstOrDefault();
+                        var chatBox = results
+                            .Where(r => r.LabelName == YoloWindowDetector.Label_ChatBox)
+                            .OrderByDescending(r => r.Confidence)
+                            .FirstOrDefault();
+
+                        if (chatInfo == null && chatBox == null)
+                        {
+                            Log($"⚠️ 第{frame + 1}屏: YOLO 未检测到 ChatInfo 和 ChatBox");
+                            continue;
+                        }
+
+                        // === 验证1: ChatInfo 区域（聊天信息）底部 1/3 ===
+                        if (chatInfo != null)
+                        {
+                            // 裁剪 ChatInfo 底部 1/3（最新消息区域）
+                            int infoH = chatInfo.BBox.Height;
+                            int cropH = Math.Max(infoH / 3, 50); // 至少 50px
+                            int cropY = chatInfo.BBox.Y + infoH - cropH;
+                            int cropX = chatInfo.BBox.X;
+                            int cropW = chatInfo.BBox.Width;
+
+                            // 边界安全检查
+                            if (cropX < 0) cropX = 0;
+                            if (cropY < 0) cropY = 0;
+                            if (cropX + cropW > w) cropW = w - cropX;
+                            if (cropY + cropH > h) cropH = h - cropY;
+
+                            if (cropW > 0 && cropH > 0)
+                            {
+                                using (var chatInfoCrop = bitmap.Clone(
+                                    new Rectangle(cropX, cropY, cropW, cropH),
+                                    bitmap.PixelFormat))
+                                {
+                                    lastChatInfoText = await PerformOcrAsync(chatInfoCrop);
+                                    Log($"📝 第{frame + 1}屏 ChatInfo OCR: {lastChatInfoText?.Substring(0, Math.Min(80, lastChatInfoText?.Length ?? 0))}");
+
+                                    // 模糊匹配：对比我们发送的关键词
+                                    if (!string.IsNullOrEmpty(lastChatInfoText) && IsFuzzyMatch(keyword, lastChatInfoText))
+                                    {
+                                        Log($"✅ 第{frame + 1}屏: ChatInfo 上屏验证成功 (模糊匹配命中)");
+                                        return (true, $"YOLO上屏验证(第{frame + 1}屏)", lastChatInfoText, lastChatBoxText);
+                                    }
+                                }
+                            }
+                        }
+
+                        // === 验证2: ChatBox 区域（聊天输入框）===
+                        if (chatBox != null)
+                        {
+                            int boxX = chatBox.BBox.X;
+                            int boxY = chatBox.BBox.Y;
+                            int boxW = chatBox.BBox.Width;
+                            int boxH = chatBox.BBox.Height;
+
+                            // 边界安全检查
+                            if (boxX < 0) boxX = 0;
+                            if (boxY < 0) boxY = 0;
+                            if (boxX + boxW > w) boxW = w - boxX;
+                            if (boxY + boxH > h) boxH = h - boxY;
+
+                            if (boxW > 0 && boxH > 0)
+                            {
+                                using (var chatBoxCrop = bitmap.Clone(
+                                    new Rectangle(boxX, boxY, boxW, boxH),
+                                    bitmap.PixelFormat))
+                                {
+                                    lastChatBoxText = await PerformOcrAsync(chatBoxCrop);
+                                    Log($"📝 第{frame + 1}屏 ChatBox OCR: {lastChatBoxText?.Substring(0, Math.Min(80, lastChatBoxText?.Length ?? 0))}");
+
+                                    // 如果 ChatBox 中不再包含我们的关键词，说明已经清空发送了
+                                    if (!string.IsNullOrEmpty(lastChatBoxText) && !IsFuzzyMatch(keyword, lastChatBoxText))
+                                    {
+                                        Log($"✅ 第{frame + 1}屏: ChatBox 清空验证成功 (输入框不含关键词)");
+                                        return (true, $"YOLO清空验证(第{frame + 1}屏)", lastChatInfoText, lastChatBoxText);
+                                    }
+                                    // ChatBox OCR 为空文本也算清空
+                                    if (string.IsNullOrWhiteSpace(lastChatBoxText) || lastChatBoxText == "未识别到文字")
+                                    {
+                                        Log($"✅ 第{frame + 1}屏: ChatBox 为空，清空验证成功");
+                                        return (true, $"YOLO清空验证(第{frame + 1}屏)", lastChatInfoText, lastChatBoxText);
+                                    }
+                                }
+                            }
+                        }
+
+                        Log($"⏳ 第{frame + 1}屏: 未验证成功，继续下一屏...");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log($"💥 第{frame + 1}屏截取异常: {ex.Message}");
+                }
+            }
+
+            // 3 屏全部未匹配到我们发送的文本 → 验证失败
+            Log($"❌ 3屏均未检测到发送的关键词 '{keyword}'");
+            return (false, "3屏均未匹配", lastChatInfoText, lastChatBoxText);
         }
 
 
