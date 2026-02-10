@@ -1334,7 +1334,12 @@ namespace moshushou
                 // --------------------------------------------------------
                 // 🔥 步骤 A: 搜索列表 OCR 验证
                 // --------------------------------------------------------
-                IntPtr searchHwnd = GetForegroundWindow();
+                // 🔧 [修复] 优先使用 SearchHelper 缓存的已验证窗口句柄，
+                // 而非 GetForegroundWindow()，避免获取到非目标窗口（如搜索弹窗/子窗口）
+                IntPtr searchHwnd = _searchHelper.TryGetAppWindowHandle(snapshot.IsWework);
+                if (searchHwnd == IntPtr.Zero)
+                    searchHwnd = GetForegroundWindow();
+                System.Diagnostics.Debug.WriteLine($"🔍 [DEBUG_TRACE] searchHwnd 来源: {(searchHwnd == GetForegroundWindow() ? "Foreground" : "Cache")}, Hwnd={searchHwnd}");
                 if (isAutoMode && searchHwnd != IntPtr.Zero)
                 {
                     _lastSearchWindowHandle = searchHwnd;
@@ -1387,6 +1392,14 @@ namespace moshushou
 
                     if (i < 2)
                     {
+                         // 🔧 [修复] 验证失败时，清除窗口缓存并重新获取正确的窗口句柄
+                         _searchHelper.ClearWindowCache(snapshot.IsWework ? "企业微信" : "微信");
+                         IntPtr refreshedHwnd = _searchHelper.TryGetAppWindowHandle(snapshot.IsWework);
+                         if (refreshedHwnd != IntPtr.Zero && refreshedHwnd != searchHwnd)
+                         {
+                             System.Diagnostics.Debug.WriteLine($"🔄 [DEBUG_TRACE] 刷新 searchHwnd: {searchHwnd} -> {refreshedHwnd}");
+                             searchHwnd = refreshedHwnd;
+                         }
                          try { await Task.Delay(800, token); } catch (TaskCanceledException) { return false; }
                     }
                 }
@@ -1526,10 +1539,11 @@ namespace moshushou
                                                 g.FillEllipse(System.Drawing.Brushes.Red, relPoint.X - 4, relPoint.Y - 4, 8, 8);
                                                 
                                                 // 保存
-                                                string debugDir = System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Debug_Yolo", DateTime.Now.ToString("yyyyMMdd"));
-                                                System.IO.Directory.CreateDirectory(debugDir);
-                                                string debugPath = System.IO.Path.Combine(debugDir, $"Verify_Full_{DateTime.Now:HHmmss_fff}.png");
-                                                bmp.Save(debugPath, System.Drawing.Imaging.ImageFormat.Png);
+                                                // [已禁用] Debug_Yolo 调试目录相关代码
+                                                // string debugDir = System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Debug_Yolo", DateTime.Now.ToString("yyyyMMdd"));
+                                                // System.IO.Directory.CreateDirectory(debugDir);
+                                                // string debugPath = System.IO.Path.Combine(debugDir, $"Verify_Full_{DateTime.Now:HHmmss_fff}.png");
+                                                //bmp.Save(debugPath, System.Drawing.Imaging.ImageFormat.Png);
                                             }
                                         }
                                     }
@@ -1834,23 +1848,26 @@ namespace moshushou
             
             StatusTextBlock.Text = $"🔍 [轮询] 正在 {appName} 搜索: {searchText}...";
 
-            // 3. 调用 SearchHelper 仅执行搜索操作（Ctrl+F + 粘贴），不做后续验证
-            bool searchSuccess = await _searchHelper.SearchInAppAsync(searchText, isWework);
+            // 3. 🔧 [修复] 每次轮询搜索前强制清除窗口缓存，防止使用已过期的句柄
+            // （企业微信关闭窗口后进程仍在托盘运行，旧句柄能通过所有验证但实际已失效）
+            _searchHelper.ClearWindowCache(appName);
 
-            // 4. 切换轮次，下次 Ctrl+Enter 搜另一个 APP
-            _isWeworkTurn = !_isWeworkTurn;
-            string nextApp = _isWeworkTurn ? "企业微信" : "微信";
-            
-            // 🔍 调试日志
-            System.Diagnostics.Debug.WriteLine($"[轮询搜索] 搜索完成, 下次轮询: {nextApp}, _isWeworkTurn={_isWeworkTurn}");
+            // 4. 调用 SearchHelper 执行搜索操作（Ctrl+F + 粘贴），不做后续验证
+            bool searchSuccess = await _searchHelper.SearchInAppAsync(searchText, isWework);
 
             if (searchSuccess)
             {
+                // 4a. 搜索成功，正常切换轮次
+                _isWeworkTurn = !_isWeworkTurn;
+                string nextApp = _isWeworkTurn ? "企业微信" : "微信";
+                System.Diagnostics.Debug.WriteLine($"[轮询搜索] 搜索完成, 下次轮询: {nextApp}, _isWeworkTurn={_isWeworkTurn}");
                 StatusTextBlock.Text = $"✅ [轮询] 已在 {appName} 搜索完成，请手动选择群聊。下次轮询: {nextApp}";
             }
             else
             {
-                StatusTextBlock.Text = $"⚠️ [轮询] {appName} 搜索失败，下次轮询: {nextApp}";
+                // 4b. 搜索失败（窗口找不到等），不切换轮次，下次仍尝试同一个 APP
+                System.Diagnostics.Debug.WriteLine($"[轮询搜索] {appName} 搜索失败，不切换轮次, _isWeworkTurn={_isWeworkTurn}");
+                StatusTextBlock.Text = $"⚠️ [轮询] {appName} 搜索失败（窗口未找到），下次仍尝试 {appName}";
             }
         }
 

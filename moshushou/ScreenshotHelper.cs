@@ -67,37 +67,38 @@ namespace moshushou
             }
         }
 
-        private static string EnsureDebugYoloDir()
-        {
-            string datePart = DateTime.Now.ToString("yyyyMMdd");
-
-            string primary = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Debug_Yolo", datePart);
-            try
-            {
-                Directory.CreateDirectory(primary);
-                return primary;
-            }
-            catch (Exception ex1)
-            {
-                System.Diagnostics.Debug.WriteLine($"[Debug_Yolo] 主目录创建失败: {primary}, err={ex1.Message}");
-            }
-
-            string fallback = Path.Combine(Environment.CurrentDirectory, "Debug_Yolo", datePart);
-            try
-            {
-                Directory.CreateDirectory(fallback);
-                return fallback;
-            }
-            catch (Exception ex2)
-            {
-                System.Diagnostics.Debug.WriteLine($"[Debug_Yolo] 备选目录创建失败: {fallback}, err={ex2.Message}");
-            }
-
-            string tempFallback = Path.Combine(Path.GetTempPath(), "moshushou", "Debug_Yolo", datePart);
-            Directory.CreateDirectory(tempFallback);
-            System.Diagnostics.Debug.WriteLine($"[Debug_Yolo] 使用临时目录: {tempFallback}");
-            return tempFallback;
-        }
+        // [已禁用] Debug_Yolo 调试目录相关代码
+        // private static string EnsureDebugYoloDir()
+        // {
+        //     string datePart = DateTime.Now.ToString("yyyyMMdd");
+        //
+        //     string primary = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Debug_Yolo", datePart);
+        //     try
+        //     {
+        //         Directory.CreateDirectory(primary);
+        //         return primary;
+        //     }
+        //     catch (Exception ex1)
+        //     {
+        //         System.Diagnostics.Debug.WriteLine($"[Debug_Yolo] 主目录创建失败: {primary}, err={ex1.Message}");
+        //     }
+        //
+        //     string fallback = Path.Combine(Environment.CurrentDirectory, "Debug_Yolo", datePart);
+        //     try
+        //     {
+        //         Directory.CreateDirectory(fallback);
+        //         return fallback;
+        //     }
+        //     catch (Exception ex2)
+        //     {
+        //         System.Diagnostics.Debug.WriteLine($"[Debug_Yolo] 备选目录创建失败: {fallback}, err={ex2.Message}");
+        //     }
+        //
+        //     string tempFallback = Path.Combine(Path.GetTempPath(), "moshushou", "Debug_Yolo", datePart);
+        //     Directory.CreateDirectory(tempFallback);
+        //     System.Diagnostics.Debug.WriteLine($"[Debug_Yolo] 使用临时目录: {tempFallback}");
+        //     return tempFallback;
+        // }
 
         private static string SanitizeDebugToken(string value, int maxLen = 32)
         {
@@ -144,38 +145,40 @@ namespace moshushou
             return string.Join(" | ", list);
         }
 
-        private string SaveDebugRawImage(Bitmap bitmap, string prefix)
-        {
-            try
-            {
-                string debugDir = EnsureDebugYoloDir();
-                string path = Path.Combine(debugDir, $"{prefix}_{DateTime.Now:HHmmss_fff}.png");
-                bitmap.Save(path, ImageFormat.Png);
-                return path;
-            }
-            catch (Exception ex)
-            {
-                System.Diagnostics.Debug.WriteLine($"[Debug_Yolo] 保存原图失败: prefix={prefix}, err={ex.Message}");
-                return null;
-            }
-        }
+        // [已禁用] Debug_Yolo 调试目录相关代码
+        // private string SaveDebugRawImage(Bitmap bitmap, string prefix)
+        // {
+        //     try
+        //     {
+        //         string debugDir = EnsureDebugYoloDir();
+        //         string path = Path.Combine(debugDir, $"{prefix}_{DateTime.Now:HHmmss_fff}.png");
+        //         bitmap.Save(path, ImageFormat.Png);
+        //         return path;
+        //     }
+        //     catch (Exception ex)
+        //     {
+        //         System.Diagnostics.Debug.WriteLine($"[Debug_Yolo] 保存原图失败: prefix={prefix}, err={ex.Message}");
+        //         return null;
+        //     }
+        // }
 
-        private string SaveDebugAnnotatedImage(Bitmap bitmap, List<YoloResult> results, string prefix)
-        {
-            try
-            {
-                if (_yoloDetector == null) return null;
-                string debugDir = EnsureDebugYoloDir();
-                string path = Path.Combine(debugDir, $"{prefix}_{DateTime.Now:HHmmss_fff}_ann.png");
-                _yoloDetector.InferenceWrapper.SaveDebugImage(bitmap, results, path);
-                return path;
-            }
-            catch (Exception ex)
-            {
-                System.Diagnostics.Debug.WriteLine($"[Debug_Yolo] 保存标注图失败: prefix={prefix}, err={ex.Message}");
-                return null;
-            }
-        }
+        // [已禁用] Debug_Yolo 调试目录相关代码
+        // private string SaveDebugAnnotatedImage(Bitmap bitmap, List<YoloResult> results, string prefix)
+        // {
+        //     try
+        //     {
+        //         if (_yoloDetector == null) return null;
+        //         string debugDir = EnsureDebugYoloDir();
+        //         string path = Path.Combine(debugDir, $"{prefix}_{DateTime.Now:HHmmss_fff}_ann.png");
+        //         _yoloDetector.InferenceWrapper.SaveDebugImage(bitmap, results, path);
+        //         return path;
+        //     }
+        //     catch (Exception ex)
+        //     {
+        //         System.Diagnostics.Debug.WriteLine($"[Debug_Yolo] 保存标注图失败: prefix={prefix}, err={ex.Message}");
+        //         return null;
+        //     }
+        // }
 
         private void LogLayoutDebug(string message)
         {
@@ -217,71 +220,72 @@ namespace moshushou
             return top.Count == 0 ? "none" : string.Join(" | ", top);
         }
 
-        private string SaveLayoutDebugDataFile(
-            string appName,
-            IntPtr hwnd,
-            RECT rect,
-            int attempt,
-            int maxRetries,
-            List<YoloResult> results,
-            YoloResult? groupName,
-            YoloResult? chatInfo,
-            YoloResult? chatBox)
-        {
-            try
-            {
-                string debugDir = EnsureDebugYoloDir();
-                string fileName = $"LayoutVerify_{(appName == "企业微信" ? "WeWork" : "WeChat")}_R{attempt}_{DateTime.Now:HHmmss_fff}.txt";
-                string path = Path.Combine(debugDir, fileName);
-
-                var sb = new StringBuilder();
-                sb.AppendLine($"Time={DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}");
-                sb.AppendLine($"App={appName}");
-                sb.AppendLine($"Hwnd={hwnd}");
-                sb.AppendLine($"Attempt={attempt}/{maxRetries}");
-                sb.AppendLine($"WindowRect=({rect.Left},{rect.Top},{rect.Right},{rect.Bottom})");
-                sb.AppendLine($"WindowSize={Math.Max(0, rect.Right - rect.Left)}x{Math.Max(0, rect.Bottom - rect.Top)}");
-                sb.AppendLine($"LabelStats={BuildLayoutLabelStats(results)}");
-                sb.AppendLine($"Top_GroupName={BuildTopCandidatesText(results, YoloWindowDetector.Label_GroupName)}");
-                sb.AppendLine($"Top_ChatInfo={BuildTopCandidatesText(results, YoloWindowDetector.Label_ChatInfo)}");
-                sb.AppendLine($"Top_ChatBox={BuildTopCandidatesText(results, YoloWindowDetector.Label_ChatBox)}");
-
-                if (groupName != null && chatInfo != null && chatBox != null)
-                {
-                    int groupY = groupName.BBox.Y + groupName.BBox.Height / 2;
-                    int infoY = chatInfo.BBox.Y + chatInfo.BBox.Height / 2;
-                    int boxY = chatBox.BBox.Y + chatBox.BBox.Height / 2;
-                    sb.AppendLine($"OrderCheck=GroupY({groupY}) < InfoY({infoY}) < BoxY({boxY}) => {(groupY < infoY && infoY < boxY)}");
-                }
-                else
-                {
-                    sb.AppendLine("OrderCheck=Skipped(MissingCoreLabel)");
-                }
-
-                sb.AppendLine("Detections:");
-                if (results == null || results.Count == 0)
-                {
-                    sb.AppendLine("  (none)");
-                }
-                else
-                {
-                    int idx = 1;
-                    foreach (var r in results.OrderByDescending(x => x.Confidence))
-                    {
-                        sb.AppendLine($"  {idx,2}. Label={r.LabelName}, Conf={r.Confidence:F4}, BBox={BuildBboxText(r.BBox)}");
-                        idx++;
-                    }
-                }
-
-                File.WriteAllText(path, sb.ToString(), Encoding.UTF8);
-                return path;
-            }
-            catch (Exception ex)
-            {
-                System.Diagnostics.Debug.WriteLine($"[Debug_Yolo] 保存布局文本失败: app={appName}, attempt={attempt}/{maxRetries}, err={ex.Message}");
-                return null;
-            }
-        }
+        // [已禁用] Debug_Yolo 调试目录相关代码
+        // private string SaveLayoutDebugDataFile(
+        //     string appName,
+        //     IntPtr hwnd,
+        //     RECT rect,
+        //     int attempt,
+        //     int maxRetries,
+        //     List<YoloResult> results,
+        //     YoloResult? groupName,
+        //     YoloResult? chatInfo,
+        //     YoloResult? chatBox)
+        // {
+        //     try
+        //     {
+        //         string debugDir = EnsureDebugYoloDir();
+        //         string fileName = $"LayoutVerify_{(appName == "企业微信" ? "WeWork" : "WeChat")}_R{attempt}_{DateTime.Now:HHmmss_fff}.txt";
+        //         string path = Path.Combine(debugDir, fileName);
+        //
+        //         var sb = new StringBuilder();
+        //         sb.AppendLine($"Time={DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}");
+        //         sb.AppendLine($"App={appName}");
+        //         sb.AppendLine($"Hwnd={hwnd}");
+        //         sb.AppendLine($"Attempt={attempt}/{maxRetries}");
+        //         sb.AppendLine($"WindowRect=({rect.Left},{rect.Top},{rect.Right},{rect.Bottom})");
+        //         sb.AppendLine($"WindowSize={Math.Max(0, rect.Right - rect.Left)}x{Math.Max(0, rect.Bottom - rect.Top)}");
+        //         sb.AppendLine($"LabelStats={BuildLayoutLabelStats(results)}");
+        //         sb.AppendLine($"Top_GroupName={BuildTopCandidatesText(results, YoloWindowDetector.Label_GroupName)}");
+        //         sb.AppendLine($"Top_ChatInfo={BuildTopCandidatesText(results, YoloWindowDetector.Label_ChatInfo)}");
+        //         sb.AppendLine($"Top_ChatBox={BuildTopCandidatesText(results, YoloWindowDetector.Label_ChatBox)}");
+        //
+        //         if (groupName != null && chatInfo != null && chatBox != null)
+        //         {
+        //             int groupY = groupName.BBox.Y + groupName.BBox.Height / 2;
+        //             int infoY = chatInfo.BBox.Y + chatInfo.BBox.Height / 2;
+        //             int boxY = chatBox.BBox.Y + chatBox.BBox.Height / 2;
+        //             sb.AppendLine($"OrderCheck=GroupY({groupY}) < InfoY({infoY}) < BoxY({boxY}) => {(groupY < infoY && infoY < boxY)}");
+        //         }
+        //         else
+        //         {
+        //             sb.AppendLine("OrderCheck=Skipped(MissingCoreLabel)");
+        //         }
+        //
+        //         sb.AppendLine("Detections:");
+        //         if (results == null || results.Count == 0)
+        //         {
+        //             sb.AppendLine("  (none)");
+        //         }
+        //         else
+        //         {
+        //             int idx = 1;
+        //             foreach (var r in results.OrderByDescending(x => x.Confidence))
+        //             {
+        //                 sb.AppendLine($"  {idx,2}. Label={r.LabelName}, Conf={r.Confidence:F4}, BBox={BuildBboxText(r.BBox)}");
+        //                 idx++;
+        //             }
+        //         }
+        //
+        //         File.WriteAllText(path, sb.ToString(), Encoding.UTF8);
+        //         return path;
+        //     }
+        //     catch (Exception ex)
+        //     {
+        //         System.Diagnostics.Debug.WriteLine($"[Debug_Yolo] 保存布局文本失败: app={appName}, attempt={attempt}/{maxRetries}, err={ex.Message}");
+        //         return null;
+        //     }
+        // }
 
 
         // ✅ 新增：获取当前窗口顶部的标题文字（完全基于 YOLO）
@@ -317,11 +321,11 @@ namespace moshushou
                     // 1. YOLO 识别
                     var yoloResults = _yoloDetector.Detect(bitmap);
                     
-                    // 2. 保存调试图 [已启用]
-                    string debugDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Debug_Yolo", DateTime.Now.ToString("yyyyMMdd"));
-                    Directory.CreateDirectory(debugDir);
-                    string debugFile = Path.Combine(debugDir, $"Title_{DateTime.Now:HHmmss_fff}.png");
-                    _yoloDetector.InferenceWrapper.SaveDebugImage(bitmap, yoloResults, debugFile);
+                    // 2. 保存调试图 [已禁用]
+                    // string debugDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Debug_Yolo", DateTime.Now.ToString("yyyyMMdd"));
+                    // Directory.CreateDirectory(debugDir);
+                    // string debugFile = Path.Combine(debugDir, $"Title_{DateTime.Now:HHmmss_fff}.png");
+                    // _yoloDetector.InferenceWrapper.SaveDebugImage(bitmap, yoloResults, debugFile);
 
                     // 🚨 [调整] 场景宽松验证 (Relaxed Scene Validation)
                     // 原则：只要有 "群名" 和 "输入框" 且置信度及格，就认为是聊天窗口。
@@ -414,11 +418,11 @@ namespace moshushou
 
                             var results = _yoloDetector.Detect(bitmap);
                             
-                            // 调试保存 [已启用]
-                            string debugDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Debug_Yolo", DateTime.Now.ToString("yyyyMMdd"));
-                            Directory.CreateDirectory(debugDir);
-                            string debugFile = Path.Combine(debugDir, $"InputBox_{DateTime.Now:HHmmss_fff}.png");
-                            _yoloDetector.InferenceWrapper.SaveDebugImage(bitmap, results, debugFile);
+                            // 调试保存 [已禁用]
+                            // string debugDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Debug_Yolo", DateTime.Now.ToString("yyyyMMdd"));
+                            // Directory.CreateDirectory(debugDir);
+                            // string debugFile = Path.Combine(debugDir, $"InputBox_{DateTime.Now:HHmmss_fff}.png");
+                            // _yoloDetector.InferenceWrapper.SaveDebugImage(bitmap, results, debugFile);
 
                             // 查找 "聊天框" (通常包含输入框)
                             var chatBox = results.Where(r => r.LabelName == YoloWindowDetector.Label_ChatBox).OrderByDescending(r => r.Confidence).FirstOrDefault();
@@ -505,8 +509,9 @@ namespace moshushou
                         var results = _yoloDetector.Detect(bitmap, LAYOUT_YOLO_CONF_THRESHOLD, LAYOUT_YOLO_IOU_THRESHOLD);
                         
                         string debugPrefix = $"LayoutVerify_{(isWework ? "WeWork" : "WeChat")}_R{i + 1}";
-                        string layoutRawPath = SaveDebugRawImage(bitmap, debugPrefix);
-                        string layoutAnnPath = SaveDebugAnnotatedImage(bitmap, results, debugPrefix);
+                        // [已禁用] Debug_Yolo 调试图保存
+                        // string layoutRawPath = SaveDebugRawImage(bitmap, debugPrefix);
+                        // string layoutAnnPath = SaveDebugAnnotatedImage(bitmap, results, debugPrefix);
                         string layoutSummary = BuildDetectionSummary(results, 12);
                         string labelStats = BuildLayoutLabelStats(results);
                         LogLayoutDebug($"🧾 [布局验证] 第{i + 1}次YOLO结果: {layoutSummary}");
@@ -514,21 +519,23 @@ namespace moshushou
                         LogLayoutDebug($"📌 [布局验证] GroupTop={BuildTopCandidatesText(results, YoloWindowDetector.Label_GroupName)}");
                         LogLayoutDebug($"📌 [布局验证] InfoTop={BuildTopCandidatesText(results, YoloWindowDetector.Label_ChatInfo)}");
                         LogLayoutDebug($"📌 [布局验证] BoxTop={BuildTopCandidatesText(results, YoloWindowDetector.Label_ChatBox)}");
-                        if (!string.IsNullOrEmpty(layoutRawPath) || !string.IsNullOrEmpty(layoutAnnPath))
-                        {
-                            LogLayoutDebug($"🖼️ [布局验证] 第{i + 1}次调试图: Raw={layoutRawPath}, Ann={layoutAnnPath}");
-                        }
+                        // [已禁用] Debug_Yolo 调试图日志
+                        // if (!string.IsNullOrEmpty(layoutRawPath) || !string.IsNullOrEmpty(layoutAnnPath))
+                        // {
+                        //     LogLayoutDebug($"🖼️ [布局验证] 第{i + 1}次调试图: Raw={layoutRawPath}, Ann={layoutAnnPath}");
+                        // }
 
                         // 获取置信度最高的组件
                         var groupName = results.Where(r => r.LabelName == YoloWindowDetector.Label_GroupName).OrderByDescending(r => r.Confidence).FirstOrDefault();
                         var chatInfo = results.Where(r => r.LabelName == YoloWindowDetector.Label_ChatInfo).OrderByDescending(r => r.Confidence).FirstOrDefault();
                         var chatBox = results.Where(r => r.LabelName == YoloWindowDetector.Label_ChatBox).OrderByDescending(r => r.Confidence).FirstOrDefault();
 
-                        string layoutDataPath = SaveLayoutDebugDataFile(appName, hwnd, rect, i + 1, maxRetries, results, groupName, chatInfo, chatBox);
-                        if (!string.IsNullOrEmpty(layoutDataPath))
-                        {
-                            LogLayoutDebug($"📝 [布局验证] 第{i + 1}次布局数据: {layoutDataPath}");
-                        }
+                        // [已禁用] Debug_Yolo 布局数据保存
+                        // string layoutDataPath = SaveLayoutDebugDataFile(appName, hwnd, rect, i + 1, maxRetries, results, groupName, chatInfo, chatBox);
+                        // if (!string.IsNullOrEmpty(layoutDataPath))
+                        // {
+                        //     LogLayoutDebug($"📝 [布局验证] 第{i + 1}次布局数据: {layoutDataPath}");
+                        // }
 
                         // 规则1: 核心组件必须存在
                         if (groupName == null || chatInfo == null || chatBox == null)
@@ -1247,14 +1254,16 @@ namespace moshushou
                         .ToList();
 
                     string framePrefix = $"SearchVerify_{(isWework ? "WeWork" : "WeChat")}_F{i + 1}_{expectedToken}";
-                    string frameRawPath = SaveDebugRawImage(bitmap, framePrefix);
-                    string frameAnnPath = SaveDebugAnnotatedImage(bitmap, results, framePrefix);
+                    // [已禁用] Debug_Yolo 调试图保存
+                    // string frameRawPath = SaveDebugRawImage(bitmap, framePrefix);
+                    // string frameAnnPath = SaveDebugAnnotatedImage(bitmap, results, framePrefix);
                     string frameSummary = BuildDetectionSummary(currentFrameTargets.Select(x => x.r), 10);
                     System.Diagnostics.Debug.WriteLine($"[SearchOCR] 帧{i + 1}/{stableFrameCount}: 候选={currentFrameTargets.Count}, 明细={frameSummary}");
-                    if (!string.IsNullOrEmpty(frameRawPath) || !string.IsNullOrEmpty(frameAnnPath))
-                    {
-                        System.Diagnostics.Debug.WriteLine($"[SearchOCR] 帧{i + 1}调试图: Raw='{frameRawPath}', Ann='{frameAnnPath}'");
-                    }
+                    // [已禁用] Debug_Yolo 调试图日志
+                    // if (!string.IsNullOrEmpty(frameRawPath) || !string.IsNullOrEmpty(frameAnnPath))
+                    // {
+                    //     System.Diagnostics.Debug.WriteLine($"[SearchOCR] 帧{i + 1}调试图: Raw='{frameRawPath}', Ann='{frameAnnPath}'");
+                    // }
                     
                     frameResults.Add(currentFrameTargets);
 
@@ -1344,15 +1353,15 @@ namespace moshushou
                         
                         using (var processed = PreprocessForOcr(crop, 3)) 
                         {
-                            string cropRawPath = SaveDebugRawImage(crop, $"SearchCropRaw_{(isWework ? "WeWork" : "WeChat")}_{expectedToken}");
-                            string cropProcessedPath = SaveDebugRawImage(processed, $"SearchCropProcessed_{(isWework ? "WeWork" : "WeChat")}_{expectedToken}");
+                            // [已禁用] Debug_Yolo 调试图保存
+                            // string cropRawPath = SaveDebugRawImage(crop, $"SearchCropRaw_{(isWework ? "WeWork" : "WeChat")}_{expectedToken}");
+                            // string cropProcessedPath = SaveDebugRawImage(processed, $"SearchCropProcessed_{(isWework ? "WeWork" : "WeChat")}_{expectedToken}");
 
                             string ocrText = await PerformOcrAsync(processed);
                             bool match = IsFuzzyMatch(expectedText, ocrText);
                             System.Diagnostics.Debug.WriteLine(
                                 $"🔍 [FindAndVerify] OCR候选: Label={target.Result.LabelName}, Conf={target.Result.Confidence:F2}, " +
-                                $"BBox={BuildBboxText(bbox)}, OCR='{ocrText}', Expected='{expected}', Match={match}, " +
-                                $"CropRaw='{cropRawPath}', CropProcessed='{cropProcessedPath}'");
+                                $"BBox={BuildBboxText(bbox)}, OCR='{ocrText}', Expected='{expected}', Match={match}");
 
                             if (match)
                             {
@@ -1447,16 +1456,18 @@ namespace moshushou
                         .ToList();
 
                     string pointPrefix = $"ValidatePoint_{(isWework ? "WeWork" : "WeChat")}_{expectedToken}";
-                    string pointRawPath = SaveDebugRawImage(bitmap, pointPrefix);
-                    string pointAnnPath = SaveDebugAnnotatedImage(bitmap, targets, pointPrefix);
+                    // [已禁用] Debug_Yolo 调试图保存
+                    // string pointRawPath = SaveDebugRawImage(bitmap, pointPrefix);
+                    // string pointAnnPath = SaveDebugAnnotatedImage(bitmap, targets, pointPrefix);
                     string pointSummary = BuildDetectionSummary(targets, 10);
                     System.Diagnostics.Debug.WriteLine(
                         $"[ValidatePoint] App={(isWework ? "企业微信" : "微信")}, Expected='{expected}', Point=({screenPoint.X},{screenPoint.Y}), " +
                         $"候选数={targets.Count}, 明细={pointSummary}, ConfTh={SEARCH_YOLO_CONF_THRESHOLD:F2}, IouTh={SEARCH_YOLO_IOU_THRESHOLD:F2}");
-                    if (!string.IsNullOrEmpty(pointRawPath) || !string.IsNullOrEmpty(pointAnnPath))
-                    {
-                        System.Diagnostics.Debug.WriteLine($"[ValidatePoint] 调试图: Raw='{pointRawPath}', Ann='{pointAnnPath}'");
-                    }
+                    // [已禁用] Debug_Yolo 调试图日志
+                    // if (!string.IsNullOrEmpty(pointRawPath) || !string.IsNullOrEmpty(pointAnnPath))
+                    // {
+                    //     System.Diagnostics.Debug.WriteLine($"[ValidatePoint] 调试图: Raw='{pointRawPath}', Ann='{pointAnnPath}'");
+                    // }
 
                     if (targets.Count == 0)
                     {

@@ -164,13 +164,39 @@ namespace moshushou
 
         private IntPtr FindAndCacheWindowHandle(string appName, string processName, string className)
         {
-            // 1. 缓存命中检查
+            // 1. 先构建目标进程名称集合（缓存验证也需要用到）
+            var targetNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { processName };
+            if (processName.IndexOf("WeChat", StringComparison.OrdinalIgnoreCase) >= 0 || 
+                processName.IndexOf("Weixin", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                targetNames.Add("Weixin");
+                targetNames.Add("WeChat");
+            }
+
+            // 2. 缓存命中检查（含进程归属验证）
             if (_windowHandleCache.TryGetValue(appName, out IntPtr cachedHwnd))
             {
                 if (IsWindow(cachedHwnd) && IsWindowVisible(cachedHwnd))
                 {
-                    // 额外检查：再次确认进程名，防止PID复用导致的误判（虽然概率极低）
-                    return cachedHwnd;
+                    // 🔧 [修复] 真正验证进程归属，防止窗口关闭重开后句柄失效或被复用
+                    bool processMatch = false;
+                    try
+                    {
+                        GetWindowThreadProcessId(cachedHwnd, out uint cachedPid);
+                        var proc = Process.GetProcessById((int)cachedPid);
+                        processMatch = targetNames.Contains(proc.ProcessName);
+                    }
+                    catch { /* 进程已退出 */ }
+
+                    if (processMatch)
+                    {
+                        return cachedHwnd;
+                    }
+                    else
+                    {
+                        Log($"⚠️ 缓存的 {appName} 窗口句柄进程不匹配，重新搜索...");
+                        _windowHandleCache.Remove(appName);
+                    }
                 }
                 else
                 {
@@ -180,16 +206,6 @@ namespace moshushou
             }
 
             IntPtr foundHwnd = IntPtr.Zero;
-
-            // 2. 确定目标进程名称集合
-            var targetNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { processName };
-            // WXWork 通常不需要别名，但 Weixin 需要
-            if (processName.IndexOf("WeChat", StringComparison.OrdinalIgnoreCase) >= 0 || 
-                processName.IndexOf("Weixin", StringComparison.OrdinalIgnoreCase) >= 0)
-            {
-                targetNames.Add("Weixin");
-                targetNames.Add("WeChat");
-            }
 
             // 3. 获取所有目标进程的 PID
             var targetPids = new HashSet<int>();
