@@ -68,10 +68,10 @@ namespace moshushou
             int targetY = y + _random.Next(-2, 3);
 
             await MoveMouseSmoothlyAsync(targetX, targetY, moveDurationBase);
-            await Task.Delay(_random.Next(10, 24));
+            await Task.Delay(_random.Next(4, 10));
 
             mouse_event(MOUSEEVENTF_LEFTDOWN, targetX, targetY, 0, 0);
-            await Task.Delay(_random.Next(18, 36));
+            await Task.Delay(_random.Next(10, 20));
             mouse_event(MOUSEEVENTF_LEFTUP, targetX, targetY, 0, 0);
         }
 
@@ -86,7 +86,7 @@ namespace moshushou
             }
 
             mouse_event(MOUSEEVENTF_LEFTDOWN, point.X, point.Y, 0, 0);
-            await Task.Delay(_random.Next(18, 36));
+            await Task.Delay(_random.Next(10, 20));
             mouse_event(MOUSEEVENTF_LEFTUP, point.X, point.Y, 0, 0);
         }
 
@@ -106,9 +106,9 @@ namespace moshushou
                 return;
             }
 
-            int actualDuration = durationMs + (int)(distance * 0.06);
-            if (actualDuration > 320) actualDuration = 320;
-            if (actualDuration < 45) actualDuration = 45;
+            int actualDuration = durationMs + (int)(distance * 0.025);
+            if (actualDuration > 180) actualDuration = 180;
+            if (actualDuration < 20) actualDuration = 20;
 
             int randomOffset = Math.Max(6, Math.Min((int)(distance * 0.18), 90));
 
@@ -118,8 +118,8 @@ namespace moshushou
             int p2x = startX + 2 * (targetX - startX) / 3 + _random.Next(-randomOffset, randomOffset);
             int p2y = startY + 2 * (targetY - startY) / 3 + _random.Next(-randomOffset, randomOffset);
 
-            int steps = actualDuration / 8;
-            if (steps < 7) steps = 7;
+            int steps = actualDuration / 12;
+            if (steps < 4) steps = 4;
 
             for (int i = 0; i <= steps; i++)
             {
@@ -136,7 +136,10 @@ namespace moshushou
                 double y = uuu * startY + 3 * uu * t * p1y + 3 * u * tt * p2y + ttt * targetY;
 
                 SetCursorPos((int)x, (int)y);
-                await Task.Delay(_random.Next(4, 8));
+                if (i < steps)
+                {
+                    await Task.Delay(_random.Next(1, 3));
+                }
             }
 
             SetCursorPos(targetX, targetY);

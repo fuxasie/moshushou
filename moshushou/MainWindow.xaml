@@ -5,7 +5,7 @@
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
         xmlns:local="clr-namespace:moshushou"
         mc:Ignorable="d"
-        Title="快递处理器 0.63" Height="480" Width="360"
+        Title="快递处理器 0.65" Height="480" Width="360"
         MinHeight="300" MinWidth="300"
         Background="#F5F7FA">
 

@@ -1265,10 +1265,14 @@ namespace moshushou
                 }
                 else if (id == HOTKEY_F2)
                 {
-                    // F2: 停止自动化发送
+                    // F2: 优先停止自动化；否则停止当前 Ctrl+Enter 手动流程
                     if (_isAutoRunning)
                     {
                         StopAutoSending();
+                    }
+                    else
+                    {
+                        StopManualSearchFlow();
                     }
                     shouldHandle = true;
                 }
@@ -1289,16 +1293,30 @@ namespace moshushou
             this.Focus();
 
             bool restartedSegmentedFromBeginning = false;
+            bool startedFromSelectedSegment = false;
             string restartedStoreName = string.Empty;
-            if (_currentSelectedNode != null &&
-                TryResolveRootNode(_currentSelectedNode, out TreeViewNode selectedRootNode) &&
+            string selectedSegmentStartMessage = string.Empty;
+            TreeViewNode? selectedNodeSnapshot = _currentSelectedNode;
+
+            if (selectedNodeSnapshot != null &&
+                TryResolveRootNode(selectedNodeSnapshot, out TreeViewNode selectedRootNode) &&
                 selectedRootNode != null &&
-                selectedRootNode.Strategy == SendStrategy.TextSegmented &&
-                ResetCompletedSegmentedStoreProgress(selectedRootNode, refreshHeader: true))
+                selectedRootNode.Strategy == SendStrategy.TextSegmented)
             {
-                // 按用户意图：F1 选中分段店铺且已全部成功时，重置分段进度并从第1段重新发送
-                restartedSegmentedFromBeginning = true;
-                restartedStoreName = selectedRootNode.StoreName;
+                if (!ReferenceEquals(selectedNodeSnapshot, selectedRootNode) &&
+                    TryApplyAutoSegmentStartFromSelectedChild(selectedRootNode, selectedNodeSnapshot, out string manualStartMessage))
+                {
+                    startedFromSelectedSegment = true;
+                    selectedSegmentStartMessage = manualStartMessage;
+                }
+                else if (ResetCompletedSegmentedStoreProgress(selectedRootNode, refreshHeader: true))
+                {
+                    // 按用户意图：F1 选中分段店铺且已全部成功时，重置分段进度并从第1段重新发送
+                    restartedSegmentedFromBeginning = true;
+                    restartedStoreName = selectedRootNode.StoreName;
+                }
+
+                // 自动化搜索依赖主节点的群名信息；若当前选中子段，统一切回主节点
                 SelectNodeWithoutCopy(selectedRootNode);
             }
 
@@ -1308,12 +1326,78 @@ namespace moshushou
             var autoCts = _autoRunCts;
 
             _isAutoRunning = true;
-            StatusTextBlock.Text = restartedSegmentedFromBeginning
-                ? $"🚀 [F1] 自动化发送模式已启动！已重置 '{restartedStoreName}' 的分段成功进度，将从第1段重发。(按 F2 停止)"
-                : "🚀 [F1] 自动化发送模式已启动！将从当前选中项继续。(按 F2 停止)";
+            StatusTextBlock.Text = startedFromSelectedSegment
+                ? selectedSegmentStartMessage
+                : restartedSegmentedFromBeginning
+                    ? $"🚀 [F1] 自动化发送模式已启动！已重置 '{restartedStoreName}' 的分段成功进度，将从第1段重发。(按 F2 停止)"
+                    : "🚀 [F1] 自动化发送模式已启动！将从当前选中项继续。(按 F2 停止)";
 
             // 启动后台循环任务
             Task.Run(() => AutoProcessLoop(autoCts));
+        }
+
+        private bool TryApplyAutoSegmentStartFromSelectedChild(TreeViewNode rootNode, TreeViewNode selectedChildNode, out string statusMessage)
+        {
+            statusMessage = string.Empty;
+
+            if (rootNode == null ||
+                selectedChildNode == null ||
+                ReferenceEquals(rootNode, selectedChildNode) ||
+                rootNode.Strategy != SendStrategy.TextSegmented ||
+                rootNode.Children == null ||
+                rootNode.Children.Count <= 0 ||
+                string.IsNullOrWhiteSpace(rootNode.StoreName))
+            {
+                return false;
+            }
+
+            int selectedIndex = rootNode.Children.IndexOf(selectedChildNode);
+            if (selectedIndex < 0)
+            {
+                return false;
+            }
+
+            int totalSegments = rootNode.Children.Count;
+            int sentSegments = Math.Max(0, Math.Min(selectedIndex, totalSegments));
+            int totalItems = 0;
+            lock (_dataLock)
+            {
+                if (_storeData.TryGetValue(rootNode.StoreName, out var rows))
+                {
+                    totalItems = rows.Count;
+                }
+            }
+
+            if (totalItems <= 0)
+            {
+                totalItems = rootNode.Children.Sum(child => CountContentLines(child.RawData));
+            }
+
+            int sentItems = 0;
+            for (int i = 0; i < selectedIndex && i < rootNode.Children.Count; i++)
+            {
+                sentItems += CountContentLines(rootNode.Children[i].RawData);
+            }
+
+            if (totalItems > 0)
+            {
+                sentItems = Math.Min(sentItems, totalItems);
+            }
+
+            ClearStoreSentMark(rootNode.StoreName, refreshHeader: false);
+            _ctrlSpaceSegmentCursor[rootNode.StoreName] = selectedIndex;
+            UpdateSegmentProgressVisual(
+                rootNode.StoreName,
+                sentSegments: sentSegments,
+                totalSegments: totalSegments,
+                sentItems: sentItems,
+                totalItems: totalItems,
+                reason: sentSegments > 0 ? "发送中(手动定位)" : "发送中");
+            SaveFileState(rootNode.StoreName);
+
+            statusMessage =
+                $"🚀 [F1] 自动化发送模式已启动！将从 '{rootNode.StoreName}' 第 {selectedIndex + 1}/{totalSegments} 段开始，前 {sentSegments} 段已标记完成。(按 F2 停止)";
+            return true;
         }
 
         private void StopAutoSending()
@@ -1321,6 +1405,27 @@ namespace moshushou
             _isAutoRunning = false;
             _autoRunCts?.Cancel();
             StatusTextBlock.Text = "🛑 [F2] 自动化发送已停止。";
+        }
+
+        private void StopManualSearchFlow()
+        {
+            var cts = Interlocked.Exchange(ref _searchCts, null);
+            if (cts == null)
+            {
+                StatusTextBlock.Text = "🛑 [F2] 当前无可停止的手动流程。";
+                return;
+            }
+
+            try
+            {
+                cts.Cancel();
+            }
+            catch
+            {
+                // 忽略取消过程中的状态竞争异常
+            }
+
+            StatusTextBlock.Text = "🛑 [F2] 当前 Ctrl+Enter 流程已停止。";
         }
 
 
@@ -4865,6 +4970,15 @@ namespace moshushou
 
             if (string.IsNullOrEmpty(storeName)) return false;
 
+            bool autoSendChecked = false;
+            if (Application.Current?.Dispatcher != null)
+            {
+                autoSendChecked = await Application.Current.Dispatcher.InvokeAsync(() => AutoSendCheckBox.IsChecked == true);
+            }
+
+            bool shouldAutoSend = isAutoMode || autoSendChecked;
+            Log($"分段执行模式: {(shouldAutoSend ? "发送" : "仅粘贴")} (isAutoMode={isAutoMode}, autoSendChecked={autoSendChecked})");
+
             // 1. 获取数据 (复制)
             List<string> trackingNumbers;
             lock (_dataLock)
@@ -4972,16 +5086,23 @@ namespace moshushou
                     var segmentItems = trackingNumbers.Skip(startIdx).Take(segmentSize).ToList();
                     string segmentContent = string.Join("\n", segmentItems);
 
-                    Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = $"📤 正在发送第 {segNum}/{totalSegments} 段 ({segmentItems.Count} 条)...");
+                    Application.Current.Dispatcher.Invoke(() =>
+                        StatusTextBlock.Text = shouldAutoSend
+                            ? $"📤 正在发送第 {segNum}/{totalSegments} 段 ({segmentItems.Count} 条)..."
+                            : $"📋 正在粘贴第 {segNum}/{totalSegments} 段 ({segmentItems.Count} 条)...");
 
-                    // 发送 (调用统一发送方法，自带校验)
-                    // 注意：这里我们传入 forceSkipCheck=false，确保每段都校验窗口（尽管会有性能损耗，但符合用户“不允许跳过”的要求）
-                    bool success = await PasteAndVerifySendAsync(segmentContent, false, token);
+                    bool success = shouldAutoSend
+                        ? await PasteAndVerifySendAsync(segmentContent, false, token)
+                        : await PasteSegmentWithoutAutoSendAsync(segmentContent, isWework, token);
                     
                     if (!success)
                     {
-                        Log($"❌ 第 {segNum} 段发送失败");
-                        Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = $"❌ 第 {segNum} 段发送失败，剩余已保留到列表末尾");
+                        string actionText = shouldAutoSend ? "发送" : "粘贴";
+                        Log($"❌ 第 {segNum} 段{actionText}失败");
+                        Application.Current.Dispatcher.Invoke(() =>
+                            StatusTextBlock.Text = shouldAutoSend
+                                ? $"❌ 第 {segNum} 段发送失败，剩余已保留到列表末尾"
+                                : $"❌ 第 {segNum} 段粘贴失败，剩余已保留到列表末尾");
                         await HandlePartialFailure(
                             storeName,
                             sentCount,
@@ -4989,9 +5110,9 @@ namespace moshushou
                             failedSegment: segNum,
                             totalSegments: totalSegments,
                             totalItems: trackingNumbers.Count,
-                            reason: "发送失败",
+                            reason: shouldAutoSend ? "发送失败" : "粘贴失败",
                             moveToRetryArea: !isAutoMode,
-                            historyAction: isAutoMode ? "自动化发送" : "分段发送");
+                            historyAction: isAutoMode ? "自动化发送" : (shouldAutoSend ? "分段发送" : "分段粘贴"));
                         return false;
                     }
 
@@ -5001,7 +5122,39 @@ namespace moshushou
                         sentSegments: segNum,
                         totalSegments: totalSegments,
                         sentItems: sentCount,
-                        totalItems: trackingNumbers.Count);
+                        totalItems: trackingNumbers.Count,
+                        reason: shouldAutoSend ? "发送中" : "发送中(待手动发送)");
+
+                    if (!shouldAutoSend)
+                    {
+                        await Application.Current.Dispatcher.InvokeAsync(() => SaveFileState());
+
+                        bool isLastSegment = segNum >= totalSegments;
+                        if (isLastSegment)
+                        {
+                            UpdateSegmentProgressVisual(
+                                storeName,
+                                sentSegments: totalSegments,
+                                totalSegments: totalSegments,
+                                sentItems: trackingNumbers.Count,
+                                totalItems: trackingNumbers.Count,
+                                reason: "发送完成");
+                            _currentItemPasted = true;
+                            _lastPastedStoreName = storeName;
+                            ClearStoreSentMark(storeName, refreshHeader: true);
+                            Application.Current.Dispatcher.Invoke(() =>
+                                StatusTextBlock.Text = $"📋 分段已全部粘贴: {storeName}（未自动发送）");
+                        }
+                        else
+                        {
+                            _currentItemPasted = false;
+                            _lastPastedStoreName = null;
+                            Application.Current.Dispatcher.Invoke(() =>
+                                StatusTextBlock.Text = $"📋 已粘贴第 {segNum}/{totalSegments} 段（未自动发送），请手动发送后再按 Ctrl+Enter 继续。");
+                        }
+
+                        return true;
+                    }
                     
                     // Delay
                     if (i < totalSegments - 1)
@@ -5076,6 +5229,45 @@ namespace moshushou
                     historyAction: isAutoMode ? "自动化发送" : "分段发送");
                 return false;
             }
+        }
+
+        private async Task<bool> PasteSegmentWithoutAutoSendAsync(string segmentContent, bool isWework, CancellationToken token)
+        {
+            if (token.IsCancellationRequested)
+            {
+                return false;
+            }
+
+            if (!await SetClipboardWithRetryAsync(segmentContent))
+            {
+                Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = "❌ 剪贴板被占用");
+                return false;
+            }
+
+            try { await Task.Delay(50, token); } catch (OperationCanceledException) { return false; }
+
+            IntPtr targetHwnd = GetForegroundWindow();
+            if (targetHwnd == IntPtr.Zero)
+            {
+                Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = "❌ 未找到目标聊天窗口");
+                return false;
+            }
+
+            if (!RobustActivateWindow(targetHwnd))
+            {
+                Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = "❌ 窗口无法激活，粘贴中止");
+                return false;
+            }
+
+            var inputRes = await _screenshotHelper.GetInputBoxClickCoordinatesAsync(targetHwnd, isWework);
+            if (inputRes.success)
+            {
+                await MouseHelper.HumanLikeClickAsync(inputRes.x, inputRes.y, 85);
+                try { await Task.Delay(35, token); } catch (OperationCanceledException) { return false; }
+            }
+
+            SimulatePaste();
+            return true;
         }
 
         // 辅助：处理部分失败，记录失败进度，并按需要移动到失败列表
