@@ -474,7 +474,8 @@
                                                    Cursor="Hand"
                                                    Padding="4,2"
                                                    MouseLeftButtonDown="TrackingNumber_MouseLeftButtonDown"
-                                                   ToolTip="点击复制单号">
+                                                   MouseRightButtonDown="TrackingNumber_MouseRightButtonDown"
+                                                   ToolTip="左键复制，右键预览">
                                             <TextBlock.Style>
                                                 <Style TargetType="TextBlock">
                                                     <Setter Property="Background" Value="Transparent"/>
@@ -519,6 +520,7 @@
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="Auto"/>
                         <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
                     </Grid.ColumnDefinitions>
 
                     <TextBlock Grid.Column="0"
@@ -535,6 +537,19 @@
                                FontWeight="Medium"
                                Foreground="#4A5568"
                                VerticalAlignment="Center"/>
+
+                    <Button Grid.Column="2"
+                            x:Name="OpenDebugLogWindowButton"
+                            Content="调试历史"
+                            Margin="8,0,0,0"
+                            Padding="8,2"
+                            FontSize="10"
+                            FontWeight="SemiBold"
+                            Foreground="White"
+                            Background="#1F2937"
+                            BorderThickness="0"
+                            Cursor="Hand"
+                            Click="OpenDebugLogWindowButton_Click"/>
                 </Grid>
             </Border>
         </Grid>

@@ -6,8 +6,7 @@ using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.RegularExpressions;
-using System.Threading.Tasks;
-using System.Threading.Tasks;
+using System.Threading;
 using System.Threading.Tasks;
 // using System.Windows; // 移除以避免 Point/Size 歧义
 using WeChatOcr; // 确保已通过 NuGet 安装 WeChatOcr.Lite
@@ -50,6 +49,8 @@ namespace moshushou
         private readonly Action<string> _logAction;
         private readonly SearchConfig _config;
         private readonly YoloWindowDetector _yoloDetector;
+        private static long _ocrRequestSeq = 0;
+        private static int _ocrActiveCount = 0;
 
 
         public ScreenshotHelper(string baseStorageDirectory, SearchConfig config, Action<string> logAction = null)
@@ -184,6 +185,16 @@ namespace moshushou
         {
             _logAction?.Invoke(message);
             System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] {message}");
+        }
+
+        private void LogOcrDebug(string message, bool mirrorToUi = false)
+        {
+            string line = $"[{DateTime.Now:HH:mm:ss.fff}] [OCRDBG] {message}";
+            System.Diagnostics.Debug.WriteLine(line);
+            if (mirrorToUi)
+            {
+                _logAction?.Invoke(line);
+            }
         }
 
         private static string BuildLayoutLabelStats(IEnumerable<YoloResult> results)
@@ -367,7 +378,7 @@ namespace moshushou
                             //processed.Save(cropDebugFile, ImageFormat.Png);
                             // _logAction?.Invoke($"🖼️ [OCR调试] 标题裁切图已存: {cropDebugFile}");
 
-                            string ocrText = await PerformOcrAsync(processed);
+                            string ocrText = await PerformOcrAsync(processed, $"GetTitle/{(isWework ? "WeWork" : "WeChat")}");
                             string cleaned = CleanGroupName(ocrText);
                             _logAction?.Invoke($"🏷️ YOLO 识别窗口标题: '{cleaned}' (置信度:{target.Confidence:P0})");
                             return cleaned;
@@ -782,7 +793,7 @@ namespace moshushou
         /// chatBoxText: 聊天框 OCR 文本（最后一屏）
         /// </returns>
         public async Task<(bool success, string verifyMethod, string chatInfoText, string chatBoxText)> VerifySendWithYoloAsync(
-            IntPtr hwnd, bool isWework, string keyword)
+            IntPtr hwnd, bool isWework, string keyword, CancellationToken token = default)
         {
             Action<string> Log = (msg) => System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [YoloVerify] {msg}");
 
@@ -807,7 +818,18 @@ namespace moshushou
 
             for (int frame = 0; frame < FRAME_COUNT; frame++)
             {
-                if (frame > 0) await Task.Delay(FRAME_INTERVAL_MS);
+                if (token.IsCancellationRequested)
+                {
+                    Log("🛑 验证取消");
+                    return (false, "已取消", lastChatInfoText, lastChatBoxText);
+                }
+
+                var frameSw = Stopwatch.StartNew();
+                if (frame > 0)
+                {
+                    try { await Task.Delay(FRAME_INTERVAL_MS, token); }
+                    catch (OperationCanceledException) { return (false, "已取消", lastChatInfoText, lastChatBoxText); }
+                }
 
                 try
                 {
@@ -825,7 +847,9 @@ namespace moshushou
                         }
 
                         // YOLO 检测
+                        var detectSw = Stopwatch.StartNew();
                         var results = _yoloDetector.Detect(bitmap);
+                        Log($"🧪 第{frame + 1}屏 YOLO完成: 耗时={detectSw.ElapsedMilliseconds}ms, 目标数={results?.Count ?? 0}, 窗口={w}x{h}");
 
                         var chatInfo = results
                             .Where(r => r.LabelName == YoloWindowDetector.Label_ChatInfo)
@@ -864,8 +888,17 @@ namespace moshushou
                                     new Rectangle(cropX, cropY, cropW, cropH),
                                     bitmap.PixelFormat))
                                 {
-                                    lastChatInfoText = await PerformOcrAsync(chatInfoCrop);
+                                    Log($"🧪 第{frame + 1}屏 ChatInfo裁剪: {cropW}x{cropH}@({cropX},{cropY}), Conf={chatInfo.Confidence:F2}");
+                                    lastChatInfoText = await PerformOcrAsync(chatInfoCrop, $"YoloVerify/F{frame + 1}/ChatInfo", token);
+                                    if (token.IsCancellationRequested || string.Equals(lastChatInfoText, "OCR识别取消", StringComparison.Ordinal))
+                                    {
+                                        return (false, "已取消", lastChatInfoText, lastChatBoxText);
+                                    }
                                     Log($"📝 第{frame + 1}屏 ChatInfo OCR: {lastChatInfoText?.Substring(0, Math.Min(80, lastChatInfoText?.Length ?? 0))}");
+                                    if (string.Equals(lastChatInfoText, "OCR识别超时", StringComparison.Ordinal))
+                                    {
+                                        Log($"⚠️ 第{frame + 1}屏 ChatInfo OCR 超时(8000ms)");
+                                    }
 
                                     // 模糊匹配：对比我们发送的关键词
                                     if (!string.IsNullOrEmpty(lastChatInfoText) && IsFuzzyMatch(keyword, lastChatInfoText))
@@ -897,8 +930,17 @@ namespace moshushou
                                     new Rectangle(boxX, boxY, boxW, boxH),
                                     bitmap.PixelFormat))
                                 {
-                                    lastChatBoxText = await PerformOcrAsync(chatBoxCrop);
+                                    Log($"🧪 第{frame + 1}屏 ChatBox裁剪: {boxW}x{boxH}@({boxX},{boxY}), Conf={chatBox.Confidence:F2}");
+                                    lastChatBoxText = await PerformOcrAsync(chatBoxCrop, $"YoloVerify/F{frame + 1}/ChatBox", token);
+                                    if (token.IsCancellationRequested || string.Equals(lastChatBoxText, "OCR识别取消", StringComparison.Ordinal))
+                                    {
+                                        return (false, "已取消", lastChatInfoText, lastChatBoxText);
+                                    }
                                     Log($"📝 第{frame + 1}屏 ChatBox OCR: {lastChatBoxText?.Substring(0, Math.Min(80, lastChatBoxText?.Length ?? 0))}");
+                                    if (string.Equals(lastChatBoxText, "OCR识别超时", StringComparison.Ordinal))
+                                    {
+                                        Log($"⚠️ 第{frame + 1}屏 ChatBox OCR 超时(8000ms)");
+                                    }
 
                                     // 如果 ChatBox 中不再包含我们的关键词，说明已经清空发送了
                                     if (!string.IsNullOrEmpty(lastChatBoxText) && !IsFuzzyMatch(keyword, lastChatBoxText))
@@ -916,7 +958,7 @@ namespace moshushou
                             }
                         }
 
-                        Log($"⏳ 第{frame + 1}屏: 未验证成功，继续下一屏...");
+                        Log($"⏳ 第{frame + 1}屏: 未验证成功，继续下一屏... 本屏总耗时={frameSw.ElapsedMilliseconds}ms");
                     }
                 }
                 catch (Exception ex)
@@ -977,7 +1019,7 @@ namespace moshushou
                     */
 
                     // 直接用原图进行 OCR (安全验证页面的文字通常较大，不需要放大)
-                    string result = await PerformOcrAsync(bitmap);
+                    string result = await PerformOcrAsync(bitmap, "SecurityCheck/FullWindow");
                     System.Diagnostics.Debug.WriteLine($"[安全检测截图] OCR 结果 (前300字): {result?.Substring(0, Math.Min(300, result?.Length ?? 0))}");
                     return result;
                 }
@@ -1067,7 +1109,7 @@ namespace moshushou
                         {
                             using (var processed = PreprocessForOcr(bitmap, 3))
                             {
-                                string rawText = await PerformOcrAsync(processed);
+                                string rawText = await PerformOcrAsync(processed, $"CaptureTop/Inline/{storeName}");
                                 ocrResult.GroupName = CleanGroupName(rawText);
                             }
                         }
@@ -1123,7 +1165,7 @@ namespace moshushou
                     // 🚀 [优化] 统一使用 PreprocessForOcr
                     using (var processed = PreprocessForOcr(originalBitmap, 3))
                     {
-                        string rawText = await PerformOcrAsync(processed);
+                        string rawText = await PerformOcrAsync(processed, $"CaptureTop/File/{storeName}");
                         recognizedGroupName = CleanGroupName(rawText);
                     }
                 } // 离开 using 块，Bitmap 资源释放
@@ -1164,44 +1206,140 @@ namespace moshushou
 
 
 
-        private async Task<string> PerformOcrAsync(Bitmap bitmap)
+        private async Task<string> PerformOcrAsync(Bitmap bitmap, string traceTag = null, CancellationToken token = default)
         {
+            long requestId = Interlocked.Increment(ref _ocrRequestSeq);
+            string tag = string.IsNullOrWhiteSpace(traceTag) ? "Generic" : traceTag.Trim();
+            var totalSw = Stopwatch.StartNew();
+
+            if (bitmap == null)
+            {
+                LogOcrDebug($"#{requestId} FAIL Tag={tag}, Bitmap=null", mirrorToUi: true);
+                return "未识别到文字";
+            }
+
+            int width = bitmap.Width;
+            int height = bitmap.Height;
             var bytes = ImageToBytes(bitmap);
-            var tcs = new TaskCompletionSource<string>();
+            int activeCount = Interlocked.Increment(ref _ocrActiveCount);
+            LogOcrDebug($"#{requestId} START Tag={tag}, Size={width}x{height}, Bytes={bytes.Length}, Active={activeCount}, Thread={Environment.CurrentManagedThreadId}");
+
+            var tcs = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
             var ocr = new ImageOcr();
+            int callbackEntered = 0;
+            int timeoutFlag = 0;
 
             ocr.Run(bytes, (path, result) =>
             {
+                long cbDelayMs = totalSw.ElapsedMilliseconds;
+                Interlocked.Exchange(ref callbackEntered, 1);
+                var callbackSw = Stopwatch.StartNew();
+
                 try
                 {
+                    int itemCount = result?.OcrResult?.SingleResult?.Count ?? 0;
+                    LogOcrDebug(
+                        $"#{requestId} CALLBACK_BEGIN Tag={tag}, Delay={cbDelayMs}ms, TimedOut={(Volatile.Read(ref timeoutFlag) == 1 ? "Y" : "N")}, " +
+                        $"Items={itemCount}, Path={(string.IsNullOrEmpty(path) ? "<null>" : path)}");
+
                     if (result?.OcrResult?.SingleResult == null)
                     {
                         tcs.TrySetResult("未识别到文字");
                         return;
                     }
+
                     var sb = new StringBuilder();
                     foreach (var item in result.OcrResult.SingleResult)
                     {
-                        if (item != null && !string.IsNullOrEmpty(item.SingleStrUtf8)) sb.Append(item.SingleStrUtf8);
+                        if (item != null && !string.IsNullOrEmpty(item.SingleStrUtf8))
+                        {
+                            sb.Append(item.SingleStrUtf8);
+                        }
                     }
-                    tcs.TrySetResult(sb.ToString().Trim());
+
+                    string finalText = sb.ToString().Trim();
+                    tcs.TrySetResult(finalText);
                 }
-                catch (Exception ex) { tcs.TrySetException(ex); }
+                catch (Exception ex)
+                {
+                    LogOcrDebug($"#{requestId} CALLBACK_EXCEPTION Tag={tag}, Error={ex.Message}", mirrorToUi: true);
+                    tcs.TrySetException(ex);
+                }
                 finally
                 {
-                    try { if (File.Exists(path)) File.Delete(path); } catch { /* ignore */ }
+                    try
+                    {
+                        if (File.Exists(path))
+                        {
+                            File.Delete(path);
+                        }
+                    }
+                    catch (Exception fileEx)
+                    {
+                        LogOcrDebug($"#{requestId} CLEANUP_WARN Tag={tag}, DeleteTempFailed={fileEx.Message}");
+                    }
+
+                    int remain = Interlocked.Decrement(ref _ocrActiveCount);
+                    LogOcrDebug(
+                        $"#{requestId} CALLBACK_END Tag={tag}, CbCost={callbackSw.ElapsedMilliseconds}ms, Total={totalSw.ElapsedMilliseconds}ms, Active={remain}");
                 }
             });
 
-            // 设置一个超时，防止OCR进程卡死
-            var timeoutTask = Task.Delay(8000);
-            var completedTask = await Task.WhenAny(tcs.Task, timeoutTask);
+            // 设置超时 + 取消等待，防止 OCR 回调长时间未返回
+            Task timeoutTask = Task.Delay(8000);
+            Task? cancelTask = null;
+            Task completedTask;
+            if (token.CanBeCanceled)
+            {
+                cancelTask = Task.Delay(Timeout.Infinite, token);
+                completedTask = await Task.WhenAny(tcs.Task, timeoutTask, cancelTask);
+            }
+            else
+            {
+                completedTask = await Task.WhenAny(tcs.Task, timeoutTask);
+            }
+
+            if (cancelTask != null && completedTask == cancelTask)
+            {
+                Interlocked.Exchange(ref timeoutFlag, 1);
+                LogOcrDebug(
+                    $"#{requestId} CANCELED Tag={tag}, Waited={totalSw.ElapsedMilliseconds}ms, CallbackEntered={(Volatile.Read(ref callbackEntered) == 1 ? "Y" : "N")}, " +
+                    $"Active={Volatile.Read(ref _ocrActiveCount)}, Size={width}x{height}, Bytes={bytes.Length}",
+                    mirrorToUi: true);
+                return "OCR识别取消";
+            }
 
             if (completedTask == timeoutTask)
             {
+                Interlocked.Exchange(ref timeoutFlag, 1);
+                LogOcrDebug(
+                    $"#{requestId} TIMEOUT Tag={tag}, Waited={totalSw.ElapsedMilliseconds}ms, CallbackEntered={(Volatile.Read(ref callbackEntered) == 1 ? "Y" : "N")}, " +
+                    $"Active={Volatile.Read(ref _ocrActiveCount)}, Size={width}x{height}, Bytes={bytes.Length}",
+                    mirrorToUi: true);
+
+                _ = tcs.Task.ContinueWith(t =>
+                {
+                    if (t.IsFaulted)
+                    {
+                        LogOcrDebug($"#{requestId} LATE_COMPLETION Tag={tag}, State=Faulted, Total={totalSw.ElapsedMilliseconds}ms");
+                    }
+                    else if (t.IsCanceled)
+                    {
+                        LogOcrDebug($"#{requestId} LATE_COMPLETION Tag={tag}, State=Canceled, Total={totalSw.ElapsedMilliseconds}ms");
+                    }
+                    else
+                    {
+                        LogOcrDebug(
+                            $"#{requestId} LATE_COMPLETION Tag={tag}, State=Success, Total={totalSw.ElapsedMilliseconds}ms, TextLen={t.Result?.Length ?? 0}");
+                    }
+                }, TaskScheduler.Default);
+
                 return "OCR识别超时";
             }
-            return await tcs.Task;
+
+            string text = await tcs.Task;
+            LogOcrDebug($"#{requestId} DONE Tag={tag}, Total={totalSw.ElapsedMilliseconds}ms, TextLen={text?.Length ?? 0}");
+            return text;
         }
 
         #region 辅助方法
@@ -1448,7 +1586,7 @@ namespace moshushou
                             // string cropRawPath = SaveDebugRawImage(crop, $"SearchCropRaw_{(isWework ? "WeWork" : "WeChat")}_{expectedToken}");
                             // string cropProcessedPath = SaveDebugRawImage(processed, $"SearchCropProcessed_{(isWework ? "WeWork" : "WeChat")}_{expectedToken}");
 
-                            string ocrText = await PerformOcrAsync(processed);
+                            string ocrText = await PerformOcrAsync(processed, $"SearchVerify/{expectedToken}");
                             bool match = IsFuzzyMatch(expectedText, ocrText);
                             System.Diagnostics.Debug.WriteLine(
                                 $"🔍 [FindAndVerify] OCR候选: Label={target.Result.LabelName}, Conf={target.Result.Confidence:F2}, " +
@@ -1593,7 +1731,7 @@ namespace moshushou
                             g.DrawImage(bitmap, new Rectangle(0, 0, bbox.Width, bbox.Height), bbox, GraphicsUnit.Pixel);
                             using (var processed = PreprocessForOcr(crop, 3))
                             {
-                                string ocrText = await PerformOcrAsync(processed);
+                                string ocrText = await PerformOcrAsync(processed, $"ValidatePoint/{expectedToken}");
                                 bool match = IsFuzzyMatch(expectedText, ocrText);
                                 System.Diagnostics.Debug.WriteLine($"🔍 [ValidatePoint] 候选 OCR:'{ocrText}' -> {(match ? "✅ 匹配" : "❌ 不匹配")}");
                                 if (match)
@@ -1658,7 +1796,7 @@ namespace moshushou
                     // OCR
                     using (var scaled = ScaleImage(bitmap, 2)) // 2倍放大通常够了
                     {
-                         string ocrText = await PerformOcrAsync(scaled);
+                         string ocrText = await PerformOcrAsync(scaled, $"FindKeyword/{keyword}");
                          // TODO: 这里 PerformOcrAsync 返回的是拼接字符串，我们需要坐标信息
                          // 因此 PerformOcrAsync 需要修改，或者我们需要直接调用 ImageOcr 返回详细结果
                          // 为了不破坏现有结构，直接在这里实例化 ImageOcr
@@ -1907,7 +2045,7 @@ namespace moshushou
                                 // 🚀 [优化] 统一使用 PreprocessForOcr，解决纯数字识别难点
                                 using (var processed = PreprocessForOcr(crop, 3))
                                 {
-                                    string ocrText = await PerformOcrAsync(processed);
+                                    string ocrText = await PerformOcrAsync(processed, $"FindGroup/{targetGroupName ?? "Auto"}");
                                     bool match = IsFuzzyMatch(targetGroupName, ocrText);
                                     
                                     _logAction?.Invoke($"   - [{target.LabelName}] OCR:'{ocrText}' -> {(match ? "✅ 匹配" : "❌ 忽略")}");

@@ -23,6 +23,26 @@ using WindowsInput.Native;
 
 namespace moshushou
 {
+    public enum StorePayloadMode
+    {
+        Normal,
+        Issue,
+        CustomMessage
+    }
+
+    /// <summary>
+    /// 商家节点的发送策略
+    /// </summary>
+    public enum SendStrategy
+    {
+        /// <summary>文本一次性发送（数据量较少时）</summary>
+        TextDirect,
+        /// <summary>文件发送（2列模式 >100 条）</summary>
+        FileExcel,
+        /// <summary>分段文本发送（4列/5列数据量较多时）</summary>
+        TextSegmented
+    }
+
     public partial class MainWindow : Window, IDisposable
     {
         private Dictionary<string, List<string>> _storeData = new Dictionary<string, List<string>>();
@@ -31,7 +51,11 @@ namespace moshushou
         private bool _isDragging = false;
         private int _copyingFlag = 0;
         private int _childNodeCopyInProgress = 0;
+        private int _selectionCopyGuard = 0;
+        private int _ctrlSpaceHotkeyInProgress = 0;
+        private bool _ctrlSpaceFallbackActive = false;
         private readonly object _dataLock = new object();
+        private readonly Dictionary<string, int> _ctrlSpaceSegmentCursor = new Dictionary<string, int>(StringComparer.Ordinal);
         private string _exportDirectory;
         private int _currentSelectedIndex = -1;
         private List<TreeViewNode> _flatNodeList = new List<TreeViewNode>();
@@ -64,9 +88,26 @@ namespace moshushou
         private HashSet<string> _failedStores = new HashSet<string>();
         // ✅ [新增] 记录被标记为“需人工”的商家，防止列表刷新后状态丢失
         private HashSet<string> _manualReviewStores = new HashSet<string>();
+        // ✅ 记录已发送成功的商家，用于在主列表显示打钩状态
+        private readonly object _sentStoreLock = new object();
+        private HashSet<string> _sentStores = new HashSet<string>(StringComparer.Ordinal);
+
+        private sealed class SegmentFailureInfo
+        {
+            public int FailedSegment { get; init; }
+            public int TotalSegments { get; init; }
+            public int SentSegments { get; init; }
+            public int SentItems { get; init; }
+            public int TotalItems { get; init; }
+            public string Reason { get; init; } = "发送失败";
+        }
+
+        private readonly object _segmentFailureLock = new object();
+        private readonly Dictionary<string, SegmentFailureInfo> _segmentFailureInfos = new Dictionary<string, SegmentFailureInfo>();
 
         // ✅ 新增：定义取消令牌源
         private CancellationTokenSource _searchCts;
+        private CancellationTokenSource? _autoRunCts;
 
         // 微信/企业微信切换状态（false=先微信，true=先企业微信）
         private bool _isWeworkTurn = false;
@@ -92,6 +133,9 @@ namespace moshushou
         // ✅ [新增] 记录本轮搜索阶段拿到的目标窗口句柄（用于失败后布局验证）
         private IntPtr _lastSearchWindowHandle = IntPtr.Zero;
         private bool _lastSearchWindowIsWework = false;
+        // 最近一次布局验证通过的句柄（用于失败后的安全检测兜底）
+        private IntPtr _lastLayoutVerifiedHwnd = IntPtr.Zero;
+        private bool? _lastLayoutVerifiedIsWework = null;
 
         // 防止自动化搜索阶段被“选中即复制”逻辑污染剪贴板
         private int _clipboardSearchGuard = 0;
@@ -109,6 +153,7 @@ namespace moshushou
         private ObservableCollection<TreeViewNode> _treeViewCollection;
         // ✅ 新增：失败归档节点
         private TreeViewNode _failureNode;
+        private DebugLogWindow? _debugLogWindow;
         // ✅ 新增：自动化运行标志
         private bool _isAutoRunning = false;
 
@@ -117,12 +162,7 @@ namespace moshushou
         // ✅ [新增] 自定义话术模式 (4列: 运单号|话术|店铺|网点)
         private bool _isCustomMessageMode = false;
 
-        private enum StorePayloadMode
-        {
-            Normal,
-            Issue,
-            CustomMessage
-        }
+
 
         // ✅ 新增：保存状态防抖计时器
         private System.Windows.Threading.DispatcherTimer _saveDebounceTimer;
@@ -132,6 +172,8 @@ namespace moshushou
         // ✅ 新增：F1/F2 热键 ID
         private const int HOTKEY_F1 = 9007;
         private const int HOTKEY_F2 = 9008;
+        private const int HOTKEY_CTRL_SPACE = 9009;
+        private const int HOTKEY_CTRL_SHIFT_SPACE = 9010;
         private const uint VK_F1 = 0x70;
         private const uint VK_F2 = 0x71;
 
@@ -195,6 +237,9 @@ namespace moshushou
         private static extern bool UnregisterHotKey(IntPtr hWnd, int id);
 
         [DllImport("user32.dll")]
+        private static extern short GetAsyncKeyState(int vKey);
+
+        [DllImport("user32.dll")]
         private static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
 
 
@@ -206,9 +251,14 @@ namespace moshushou
         private const uint VK_RIGHT = 0x27;
         private const uint VK_RETURN = 0x0D;
         private const uint VK_OEM_7 = 0xDE;
+        private const uint VK_SPACE = 0x20;
+        private const int VK_CONTROL_KEY = 0x11;
+        private const int VK_LCONTROL_KEY = 0xA2;
+        private const int VK_RCONTROL_KEY = 0xA3;
 
         // 修饰键
         private const uint MOD_CONTROL = 0x0002;
+        private const uint MOD_SHIFT = 0x0004;
 
 
 
@@ -228,6 +278,7 @@ namespace moshushou
         public MainWindow()
         {
             InitializeComponent();
+            DebugLogManager.Initialize();
             _inputSimulator = new InputSimulator();
 
             LoadBusinessInfo();
@@ -246,6 +297,7 @@ namespace moshushou
 
             string screenshotBaseDir = Path.Combine(baseDir, "Screenshots");
             _screenshotHelper = new ScreenshotHelper(screenshotBaseDir, _searchConfig, (msg) => {
+                DebugLogManager.Log("Screenshot", msg);
                 Application.Current.Dispatcher.Invoke(() =>
                 {
                     StatusTextBlock.Text = msg;
@@ -254,6 +306,7 @@ namespace moshushou
 
             _searchHelper = new SearchHelper(_searchConfig, (msg) =>
             {
+                DebugLogManager.Log("Search", msg);
                 Application.Current.Dispatcher.Invoke(() =>
                 {
                     StatusTextBlock.Text = msg;
@@ -399,6 +452,27 @@ namespace moshushou
             }
         }
 
+        private void OpenDebugLogWindowButton_Click(object sender, RoutedEventArgs e)
+        {
+            if (_debugLogWindow == null || !_debugLogWindow.IsLoaded)
+            {
+                _debugLogWindow = new DebugLogWindow
+                {
+                    Owner = this
+                };
+                _debugLogWindow.Closed += (_, __) => _debugLogWindow = null;
+                _debugLogWindow.Show();
+                return;
+            }
+
+            if (_debugLogWindow.WindowState == WindowState.Minimized)
+            {
+                _debugLogWindow.WindowState = WindowState.Normal;
+            }
+
+            _debugLogWindow.Activate();
+        }
+
 
 
 
@@ -488,15 +562,34 @@ namespace moshushou
                 bool rightRegistered = RegisterHotKey(_windowHandle, HOTKEY_RIGHT, MOD_CONTROL, VK_RIGHT);
                 bool enterRegistered = RegisterHotKey(_windowHandle, HOTKEY_ENTER, MOD_CONTROL, VK_RETURN);
                 bool quoteRegistered = RegisterHotKey(_windowHandle, HOTKEY_QUOTE, MOD_CONTROL, VK_OEM_7);
+                bool spaceRegistered = RegisterHotKey(_windowHandle, HOTKEY_CTRL_SPACE, MOD_CONTROL, VK_SPACE);
+                bool spaceFallbackRegistered = false;
+                _ctrlSpaceFallbackActive = false;
+
+                // Ctrl+Space 常被输入法占用，失败时自动降级到 Ctrl+Shift+Space
+                if (!spaceRegistered)
+                {
+                    spaceFallbackRegistered = RegisterHotKey(_windowHandle, HOTKEY_CTRL_SHIFT_SPACE, MOD_CONTROL | MOD_SHIFT, VK_SPACE);
+                    _ctrlSpaceFallbackActive = spaceFallbackRegistered;
+                }
 
                 // 2. 注册新增的 F1 / F2 (无修饰键)
                 bool f1Registered = RegisterHotKey(_windowHandle, HOTKEY_F1, 0, VK_F1);
                 bool f2Registered = RegisterHotKey(_windowHandle, HOTKEY_F2, 0, VK_F2);
 
-                if (upRegistered && downRegistered && leftRegistered && rightRegistered && enterRegistered && quoteRegistered && f1Registered && f2Registered)
+                if (upRegistered &&
+                    downRegistered &&
+                    leftRegistered &&
+                    rightRegistered &&
+                    enterRegistered &&
+                    quoteRegistered &&
+                    (spaceRegistered || spaceFallbackRegistered) &&
+                    f1Registered &&
+                    f2Registered)
                 {
                     _globalHotkeysRegistered = true;
-                    StatusTextBlock.Text = "全局快捷键已启用：F1自动开始，F2停止，Ctrl+方向键操作...";
+                    string ctrlSpaceTip = _ctrlSpaceFallbackActive ? "Ctrl+Shift+Space快捷粘贴(兼容)" : "Ctrl+Space快捷粘贴";
+                    StatusTextBlock.Text = $"快捷键：F1开始自动/F2停止，Ctrl+↑↓切换，Ctrl+←复制店铺，Ctrl+→粘贴发送，{ctrlSpaceTip}，Ctrl+Enter手动搜索，Ctrl+'识别群名";
                 }
                 else
                 {
@@ -523,12 +616,15 @@ namespace moshushou
                 UnregisterHotKey(_windowHandle, HOTKEY_RIGHT);
                 UnregisterHotKey(_windowHandle, HOTKEY_ENTER);
                 UnregisterHotKey(_windowHandle, HOTKEY_QUOTE);
+                UnregisterHotKey(_windowHandle, HOTKEY_CTRL_SPACE);
+                UnregisterHotKey(_windowHandle, HOTKEY_CTRL_SHIFT_SPACE);
 
                 // 注销 F1 / F2
                 UnregisterHotKey(_windowHandle, HOTKEY_F1);
                 UnregisterHotKey(_windowHandle, HOTKEY_F2);
 
                 _globalHotkeysRegistered = false;
+                _ctrlSpaceFallbackActive = false;
             }
             catch (Exception ex)
             {
@@ -570,6 +666,28 @@ namespace moshushou
                     Application.Current.Dispatcher.InvokeAsync(async () =>
                     {
                         await ManualPasteProcessAsync();
+                    });
+                    shouldHandle = true;
+                }
+                else if (id == HOTKEY_CTRL_SPACE || id == HOTKEY_CTRL_SHIFT_SPACE)
+                {
+                    // Ctrl+Space: 按当前选中项执行快捷粘贴/发送（含分段推进）
+                    Application.Current.Dispatcher.InvokeAsync(async () =>
+                    {
+                        if (Interlocked.CompareExchange(ref _ctrlSpaceHotkeyInProgress, 1, 0) == 1)
+                        {
+                            StatusTextBlock.Text = "⌛ Ctrl+Space 正在执行，请稍后再按";
+                            return;
+                        }
+
+                        try
+                        {
+                            await HandleCtrlSpaceHotkeyAsync();
+                        }
+                        finally
+                        {
+                            Interlocked.Exchange(ref _ctrlSpaceHotkeyInProgress, 0);
+                        }
                     });
                     shouldHandle = true;
                 }
@@ -642,16 +760,35 @@ namespace moshushou
             this.Activate();
             this.Focus();
 
+            bool restartedSegmentedFromBeginning = false;
+            string restartedStoreName = string.Empty;
+            if (_currentSelectedNode != null &&
+                TryResolveRootNode(_currentSelectedNode, out TreeViewNode selectedRootNode) &&
+                ResetCompletedSegmentedStoreProgress(selectedRootNode, refreshHeader: true))
+            {
+                restartedSegmentedFromBeginning = true;
+                restartedStoreName = selectedRootNode.StoreName;
+                SelectNodeWithoutCopy(selectedRootNode);
+            }
+
+            _autoRunCts?.Cancel();
+            _autoRunCts?.Dispose();
+            _autoRunCts = new CancellationTokenSource();
+            var autoCts = _autoRunCts;
+
             _isAutoRunning = true;
-            StatusTextBlock.Text = "🚀 [F1] 自动化发送模式已启动！(按 F2 停止)";
+            StatusTextBlock.Text = restartedSegmentedFromBeginning
+                ? $"🚀 [F1] 自动化发送模式已启动！已重置 '{restartedStoreName}' 从第1段开始。(按 F2 停止)"
+                : "🚀 [F1] 自动化发送模式已启动！(按 F2 停止)";
 
             // 启动后台循环任务
-            Task.Run(AutoProcessLoop);
+            Task.Run(() => AutoProcessLoop(autoCts));
         }
 
         private void StopAutoSending()
         {
             _isAutoRunning = false;
+            _autoRunCts?.Cancel();
             StatusTextBlock.Text = "🛑 [F2] 自动化发送已停止。";
         }
 
@@ -659,13 +796,35 @@ namespace moshushou
 
 
 
-        private async Task AutoProcessLoop()
+        private async Task AutoProcessLoop(CancellationTokenSource autoCts)
         {
+            var token = autoCts.Token;
             int consecutiveFailures = 0;
+            // 自动化失败后原地重试次数（每个商家、每个阶段独立计数）
+            const int maxInlineRetriesPerStore = 1;
+            var inlineRetryUsedMap = new Dictionary<string, int>(StringComparer.Ordinal);
 
-            while (_isAutoRunning)
+            string BuildInlineRetryKey(string storeName, bool inRetryArea)
+            {
+                return $"{(inRetryArea ? "retry" : "main")}::{storeName}";
+            }
+
+            void ClearInlineRetryState(string? storeName)
+            {
+                if (string.IsNullOrWhiteSpace(storeName))
+                {
+                    return;
+                }
+
+                inlineRetryUsedMap.Remove(BuildInlineRetryKey(storeName, false));
+                inlineRetryUsedMap.Remove(BuildInlineRetryKey(storeName, true));
+            }
+
+            while (_isAutoRunning && !token.IsCancellationRequested)
             {
                 bool shouldStop = false;
+                bool? attemptAppIsWework = null;
+                bool shouldRunSecurityCheckAfterFailure = true;
 
                 // 1. 状态检查与停止条件
                 await Application.Current.Dispatcher.InvokeAsync(() =>
@@ -699,13 +858,39 @@ namespace moshushou
                         return;
                     }
 
-                    // D. 检查是否有群名
+                    // D. 已被手动/快捷发送打钩：自动流程直接跳过
+                    if (IsStoreMarkedSent(_currentSelectedNode.StoreName))
+                    {
+                        string sentStoreName = _currentSelectedNode.StoreName;
+                        if (TryNavigateToNextNodeForAuto())
+                        {
+                            StatusTextBlock.Text = $"⏭️ 商家 '{sentStoreName}' 已标记✅，自动跳过。";
+                        }
+                        else
+                        {
+                            StatusTextBlock.Text = "🏁 列表已处理完毕，自动化停止。";
+                            shouldStop = true;
+                        }
+                        return;
+                    }
+
+                    // E. 检查是否有群名
                     if (string.IsNullOrWhiteSpace(_currentSelectedNode.GroupName))
                     {
                         StatusTextBlock.Text = $"🛑 商家 '{_currentSelectedNode.StoreName}' 无群名，自动停止。";
                         shouldStop = true;
                         FocusAndSelectItem(_currentSelectedNode);
                         return;
+                    }
+
+                    string src = _currentSelectedNode.Source?.Trim() ?? string.Empty;
+                    if (string.Equals(src, "企业微信", StringComparison.OrdinalIgnoreCase))
+                    {
+                        attemptAppIsWework = true;
+                    }
+                    else if (string.Equals(src, "微信", StringComparison.OrdinalIgnoreCase))
+                    {
+                        attemptAppIsWework = false;
                     }
                 });
 
@@ -717,15 +902,15 @@ namespace moshushou
 
                 if (_currentSelectedNode == null || _currentSelectedNode.StoreName == "FAIL_SEPARATOR")
                 {
-                    await Task.Delay(100);
+                    try { await Task.Delay(100, token); } catch (OperationCanceledException) { break; }
                     continue;
                 }
 
                 // 2. 核心处理
                 // ✅ [修复] 调用带点击逻辑的版本（与 Ctrl+Enter 手动模式一致）
-                bool success = await SearchCurrentItemAsync(true, CancellationToken.None);
+                bool success = await SearchCurrentItemAsync(true, token);
 
-                if (!_isAutoRunning) break;
+                if (!_isAutoRunning || token.IsCancellationRequested) break;
 
                 var autoLoopUiTask = await Application.Current.Dispatcher.InvokeAsync(async () =>
                 {
@@ -736,6 +921,8 @@ namespace moshushou
 
                     if (success)
                     {
+                        string? successStoreName = _currentSelectedNode?.StoreName;
+                        ClearInlineRetryState(successStoreName);
                         consecutiveFailures = 0;
                         if (TryNavigateToNextNodeForAuto())
                         {
@@ -893,7 +1080,9 @@ namespace moshushou
                             // 🛑 布局验证失败 -> 认为是严重异常 (窗口关闭/退出登录/被挡住)
                             // 此时直接停止自动化，不进入重试区
                             this.Activate();
-                            
+                            _lastLayoutVerifiedHwnd = IntPtr.Zero;
+                            _lastLayoutVerifiedIsWework = null;
+                             
                             _isAutoRunning = false;
                             StatusTextBlock.Text = "🛑 [严重] 窗口布局异常(检测不到群名/消息/输入框)，自动化已停止！";
                             System.Diagnostics.Debug.WriteLine($"[AutoLoop] 布局验证失败 (LastHwnd={lastCheckedHwnd})，停止自动化。");
@@ -902,39 +1091,70 @@ namespace moshushou
                         {
                             string matchedAppName = matchedAppIsWework == true ? "企业微信" : "微信";
                             System.Diagnostics.Debug.WriteLine($"[AutoLoop] 布局验证通过: App={matchedAppName}, Hwnd={matchedHwnd}");
-
-                            consecutiveFailures++;
+                            _lastLayoutVerifiedHwnd = matchedHwnd;
+                            _lastLayoutVerifiedIsWework = matchedAppIsWework;
 
                             var node = _currentSelectedNode;
                             if (node != null)
                             {
-                                if (_failedStores.Contains(node.StoreName))
+                                bool isRetryAreaStore = _failedStores.Contains(node.StoreName);
+                                string retryKey = BuildInlineRetryKey(node.StoreName, isRetryAreaStore);
+                                int usedRetries = inlineRetryUsedMap.TryGetValue(retryKey, out int tmpUsed) ? tmpUsed : 0;
+
+                                if (usedRetries < maxInlineRetriesPerStore)
                                 {
-                                    // --- 第二次失败（重试区） ---
-                                    StatusTextBlock.Text += $" [重试失败 {consecutiveFailures}] 标记需人工...";
+                                    inlineRetryUsedMap[retryKey] = usedRetries + 1;
+                                    shouldRunSecurityCheckAfterFailure = false;
+                                    string phaseTag = isRetryAreaStore ? "重试区" : "主列表";
+                                    StatusTextBlock.Text += $" [失败] 原位重试({usedRetries + 1}/{maxInlineRetriesPerStore})...";
+                                    DebugLogManager.Log("自动重试", $"商家={node.StoreName}, 阶段={phaseTag}, 第{usedRetries + 1}次原位重试");
+                                    System.Diagnostics.Debug.WriteLine($"[AutoLoop] 失败后原位重试: Store={node.StoreName}, Phase={phaseTag}, Retry={usedRetries + 1}/{maxInlineRetriesPerStore}");
 
-                                    // ✅ [修复] 记录到人工名单
-                                    _manualReviewStores.Add(node.StoreName);
-                                    SaveFileState(); // ✅ 保存状态
-
-                                    if (!node.Header.StartsWith("❌"))
+                                    if (node.Strategy == SendStrategy.TextSegmented)
                                     {
-                                        node.Header = "❌ [需人工] " + node.Header;
-                                    }
-                                    if (!TryNavigateToNextNodeForAuto())
-                                    {
-                                        _isAutoRunning = false;
-                                        StatusTextBlock.Text += " 🏁 自动重试区已处理完毕，自动化停止。";
+                                        ApplySegmentFailureProgressToNode(node);
                                     }
                                 }
                                 else
                                 {
-                                    // --- 第一次失败 ---
-                                    StatusTextBlock.Text += $" [初次失败 {consecutiveFailures}] 移入重试区...";
+                                    inlineRetryUsedMap.Remove(retryKey);
+                                    consecutiveFailures++;
 
-                                    _failedStores.Add(node.StoreName);
-                                    MoveCurrentToFailureNode();
-                                    SaveFileState(); // ✅ 保存状态
+                                    if (isRetryAreaStore)
+                                    {
+                                        // --- 重试区再次失败（原位重试已耗尽） ---
+                                        StatusTextBlock.Text += $" [重试失败 {consecutiveFailures}] 标记需人工...";
+                                        DebugLogManager.Log("自动重试", $"商家={node.StoreName}, 重试区失败已耗尽，标记需人工");
+
+                                        // ✅ 记录到人工名单
+                                        _manualReviewStores.Add(node.StoreName);
+                                        ClearStoreSentMark(node.StoreName);
+                                        SaveFileState();
+
+                                        RefreshStoreNodeHeader(node);
+
+                                        ClearInlineRetryState(node.StoreName);
+                                        if (!TryNavigateToNextNodeForAuto())
+                                        {
+                                            _isAutoRunning = false;
+                                            StatusTextBlock.Text += " 🏁 自动重试区已处理完毕，自动化停止。";
+                                        }
+                                    }
+                                    else
+                                    {
+                                        // --- 主列表失败（原位重试已耗尽） ---
+                                        StatusTextBlock.Text += $" [初次失败 {consecutiveFailures}] 移入重试区...";
+                                        DebugLogManager.Log("自动重试", $"商家={node.StoreName}, 主列表重试已耗尽，移入重试区");
+
+                                        _failedStores.Add(node.StoreName);
+                                        ClearStoreSentMark(node.StoreName);
+                                        ApplySegmentFailureProgressToNode(node);
+                                        MoveCurrentToFailureNode();
+                                        SaveFileState();
+
+                                        // 进入重试区后是新阶段，清掉主列表阶段计数
+                                        ClearInlineRetryState(node.StoreName);
+                                    }
                                 }
                             }
 
@@ -953,24 +1173,45 @@ namespace moshushou
                 // ✅ 关键修复：成功/失败后都需要等待，确保微信有足够时间处理粘贴内容
                 if (success)
                 {
-                    await Task.Delay(500); // 成功后等待 500ms，防止下一个商家的粘贴覆盖当前商家
+                    try
+                    {
+                        await Task.Delay(500, token); // 成功后等待 500ms，防止下一个商家的粘贴覆盖当前商家
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        break;
+                    }
                 }
                 else
                 {
-                    // ✅ [新增] 失败时检测是否出现了“设备异常/需扫码”的安全验证
-                    bool isSecurityBlock = await CheckForSecurityVerificationAsync();
-                    if (isSecurityBlock)
+                    if (shouldRunSecurityCheckAfterFailure)
                     {
-                        _isAutoRunning = false;
-                        await Application.Current.Dispatcher.InvokeAsync(() => 
+                        // ✅ [新增] 失败时检测是否出现了“设备异常/需扫码”的安全验证
+                        if (!attemptAppIsWework.HasValue && _lastSearchWindowHandle != IntPtr.Zero)
                         {
-                             StatusTextBlock.Text = "🛑[停止] 无法检测到窗口，自动化紧急停止！";
-                            
-                        });
-                        break;
+                            attemptAppIsWework = _lastSearchWindowIsWework;
+                        }
+
+                        bool isSecurityBlock = CheckForSecurityVerification(attemptAppIsWework);
+                        if (isSecurityBlock)
+                        {
+                            _isAutoRunning = false;
+                            await Application.Current.Dispatcher.InvokeAsync(() =>
+                            {
+                                StatusTextBlock.Text = "🛑[停止] 无法检测到窗口，自动化紧急停止！";
+                            });
+                            break;
+                        }
                     }
 
-                    await Task.Delay(500); // 失败后等待 500ms
+                    try
+                    {
+                        await Task.Delay(500, token); // 失败后等待 500ms
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        break;
+                    }
                 }
             }
 
@@ -979,6 +1220,12 @@ namespace moshushou
                 if (!_isAutoRunning && consecutiveFailures < 3)
                     StatusTextBlock.Text += " (已停止)";
             });
+
+            autoCts.Dispose();
+            if (ReferenceEquals(_autoRunCts, autoCts))
+            {
+                _autoRunCts = null;
+            }
         }
 
         private void MoveCurrentToFailureNode()
@@ -1003,37 +1250,8 @@ namespace moshushou
             // 重建扁平索引
             RebuildFlatNodeList();
 
-            // 恢复索引
-            _currentSelectedIndex = targetSlotIndex;
-
-            // 边界修正
-            if (_currentSelectedIndex >= _flatNodeList.Count)
-            {
-                _currentSelectedIndex = _flatNodeList.Count - 1;
-            }
-            if (_flatNodeList.Count == 0)
-            {
-                _currentSelectedIndex = -1;
-            }
-
-            // 选中当前槽位的新节点（即原本排在后面的那个）
-            if (_currentSelectedIndex >= 0 && _currentSelectedIndex < _flatNodeList.Count)
-            {
-                var nextNode = _flatNodeList[_currentSelectedIndex];
-
-                // 如果只剩下一个节点，或者我们移走的是最后一个，nextNode可能就是它自己
-                if (nextNode == node)
-                {
-                    // 这种情况下，说明这已经是最后一项了（或者后面就是分隔符），让Loop去处理分隔符逻辑
-                    _currentSelectedNode = nextNode;
-                }
-                else
-                {
-                    FocusAndSelectItem(nextNode);
-                    _currentSelectedNode = nextNode;
-                }
-            }
-            else
+            // 保持选中在“下一个合适项”，避免置空
+            if (!SelectBestNode(targetSlotIndex))
             {
                 _currentSelectedNode = null;
             }
@@ -1114,59 +1332,215 @@ namespace moshushou
         }
 
         /// <summary>
-        /// ✅ [优化版] 检测企业微信是否已退出登录
-        /// 检测条件：1. 进程不存在  2. 无有效窗口  3. 出现登录窗口(WeChatLogin)
+        /// 安全检测：仅检测当前流程对应的应用，避免“微信流程误查企微”导致误停。
         /// </summary>
-        private async Task<bool> CheckForSecurityVerificationAsync()
+        private bool CheckForSecurityVerification(bool? expectedAppIsWework)
         {
             try
             {
-                // 检测企业微信进程是否存在
-                var wxWorkProcesses = System.Diagnostics.Process.GetProcessesByName("WXWork");
-                
-                if (wxWorkProcesses.Length == 0)
-                {
-                    System.Diagnostics.Debug.WriteLine("[安全检测] ⛔ 企业微信进程不存在，需要停止");
-                    return true;
-                }
+                bool? appIsWework = expectedAppIsWework;
 
-                // ✅ [关键] 检测是否出现了登录窗口 (类名: WeChatLogin)
-                IntPtr loginWindowHandle = FindWindow("WeChatLogin", null);
-                if (loginWindowHandle != IntPtr.Zero)
+                if (!appIsWework.HasValue && _currentSelectedNode != null)
                 {
-                    System.Diagnostics.Debug.WriteLine("[安全检测] ⛔ 检测到登录窗口 (WeChatLogin)，企业微信已退出登录！");
-                    return true;
-                }
-
-                // 检测企业微信主窗口是否存在且有效
-                bool hasValidWindow = false;
-                foreach (var process in wxWorkProcesses)
-                {
-                    try
+                    string src = _currentSelectedNode.Source?.Trim() ?? string.Empty;
+                    if (string.Equals(src, "企业微信", StringComparison.OrdinalIgnoreCase))
                     {
-                        if (process.MainWindowHandle != IntPtr.Zero)
-                        {
-                            hasValidWindow = true;
-                            System.Diagnostics.Debug.WriteLine($"[安全检测] ✅ 企业微信窗口存在: PID={process.Id}, Title='{process.MainWindowTitle}'");
-                            break;
-                        }
+                        appIsWework = true;
                     }
-                    catch { }
+                    else if (string.Equals(src, "微信", StringComparison.OrdinalIgnoreCase))
+                    {
+                        appIsWework = false;
+                    }
                 }
 
-                if (!hasValidWindow)
+                if (!appIsWework.HasValue && _lastSearchWindowHandle != IntPtr.Zero)
                 {
-                    System.Diagnostics.Debug.WriteLine("[安全检测] ⛔ 企业微信进程存在但无有效窗口，可能已退出登录");
-                    return true;
+                    appIsWework = _lastSearchWindowIsWework;
                 }
 
-                return false;
+                if (!appIsWework.HasValue)
+                {
+                    System.Diagnostics.Debug.WriteLine("[安全检测] ℹ️ 无法确定当前应用，跳过安全检测");
+                    return false;
+                }
+
+                string appName = appIsWework.Value ? "企业微信" : "微信";
+                System.Diagnostics.Debug.WriteLine(
+                    $"[安全检测] 开始: App={appName}, LastSearchHwnd={_lastSearchWindowHandle}, LastSearchIsWework={_lastSearchWindowIsWework}, " +
+                    $"LastLayoutHwnd={_lastLayoutVerifiedHwnd}, LastLayoutIsWework={_lastLayoutVerifiedIsWework}");
+
+                // 优先信任“刚通过布局验证”的窗口句柄，避免仅靠进程名误判
+                if (TryTrustWindowHandleForSecurity(_lastLayoutVerifiedHwnd, _lastLayoutVerifiedIsWework, appIsWework.Value, "布局验证"))
+                {
+                    return false;
+                }
+
+                // 次级兜底：信任本轮搜索阶段命中的窗口句柄
+                if (TryTrustWindowHandleForSecurity(_lastSearchWindowHandle, _lastSearchWindowIsWework, appIsWework.Value, "搜索阶段"))
+                {
+                    return false;
+                }
+
+                if (appIsWework.Value)
+                {
+                    return CheckAppSecurityVerification(new[] { "WXWork" }, "企业微信", "WeChatLogin");
+                }
+
+                string configuredWeChatName = _searchConfig?.WeChatProcessName?.Trim() ?? "Weixin";
+                var weChatProcessCandidates = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    configuredWeChatName,
+                    "Weixin",
+                    "WeChat"
+                };
+                return CheckAppSecurityVerification(weChatProcessCandidates, "微信", null);
             }
             catch (Exception ex)
             {
                 System.Diagnostics.Debug.WriteLine($"[安全检测] 异常: {ex.Message}");
                 return false;
             }
+        }
+
+        private bool TryTrustWindowHandleForSecurity(IntPtr hwnd, bool? handleIsWework, bool expectedIsWework, string stageTag)
+        {
+            if (hwnd == IntPtr.Zero || !handleIsWework.HasValue || handleIsWework.Value != expectedIsWework)
+            {
+                return false;
+            }
+
+            bool valid = IsTargetChatWindow(hwnd, out string processName) &&
+                         IsProcessNameForApp(processName, expectedIsWework);
+            if (valid)
+            {
+                System.Diagnostics.Debug.WriteLine(
+                    $"[安全检测] ✅ 复用{stageTag}句柄通过: Hwnd={hwnd}, Proc={processName}");
+                return true;
+            }
+
+            System.Diagnostics.Debug.WriteLine(
+                $"[安全检测] ⚠️ {stageTag}句柄不可用: Hwnd={hwnd}, Proc={(string.IsNullOrWhiteSpace(processName) ? "<unknown>" : processName)}");
+            return false;
+        }
+
+        private bool CheckAppSecurityVerification(IEnumerable<string> processNames, string appName, string? loginWindowClass)
+        {
+            var candidateNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (processNames != null)
+            {
+                foreach (var name in processNames)
+                {
+                    string normalized = NormalizeProcessNameCandidate(name);
+                    if (!string.IsNullOrWhiteSpace(normalized))
+                    {
+                        candidateNames.Add(normalized);
+                    }
+                }
+            }
+
+            if (candidateNames.Count == 0)
+            {
+                candidateNames.Add(appName == "企业微信" ? "WXWork" : "Weixin");
+            }
+
+            var processMap = new Dictionary<int, Process>();
+            System.Diagnostics.Debug.WriteLine($"[安全检测] {appName}进程候选: {string.Join("/", candidateNames)}");
+            foreach (var name in candidateNames)
+            {
+                Process[] matched;
+                try
+                {
+                    matched = Process.GetProcessesByName(name);
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine($"[安全检测] 获取进程列表失败: Name={name}, Error={ex.Message}");
+                    continue;
+                }
+
+                System.Diagnostics.Debug.WriteLine($"[安全检测] 候选命中: Name={name}, Count={matched.Length}");
+                foreach (var p in matched)
+                {
+                    if (!processMap.ContainsKey(p.Id))
+                    {
+                        processMap[p.Id] = p;
+                    }
+                }
+            }
+            var processes = processMap.Values.ToList();
+
+            if (processes.Count == 0)
+            {
+                string msg = $"⛔ {appName}进程不存在，需要停止 (Candidates={string.Join("/", candidateNames)})";
+                System.Diagnostics.Debug.WriteLine($"[安全检测] {msg}");
+                DebugLogManager.Log("安全检测", msg);
+                return true;
+            }
+
+            if (!string.IsNullOrWhiteSpace(loginWindowClass))
+            {
+                IntPtr loginWindowHandle = FindWindow(loginWindowClass, null);
+                if (loginWindowHandle != IntPtr.Zero)
+                {
+                    string msg = $"⛔ 检测到登录窗口 ({loginWindowClass})，{appName}可能已退出登录";
+                    System.Diagnostics.Debug.WriteLine($"[安全检测] {msg}");
+                    DebugLogManager.Log("安全检测", msg);
+                    return true;
+                }
+            }
+
+            bool hasValidWindow = false;
+            foreach (var process in processes)
+            {
+                try
+                {
+                    process.Refresh();
+                    System.Diagnostics.Debug.WriteLine(
+                        $"[安全检测] 进程明细: PID={process.Id}, Name={process.ProcessName}, MainHwnd={process.MainWindowHandle}, Title='{process.MainWindowTitle}'");
+                    if (process.MainWindowHandle != IntPtr.Zero)
+                    {
+                        hasValidWindow = true;
+                        System.Diagnostics.Debug.WriteLine($"[安全检测] ✅ {appName}窗口存在: PID={process.Id}, Title='{process.MainWindowTitle}'");
+                        break;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine($"[安全检测] 读取进程窗口失败: PID={process.Id}, Error={ex.Message}");
+                }
+            }
+
+            if (!hasValidWindow)
+            {
+                string msg = $"⛔ {appName}进程存在但无有效窗口，可能已退出登录";
+                System.Diagnostics.Debug.WriteLine($"[安全检测] {msg}");
+                DebugLogManager.Log("安全检测", msg);
+                return true;
+            }
+
+            return false;
+        }
+
+        private static string NormalizeProcessNameCandidate(string? rawName)
+        {
+            if (string.IsNullOrWhiteSpace(rawName))
+            {
+                return string.Empty;
+            }
+
+            string name = rawName.Trim();
+            int slashIndex = Math.Max(name.LastIndexOf('\\'), name.LastIndexOf('/'));
+            if (slashIndex >= 0 && slashIndex < name.Length - 1)
+            {
+                name = name[(slashIndex + 1)..];
+            }
+
+            if (name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
+            {
+                name = name[..^4];
+            }
+
+            return name.Trim();
         }
 
         private async Task ManualSmartProcessAsync(CancellationToken token)
@@ -1221,7 +1595,7 @@ namespace moshushou
             string storeName = null;
             string groupName = null;
             string source = null;
-            bool isFileNode = false;
+            SendStrategy strategy = SendStrategy.TextDirect;
 
             try
             {
@@ -1232,7 +1606,7 @@ namespace moshushou
                         storeName = _currentSelectedNode.StoreName;
                         groupName = _currentSelectedNode.GroupName;
                         source = _currentSelectedNode.Source;
-                        isFileNode = _currentSelectedNode.IsFileNode;
+                        strategy = _currentSelectedNode.Strategy;
                     }
                 });
 
@@ -1268,13 +1642,18 @@ namespace moshushou
                 string appName = snapshot.IsWework ? "企业微信" : "微信";
                 Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = $"🔍 正在 [{appName}] 搜索: {snapshot.SearchText}...");
 
-                // 定义粘贴动作
+                // ✅ [重构] 定义粘贴动作：根据 SendStrategy 三路分发
                 Func<Task<bool>> performPasteAsync = async () =>
                 {
-                    if (isFileNode)
-                        return await PasteExcelFileAsync(snapshot.StoreName, snapshot.IsWework);
-                    else
-                        return await PasteFullStoreInfoAsync(snapshot.StoreName, snapshot.IsWework);
+                    switch (strategy)
+                    {
+                        case SendStrategy.FileExcel:
+                            return await PasteExcelFileAsync(snapshot.StoreName, snapshot.IsWework, token);
+                        case SendStrategy.TextSegmented:
+                            return await PasteStoreInfoInSegmentsAsync(snapshot.StoreName, snapshot.IsWework, token, isAutoMode);
+                        default:
+                            return await PasteFullStoreInfoAsync(snapshot.StoreName, snapshot.IsWework, token);
+                    }
                 };
 
                 // ✅ 检查取消
@@ -1454,7 +1833,7 @@ namespace moshushou
                         
                         // 直接按回车进入
                         _inputSimulator.Keyboard.KeyPress(VirtualKeyCode.RETURN);
-                        await Task.Delay(300);
+                        try { await Task.Delay(300, token); } catch (TaskCanceledException) { return false; }
                     }
 
                     else
@@ -1616,7 +1995,7 @@ namespace moshushou
                         if (v < 2) 
                         {
                             System.Diagnostics.Debug.WriteLine("⏳ [DEBUG_TRACE] 标题验证未通过/为空，等待 UI 渲染...");
-                            await Task.Delay(500);
+                            try { await Task.Delay(500, token); } catch (TaskCanceledException) { return false; }
                         }
                     }
                     
@@ -1711,7 +2090,7 @@ namespace moshushou
                         string rawTitle = await _screenshotHelper.GetWeChatWindowTitleTextAsync(chatHwnd, snapshot.IsWework);
                         if (string.IsNullOrEmpty(rawTitle))
                         {
-                            await Task.Delay(300);
+                            try { await Task.Delay(300, token); } catch (TaskCanceledException) { return false; }
                             rawTitle = await _screenshotHelper.GetWeChatWindowTitleTextAsync(chatHwnd, snapshot.IsWework);
                         }
 
@@ -1740,7 +2119,7 @@ namespace moshushou
                             // 🛠️ [容错] 如果不幸打开了弹窗，尝试按 ESC 关闭，以便下次搜索能正常进行
                             // (特别是搜索页面)
                             _inputSimulator.Keyboard.KeyPress(VirtualKeyCode.ESCAPE);
-                            await Task.Delay(100);
+                            try { await Task.Delay(100, token); } catch (TaskCanceledException) { return false; }
                         }
                     } // End Loop
                 } // End if (!enteredSuccess)
@@ -1968,7 +2347,7 @@ namespace moshushou
 
             string storeName = _currentSelectedNode.StoreName;
             string originalGroupName = _currentSelectedNode.GroupName;
-            bool isFileNode = _currentSelectedNode.IsFileNode;
+            SendStrategy strategy = _currentSelectedNode.Strategy;
 
             // ============================================================
             // 2. 🤖 自动识别窗口身份 (兼容 search_config.json)
@@ -2037,15 +2416,36 @@ namespace moshushou
             // 3. 执行核心动作 (传入识别到的 isWework)
             // ============================================================
             bool actionSuccess = false;
-            if (isFileNode)
+
+            // ✅ [修复] 如果选中了子节点（分段或单行），直接发送 RawData
+            // 排除 FileExcel 模式（通常期望发送文件或全量）
+            if (!string.IsNullOrEmpty(_currentSelectedNode.RawData) && 
+                _currentSelectedNode.Strategy != SendStrategy.FileExcel)
             {
-                // 传入 isWework 确保点击坐标正确 (企微宽，微信窄)
-                actionSuccess = await PasteExcelFileAsync(storeName, isWework);
+                 Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = "📤 正在发送选中片段...");
+                 
+                 // 先写入剪贴板
+                 if (await SetClipboardWithRetryAsync(_currentSelectedNode.RawData))
+                 {
+                     // 调用通用发送逻辑 (false 表示不是文件)
+                     actionSuccess = await PasteAndVerifySendAsync(_currentSelectedNode.RawData, false);
+                 }
             }
             else
             {
-                actionSuccess = await PasteFullStoreInfoAsync(storeName, isWework);
+                switch (strategy)
+                {
+                case SendStrategy.FileExcel:
+                    actionSuccess = await PasteExcelFileAsync(storeName, isWework);
+                    break;
+                case SendStrategy.TextSegmented:
+                    actionSuccess = await PasteStoreInfoInSegmentsAsync(storeName, isWework, CancellationToken.None);
+                    break;
+                default:
+                    actionSuccess = await PasteFullStoreInfoAsync(storeName, isWework);
+                    break;
             }
+        }
 
             if (!actionSuccess) return;
 
@@ -2089,6 +2489,592 @@ namespace moshushou
             }
         }
 
+        private static bool IsControlKeyPressed()
+        {
+            return (GetAsyncKeyState(VK_CONTROL_KEY) & 0x8000) != 0 ||
+                   (GetAsyncKeyState(VK_LCONTROL_KEY) & 0x8000) != 0 ||
+                   (GetAsyncKeyState(VK_RCONTROL_KEY) & 0x8000) != 0;
+        }
+
+        private async Task EnsureCtrlReleasedBeforeHotkeySendAsync()
+        {
+            // 释放注入层 Ctrl，避免发送 Enter 时被识别为 Ctrl+Enter
+            try
+            {
+                _inputSimulator.Keyboard.KeyUp(VirtualKeyCode.LCONTROL);
+                _inputSimulator.Keyboard.KeyUp(VirtualKeyCode.RCONTROL);
+                _inputSimulator.Keyboard.KeyUp(VirtualKeyCode.CONTROL);
+            }
+            catch
+            {
+                // 忽略输入模拟器异常
+            }
+
+            // 等待用户物理按键松开，避免“有时发不出去”
+            for (int i = 0; i < 16; i++)
+            {
+                if (!IsControlKeyPressed())
+                {
+                    break;
+                }
+
+                await Task.Delay(5);
+            }
+        }
+
+        private async Task HandleCtrlSpaceHotkeyAsync()
+        {
+            await EnsureCtrlReleasedBeforeHotkeySendAsync();
+
+            if (_currentSelectedNode == null)
+            {
+                StatusTextBlock.Text = "⚠️ 请先选择一个商家或子项";
+                return;
+            }
+
+            if (!TryResolveRootNode(_currentSelectedNode, out TreeViewNode rootNode))
+            {
+                StatusTextBlock.Text = "⚠️ 未能定位当前所属主列表项";
+                return;
+            }
+
+            if (string.IsNullOrWhiteSpace(rootNode.StoreName) || rootNode.StoreName == "FAIL_SEPARATOR")
+            {
+                StatusTextBlock.Text = "⚠️ 当前项不可执行 Ctrl+Space";
+                return;
+            }
+
+            bool autoSend = AutoSendCheckBox.IsChecked == true;
+            bool isSegmentedRoot = rootNode.Strategy == SendStrategy.TextSegmented &&
+                                   rootNode.Children != null &&
+                                   rootNode.Children.Count > 0;
+
+            if (isSegmentedRoot)
+            {
+                await HandleCtrlSpaceSegmentedAsync(rootNode, _currentSelectedNode, autoSend);
+                return;
+            }
+
+            SelectNodeWithoutCopy(rootNode);
+
+            bool success = rootNode.Strategy == SendStrategy.FileExcel
+                ? await PasteExcelForCtrlSpaceAsync(rootNode.StoreName, autoSend)
+                : await PasteStoreFullTextForCtrlSpaceAsync(rootNode.StoreName, autoSend);
+
+            if (!success)
+            {
+                return;
+            }
+
+            if (autoSend)
+            {
+                MarkStoreAsSent(rootNode.StoreName);
+            }
+            else
+            {
+                ClearStoreSentMark(rootNode.StoreName, refreshHeader: true);
+            }
+
+            _ctrlSpaceSegmentCursor[rootNode.StoreName] = 0;
+            await AdvanceToNextMainNodeAndCopyStoreNameAsync(rootNode);
+        }
+
+        private async Task HandleCtrlSpaceSegmentedAsync(TreeViewNode rootNode, TreeViewNode selectedNode, bool autoSend)
+        {
+            int totalSegments = rootNode.Children?.Count ?? 0;
+            if (totalSegments <= 0)
+            {
+                StatusTextBlock.Text = "⚠️ 分段列表为空";
+                return;
+            }
+
+            bool restartedFromBeginning = ResetCompletedSegmentedStoreProgress(rootNode, refreshHeader: true);
+            int selectedIndex = -1;
+            if (!ReferenceEquals(selectedNode, rootNode))
+            {
+                selectedIndex = rootNode.Children.IndexOf(selectedNode);
+            }
+
+            bool hasCursor = _ctrlSpaceSegmentCursor.TryGetValue(rootNode.StoreName, out int cursorIndex);
+            int currentIndex;
+            if (restartedFromBeginning || ReferenceEquals(selectedNode, rootNode))
+            {
+                // 主项起发时固定从第一段开始
+                currentIndex = 0;
+            }
+            else if (hasCursor && selectedIndex == cursorIndex - 1)
+            {
+                // 选中项是“刚发完的一段”时，按游标推进下一段
+                currentIndex = cursorIndex;
+            }
+            else if (selectedIndex >= 0)
+            {
+                // 用户手动选中某个子段时，优先从该段发起
+                currentIndex = selectedIndex;
+            }
+            else if (hasCursor)
+            {
+                currentIndex = cursorIndex;
+            }
+            else
+            {
+                currentIndex = 0;
+            }
+
+            if (currentIndex < 0) currentIndex = 0;
+            if (currentIndex >= totalSegments) currentIndex = totalSegments - 1;
+
+            TreeViewNode currentSegmentNode = rootNode.Children[currentIndex];
+            SelectNodeWithoutCopy(currentSegmentNode, rootNode);
+
+            string payload = currentSegmentNode.RawData;
+            if (string.IsNullOrWhiteSpace(payload))
+            {
+                payload = currentSegmentNode.Text?.Trim() ?? string.Empty;
+            }
+
+            if (string.IsNullOrWhiteSpace(payload) ||
+                (payload.StartsWith("(") && payload.EndsWith(")")))
+            {
+                StatusTextBlock.Text = $"⚠️ 第 {currentIndex + 1}/{totalSegments} 段无可粘贴内容";
+                return;
+            }
+
+            bool success = await PasteTextPayloadForCtrlSpaceAsync(
+                rootNode.StoreName,
+                payload,
+                autoSend,
+                $"第 {currentIndex + 1}/{totalSegments} 段");
+
+            if (!success)
+            {
+                return;
+            }
+
+            int sentSegments = currentIndex + 1;
+            int totalItems = rootNode.Children.Sum(child => CountContentLines(child.RawData));
+            if (totalItems <= 0)
+            {
+                lock (_dataLock)
+                {
+                    if (_storeData.TryGetValue(rootNode.StoreName, out var rows))
+                    {
+                        totalItems = rows.Count;
+                    }
+                }
+            }
+
+            int sentItems = 0;
+            for (int i = 0; i <= currentIndex && i < rootNode.Children.Count; i++)
+            {
+                sentItems += CountContentLines(rootNode.Children[i].RawData);
+            }
+            if (sentItems <= 0)
+            {
+                int segmentSize = Math.Max(1, _searchConfig.SegmentSize);
+                sentItems = Math.Min(totalItems, sentSegments * segmentSize);
+            }
+
+            bool isSegmentCompleted = sentSegments >= totalSegments;
+            UpdateSegmentProgressVisual(
+                rootNode.StoreName,
+                sentSegments: sentSegments,
+                totalSegments: totalSegments,
+                sentItems: sentItems,
+                totalItems: totalItems,
+                reason: isSegmentCompleted ? "发送完成" : "发送中(Ctrl+Space)");
+
+            int nextSegmentIndex = currentIndex + 1;
+            if (nextSegmentIndex < totalSegments)
+            {
+                _ctrlSpaceSegmentCursor[rootNode.StoreName] = nextSegmentIndex;
+                // 保持当前选中项为“已发送段”，下次 Ctrl+Space 自动推进到下一段
+                SelectNodeWithoutCopy(currentSegmentNode, rootNode);
+                StatusTextBlock.Text += $"，已完成({currentIndex + 1}/{totalSegments})，下次发送第{nextSegmentIndex + 1}段";
+                return;
+            }
+
+            _ctrlSpaceSegmentCursor[rootNode.StoreName] = 0;
+            SelectNodeWithoutCopy(currentSegmentNode, rootNode);
+            StatusTextBlock.Text += "，分段已完成";
+            if (autoSend)
+            {
+                MarkStoreAsSent(rootNode.StoreName);
+            }
+            else
+            {
+                ClearStoreSentMark(rootNode.StoreName, refreshHeader: true);
+            }
+            await AdvanceToNextMainNodeAndCopyStoreNameAsync(rootNode);
+        }
+
+        private bool ResetCompletedSegmentedStoreProgress(TreeViewNode rootNode, bool refreshHeader = true)
+        {
+            if (rootNode == null ||
+                rootNode.Strategy != SendStrategy.TextSegmented ||
+                string.IsNullOrWhiteSpace(rootNode.StoreName))
+            {
+                return false;
+            }
+
+            bool isMarkedSent = IsStoreMarkedSent(rootNode.StoreName);
+            bool isSegmentCompleted = false;
+            if (TryGetSegmentFailureInfo(rootNode.StoreName, out var segmentInfo) && segmentInfo != null)
+            {
+                int totalSegments = Math.Max(1, rootNode.Children?.Count ?? segmentInfo.TotalSegments);
+                isSegmentCompleted = IsSegmentCompleted(segmentInfo, totalSegments);
+            }
+
+            if (!isMarkedSent && !isSegmentCompleted)
+            {
+                return false;
+            }
+
+            ClearStoreSentMark(rootNode.StoreName, refreshHeader);
+            _ctrlSpaceSegmentCursor[rootNode.StoreName] = 0;
+            ClearSegmentFailureInfo(rootNode.StoreName);
+            return true;
+        }
+
+        private async Task<bool> PasteStoreFullTextForCtrlSpaceAsync(string storeName, bool autoSend)
+        {
+            if (!TryBuildStoreFullPayload(storeName, out string payload, out int trackingCount))
+            {
+                return false;
+            }
+
+            bool success = await PasteTextPayloadForCtrlSpaceAsync(storeName, payload, autoSend);
+            if (success)
+            {
+                string modeText = autoSend ? "发送" : "粘贴";
+                DebugLogManager.Log("CtrlSpace", $"商家={storeName}, 模式=整单{modeText}, 条数={trackingCount}");
+            }
+
+            return success;
+        }
+
+        private async Task<bool> PasteExcelForCtrlSpaceAsync(string storeName, bool autoSend)
+        {
+            string filePath;
+            lock (_dataLock)
+            {
+                if (!_exportedFilePaths.TryGetValue(storeName, out filePath))
+                {
+                    StatusTextBlock.Text = "❌ 未找到文件路径";
+                    return false;
+                }
+            }
+
+            if (!File.Exists(filePath))
+            {
+                StatusTextBlock.Text = "❌ 文件不存在";
+                return false;
+            }
+
+            var data = new DataObject();
+            data.SetData(DataFormats.FileDrop, new[] { filePath });
+
+            // 快捷键发送走极速参数，减少剪贴板重试等待带来的卡顿
+            if (!await SetClipboardWithRetryAsync(data, maxAttempts: 8, retryDelayMs: 8))
+            {
+                StatusTextBlock.Text = "❌ 文件剪贴板写入失败";
+                return false;
+            }
+
+            await Task.Delay(8);
+            SimulatePaste();
+
+            if (autoSend)
+            {
+                // 按用户要求：快捷键发送仅使用 Enter 单键，不再 Alt+S 双保险
+                const int enterDelayMs = 8;
+                await Task.Delay(enterDelayMs);
+                SimulateEnter();
+                DebugLogManager.Log("CtrlSpace", $"文件发送延迟: {enterDelayMs}ms, 文件={Path.GetFileName(filePath)}");
+                StatusTextBlock.Text = $"✅ [Ctrl+Space] 已发送文件: {storeName}";
+            }
+            else
+            {
+                StatusTextBlock.Text = $"📋 [Ctrl+Space] 已粘贴文件: {storeName}";
+            }
+
+            _currentItemPasted = true;
+            _lastPastedStoreName = storeName;
+            return true;
+        }
+
+        private async Task<bool> PasteTextPayloadForCtrlSpaceAsync(string storeName, string payload, bool autoSend, string? segmentTag = null)
+        {
+            // 快捷键发送走极速参数，减少剪贴板重试等待带来的卡顿
+            if (!await SetClipboardWithRetryAsync(payload, maxAttempts: 8, retryDelayMs: 8))
+            {
+                StatusTextBlock.Text = "❌ 剪贴板被占用";
+                return false;
+            }
+
+            await Task.Delay(8);
+            SimulatePaste();
+
+            string suffix = string.IsNullOrWhiteSpace(segmentTag) ? string.Empty : $" ({segmentTag})";
+            if (autoSend)
+            {
+                // 按用户要求：快捷键发送仅使用 Enter 单键，不再 Alt+S 双保险
+                const int enterDelayMs = 8;
+                await Task.Delay(enterDelayMs);
+                SimulateEnter();
+                DebugLogManager.Log("CtrlSpace", $"文本发送延迟: {enterDelayMs}ms, 长度={payload.Length}");
+                StatusTextBlock.Text = $"✅ [Ctrl+Space] 已发送: {storeName}{suffix}";
+            }
+            else
+            {
+                StatusTextBlock.Text = $"📋 [Ctrl+Space] 已粘贴: {storeName}{suffix}";
+            }
+
+            _currentItemPasted = true;
+            _lastPastedStoreName = storeName;
+            return true;
+        }
+
+        private bool IsForegroundWeWorkWindow()
+        {
+            IntPtr hwnd = GetForegroundWindow();
+            if (hwnd == IntPtr.Zero)
+            {
+                return false;
+            }
+
+            try
+            {
+                GetWindowThreadProcessId(hwnd, out uint pid);
+                if (pid == 0)
+                {
+                    return false;
+                }
+
+                using var process = Process.GetProcessById((int)pid);
+                return process.ProcessName.Equals("WXWork", StringComparison.OrdinalIgnoreCase);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private bool TryBuildStoreFullPayload(string storeName, out string payload, out int trackingCount)
+        {
+            payload = string.Empty;
+            trackingCount = 0;
+
+            List<string> trackingNumbers;
+            lock (_dataLock)
+            {
+                if (!_storeData.TryGetValue(storeName, out trackingNumbers))
+                {
+                    StatusTextBlock.Text = "❌ 未找到商家数据";
+                    return false;
+                }
+                trackingNumbers = trackingNumbers.ToList();
+            }
+
+            trackingCount = trackingNumbers.Count;
+            var payloadMode = ResolveStorePayloadMode(storeName, trackingNumbers);
+            bool isCustomMode = payloadMode == StorePayloadMode.CustomMessage;
+            bool isIssueMode = payloadMode == StorePayloadMode.Issue;
+
+            var sb = new StringBuilder();
+            if (!isCustomMode)
+            {
+                sb.AppendLine(storeName);
+            }
+
+            foreach (var num in trackingNumbers)
+            {
+                sb.AppendLine(num);
+            }
+
+            if (!isIssueMode && !isCustomMode)
+            {
+                sb.AppendLine(_searchConfig.FixedMessage);
+            }
+
+            payload = sb.ToString();
+            return true;
+        }
+
+        private bool TryResolveRootNode(TreeViewNode selectedNode, out TreeViewNode rootNode)
+        {
+            rootNode = null;
+            if (selectedNode == null || _treeViewCollection == null)
+            {
+                return false;
+            }
+
+            foreach (var top in _treeViewCollection)
+            {
+                if (top == null || string.IsNullOrWhiteSpace(top.StoreName))
+                {
+                    continue;
+                }
+
+                if (ReferenceEquals(top, selectedNode))
+                {
+                    rootNode = top;
+                    return true;
+                }
+
+                if (top.Children != null && top.Children.Contains(selectedNode))
+                {
+                    rootNode = top;
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private TreeViewNode? GetNextMainNode(TreeViewNode rootNode)
+        {
+            if (rootNode == null)
+            {
+                return null;
+            }
+
+            if (_flatNodeList.Count == 0)
+            {
+                RebuildFlatNodeList();
+            }
+
+            int currentIndex = _flatNodeList.IndexOf(rootNode);
+            if (currentIndex < 0)
+            {
+                currentIndex = _currentSelectedIndex;
+            }
+
+            for (int i = currentIndex + 1; i < _flatNodeList.Count; i++)
+            {
+                var node = _flatNodeList[i];
+                if (IsSelectableNode(node))
+                {
+                    return node;
+                }
+            }
+
+            return null;
+        }
+
+        private async Task AdvanceToNextMainNodeAndCopyStoreNameAsync(TreeViewNode rootNode)
+        {
+            var nextNode = GetNextMainNode(rootNode);
+            if (nextNode == null)
+            {
+                StatusTextBlock.Text += "，已到列表末尾";
+                return;
+            }
+
+            SelectNodeWithoutCopy(nextNode);
+
+            bool copied = await SetClipboardWithRetryAsync(nextNode.StoreName, maxAttempts: 8, retryDelayMs: 8);
+            StatusTextBlock.Text += copied
+                ? "，已跳到下一项并复制商家名"
+                : "，已跳到下一项(复制商家名失败)";
+        }
+
+        private void SelectNodeWithoutCopy(TreeViewNode targetNode, TreeViewNode? rootToExpand = null)
+        {
+            if (targetNode == null)
+            {
+                return;
+            }
+
+            Interlocked.Increment(ref _selectionCopyGuard);
+            try
+            {
+                if (rootToExpand != null)
+                {
+                    ExpandRootNode(rootToExpand);
+                }
+
+                if (_currentSelectedNode != null && !ReferenceEquals(_currentSelectedNode, targetNode))
+                {
+                    _currentSelectedNode.IsSelected = false;
+                }
+
+                targetNode.IsSelected = true;
+                _currentSelectedNode = targetNode;
+
+                TreeViewNode indexAnchor = rootToExpand ?? targetNode;
+                if (_flatNodeList.Contains(indexAnchor))
+                {
+                    _currentSelectedIndex = _flatNodeList.IndexOf(indexAnchor);
+                    ScrollToNode(indexAnchor);
+                }
+
+                StoreTreeView.UpdateLayout();
+
+                TreeViewItem? container = null;
+                if (rootToExpand != null)
+                {
+                    container = GetTreeViewItemForNode(rootToExpand, targetNode);
+                }
+                else if (_flatNodeList.Contains(targetNode))
+                {
+                    container = StoreTreeView.ItemContainerGenerator.ContainerFromItem(targetNode) as TreeViewItem;
+                }
+
+                container?.Focus();
+            }
+            finally
+            {
+                Application.Current.Dispatcher.BeginInvoke(new Action(() =>
+                {
+                    Interlocked.Exchange(ref _selectionCopyGuard, 0);
+                }), System.Windows.Threading.DispatcherPriority.ContextIdle);
+            }
+        }
+
+        private void ExpandRootNode(TreeViewNode rootNode)
+        {
+            if (rootNode == null)
+            {
+                return;
+            }
+
+            if (StoreTreeView.ItemContainerGenerator.ContainerFromItem(rootNode) is TreeViewItem rootContainer)
+            {
+                if (!rootContainer.IsExpanded)
+                {
+                    rootContainer.IsExpanded = true;
+                    StoreTreeView.UpdateLayout();
+                }
+            }
+        }
+
+        private TreeViewItem? GetTreeViewItemForNode(TreeViewNode rootNode, TreeViewNode targetNode)
+        {
+            if (rootNode == null || targetNode == null)
+            {
+                return null;
+            }
+
+            if (StoreTreeView.ItemContainerGenerator.ContainerFromItem(rootNode) is not TreeViewItem rootContainer)
+            {
+                return null;
+            }
+
+            if (!rootContainer.IsExpanded)
+            {
+                rootContainer.IsExpanded = true;
+                StoreTreeView.UpdateLayout();
+            }
+
+            if (ReferenceEquals(rootNode, targetNode))
+            {
+                return rootContainer;
+            }
+
+            return rootContainer.ItemContainerGenerator.ContainerFromItem(targetNode) as TreeViewItem;
+        }
+
 
         private async Task<bool> PasteFullStoreInfoBlindAsync(string storeName)
         {
@@ -2112,10 +3098,6 @@ namespace moshushou
             bool isCustomMode = payloadMode == StorePayloadMode.CustomMessage;
             bool isIssueMode = payloadMode == StorePayloadMode.Issue;
             string displayStoreName = storeName;
-            if (TryParseCustomStoreKey(storeName, out var parsedStore, out _))
-            {
-                displayStoreName = parsedStore;
-            }
 
             var sb = new StringBuilder();
             
@@ -2160,6 +3142,7 @@ namespace moshushou
                 await Task.Delay(50);
                 SimulateEnter(); // 补刀
 
+                MarkStoreAsSent(storeName);
                 StatusTextBlock.Text = $"✅ [快捷] 已发送: {displayStoreName}";
             }
             else
@@ -2267,6 +3250,7 @@ namespace moshushou
                 SimulateAltS();
                 await Task.Delay(50);
                 SimulateEnter();
+                MarkStoreAsSent(storeName);
                 StatusTextBlock.Text = $"✅ [快捷] 文件已发送: {storeName}";
             }
             else
@@ -2359,20 +3343,26 @@ namespace moshushou
         // 原因：存在两个同名方法导致调用混乱
         // 现在所有调用统一使用 SearchCurrentItemAsync(bool isAutoMode, CancellationToken token) 版本
         // 该版本位于第 922 行，包含完整的 OCR 定位 + 鼠标点击逻辑
-        private async Task<bool> PasteAndVerifySendAsync(string contentToSend, bool isFile)
+        private async Task<bool> PasteAndVerifySendAsync(string contentToSend, bool isFile, CancellationToken token = default)
         {
             Action<string> Log = (msg) => System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [SendVerify] {msg}");
-            
+
+            if (token.IsCancellationRequested)
+            {
+                return false;
+            }
+
             // ✅ Fix: 如果是发送文本，必须在此处更新剪贴板，否则会重复粘贴上一次的文件
             if (!isFile && !string.IsNullOrEmpty(contentToSend))
             {
-                 bool copied = await SetClipboardWithRetryAsync(contentToSend);
-                 if (!copied)
-                 {
-                     Log("❌ [SendVerify] 设置剪贴板失败");
-                     return false; 
-                 }
-                 await Task.Delay(100); 
+                bool copied = await SetClipboardWithRetryAsync(contentToSend);
+                if (!copied)
+                {
+                    Log("❌ [SendVerify] 设置剪贴板失败");
+                    return false;
+                }
+
+                try { await Task.Delay(100, token); } catch (OperationCanceledException) { return false; }
             }
 
             IntPtr targetHwnd = GetForegroundWindow();
@@ -2388,10 +3378,47 @@ namespace moshushou
             if (!GetWindowRect(targetHwnd, out RECT rect)) return false;
 
             bool isWework = false;
+            string expectedGroupName = string.Empty;
             await Application.Current.Dispatcher.InvokeAsync(() =>
             {
-                if (_currentSelectedNode != null) isWework = "企业微信".Equals(_currentSelectedNode.Source);
+                if (_currentSelectedNode != null)
+                {
+                    isWework = "企业微信".Equals(_currentSelectedNode.Source);
+                    expectedGroupName = _currentSelectedNode.GroupName?.Trim() ?? string.Empty;
+                }
             });
+
+            // ------------------------------------------------------------
+            // 🚀 [安全加固] 在极速模式发送前，强制校验当前窗口标题是否匹配群名
+            // ------------------------------------------------------------
+            if (!string.IsNullOrWhiteSpace(expectedGroupName))
+            {
+                // [强制] 每次都校验，移除之前的跳过优化
+                Log($"🔍 [SendVerify] 正在校验群名: 预期='{expectedGroupName}'");
+                 
+                string currentTitle = await _screenshotHelper.GetWeChatWindowTitleTextAsync(targetHwnd, isWework);
+                 
+                bool isMatch = _screenshotHelper.IsFuzzyMatch(expectedGroupName, currentTitle);
+                if (!isMatch && !string.IsNullOrEmpty(currentTitle) && 
+                    (currentTitle.Contains(expectedGroupName) || expectedGroupName.Contains(currentTitle)))
+                {
+                    isMatch = true;
+                }
+
+                if (!isMatch)
+                {
+                    string msg = $"⚠️ [SendVerify] 校验失败: 预期'{expectedGroupName}' vs 实际'{currentTitle}'，本次发送终止";
+                    Log(msg);
+                    DebugLogManager.Log("SendVerify", msg);
+                    Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = msg);
+                    // 关键修复：禁止在发送函数内递归触发 SearchCurrentItemAsync，避免分段发送重入嵌套。
+                    return false;
+                }
+                else
+                {
+                    Log($"✅ [SendVerify] 窗口校验通过: {currentTitle}");
+                }
+            }
 
             int clickX = 0, clickY = 0;
             // ✅ Fix: 使用 YOLO 获取精准点击坐标，而不是硬编码
@@ -2412,13 +3439,22 @@ namespace moshushou
 
             // === 动作 A: 激活输入框并粘贴 ===
             await MouseHelper.HumanLikeClickAsync(clickX, clickY, 90);
-            await Task.Delay(35);
+            try { await Task.Delay(35, token); } catch (OperationCanceledException) { return false; }
+
+            // 自动发送文本前先清空输入框，避免残留内容叠加
+            if (_isAutoRunning && !isFile)
+            {
+                bool cleared = await ClearInputBoxBeforeAutoSendAsync(token);
+                if (!cleared)
+                {
+                    Log("⚠️ [SendVerify] 清空输入框未完全确认，继续发送流程");
+                }
+            }
 
             // 2. 粘贴
             SimulatePaste();
 
             Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = "⏳ 粘贴中... (等待渲染)");
-     
 
             // 再次检查窗口（防止粘贴期间窗口关了）
             if (!CheckWindowReady(targetHwnd, "验证粘贴")) return false;
@@ -2435,14 +3471,14 @@ namespace moshushou
 
             // 3. 【优化】移除发送前的 OCR 粘贴检测
             // 用户反馈该步骤拖慢速度且识别不准，直接跳过，依靠后续的“发送后验证”来确认
-            Log("🚀 [极速] 跳过粘贴OCR检测，准备直接发送...");
-            await Task.Delay(100); // 虽然跳过检测，还是留给 UI 极短的渲染反应时间，防止粘贴指令还没处理完就发了
+            Log("⚡ [极速] 已跳过粘贴内容检查(窗口已验证)，准备发送...");
+            try { await Task.Delay(100, token); } catch (OperationCanceledException) { return false; } // 留给 UI 极短渲染时间
 
             // === 动作 B: 执行发送 (双保险) ===
 
             // 再次点击输入框
             await MouseHelper.HumanLikeClickAsync(clickX, clickY, 80);
-            await Task.Delay(35);
+            try { await Task.Delay(35, token); } catch (OperationCanceledException) { return false; }
 
             bool skipEnter = false;
             // ✅ 新增：如果是企业微信发送文件，尝试处理“转为在线表格”弹窗
@@ -2454,11 +3490,13 @@ namespace moshushou
                 // OCR 查找 "使用原文件"
                 // OCR 查找 "使用原文件"
                 System.Drawing.Point? clickPoint = null;
-                for(int k=0; k<5; k++)
+                for (int k = 0; k < 5; k++)
                 {
+                    if (token.IsCancellationRequested) return false;
+
                     clickPoint = await _screenshotHelper.FindPopupTextPositionAsync(targetHwnd, "使用原文件");
                     if (clickPoint != null) break;
-                    await Task.Delay(300);
+                    try { await Task.Delay(300, token); } catch (OperationCanceledException) { return false; }
                 }
 
                 if (clickPoint != null)
@@ -2483,7 +3521,7 @@ namespace moshushou
                 // 方案 1: Alt + S
                 SimulateAltS();
                 Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = "✉️ 发送指令 (Alt+S)...");
-                await Task.Delay(300);
+                try { await Task.Delay(300, token); } catch (OperationCanceledException) { return false; }
 
                 // 方案 2: Enter (补刀)
                 SimulateEnter();
@@ -2491,7 +3529,7 @@ namespace moshushou
             }
             else
             {
-                await Task.Delay(400); // 弹窗点击后，给予更长的上传缓冲时间
+                try { await Task.Delay(400, token); } catch (OperationCanceledException) { return false; } // 弹窗点击后缓冲
             }
 
             // ============================================================
@@ -2501,7 +3539,8 @@ namespace moshushou
 
             for (int round = 0; round < MAX_VERIFY_ROUNDS; round++)
             {
-                await Task.Delay(200); // 等待 UI 渲染
+                try { await Task.Delay(200, token); } catch (OperationCanceledException) { return false; } // 等待 UI 渲染
+                if (token.IsCancellationRequested) return false;
 
                 // 检查窗口焦点：焦点丢失视为发送失败，要求严格验证
                 IntPtr currentForeground = GetForegroundWindow();
@@ -2512,10 +3551,38 @@ namespace moshushou
                 }
 
                 // 调用 YOLO 精准验证（内部快速截取3屏）
-                var verifyResult = await _screenshotHelper.VerifySendWithYoloAsync(targetHwnd, isWework, keyword);
+                var verifyResult = await _screenshotHelper.VerifySendWithYoloAsync(targetHwnd, isWework, keyword, token);
+                if (token.IsCancellationRequested || string.Equals(verifyResult.verifyMethod, "已取消", StringComparison.Ordinal))
+                {
+                    return false;
+                }
 
                 if (verifyResult.success)
                 {
+                    if (!string.IsNullOrWhiteSpace(expectedGroupName))
+                    {
+                        string finalTitle = await _screenshotHelper.GetWeChatWindowTitleTextAsync(targetHwnd, isWework);
+                        bool titleMatched = _screenshotHelper.IsFuzzyMatch(expectedGroupName, finalTitle);
+                        if (!titleMatched && !string.IsNullOrWhiteSpace(finalTitle))
+                        {
+                            titleMatched = finalTitle.Contains(expectedGroupName, StringComparison.OrdinalIgnoreCase)
+                                           || expectedGroupName.Contains(finalTitle, StringComparison.OrdinalIgnoreCase);
+                        }
+
+                        if (!titleMatched)
+                        {
+                            string mismatchMsg = $"❌ [SendVerify] 发送后群标题校验失败: 预期='{expectedGroupName}', 实际='{finalTitle}'，标记失败并重试搜索";
+                            Log(mismatchMsg);
+                            DebugLogManager.Log("SendVerify", mismatchMsg);
+                            Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = mismatchMsg);
+                            return false;
+                        }
+
+                        string postOkMsg = $"✅ [SendVerify] 发送后群标题二次校验通过: {finalTitle}";
+                        Log(postOkMsg);
+                        DebugLogManager.Log("SendVerify", postOkMsg);
+                    }
+
                     Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = $"✅ [{verifyResult.verifyMethod}] 发送成功。");
                     return true;
                 }
@@ -2526,7 +3593,7 @@ namespace moshushou
                     Log($"⚠️ 第{round + 1}轮验证未通过，补刀重试...");
                     Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = $"⚠️ 第{round + 1}轮未通过，补刀Enter重试...");
                     await MouseHelper.HumanLikeClickAsync(clickX, clickY, 80);
-                    await Task.Delay(35);
+                    try { await Task.Delay(35, token); } catch (OperationCanceledException) { return false; }
                     SimulateEnter();
                 }
             }
@@ -2535,9 +3602,34 @@ namespace moshushou
             Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = $"❌ [YOLO验证] 发送失败: 未检测到发送内容。");
             return false;
         }
+        private async Task<bool> ClearInputBoxBeforeAutoSendAsync(CancellationToken token = default)
+        {
+            const int clearDelayMs = 8;
 
+            try
+            {
+                _inputSimulator.Keyboard.ModifiedKeyStroke(VirtualKeyCode.CONTROL, VirtualKeyCode.VK_A);
+                await Task.Delay(clearDelayMs, token);
+                _inputSimulator.Keyboard.KeyPress(VirtualKeyCode.BACK);
+                await Task.Delay(clearDelayMs, token);
 
-
+                // 二次清空：兼容输入法/富文本偶发未全清的情况
+                _inputSimulator.Keyboard.ModifiedKeyStroke(VirtualKeyCode.CONTROL, VirtualKeyCode.VK_A);
+                await Task.Delay(clearDelayMs, token);
+                _inputSimulator.Keyboard.KeyPress(VirtualKeyCode.DELETE);
+                await Task.Delay(clearDelayMs, token);
+                return true;
+            }
+            catch (OperationCanceledException)
+            {
+                return false;
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[SendVerify] 清空输入框异常: {ex.Message}");
+                return false;
+            }
+        }
 
         private void SimulateEnter()
         {
@@ -2574,8 +3666,64 @@ namespace moshushou
             FocusAndSelectItem(selectedNode);
         }
 
+        private bool IsSelectableNode(TreeViewNode? node)
+        {
+            return node != null && !string.IsNullOrEmpty(node.StoreName) && node.StoreName != "FAIL_SEPARATOR";
+        }
+
+        private int FindBestSelectionIndex(int preferredIndex)
+        {
+            if (_flatNodeList.Count == 0)
+            {
+                return -1;
+            }
+
+            int start = preferredIndex;
+            if (start < 0) start = 0;
+            if (start >= _flatNodeList.Count) start = _flatNodeList.Count - 1;
+
+            if (IsSelectableNode(_flatNodeList[start]))
+            {
+                return start;
+            }
+
+            for (int i = start + 1; i < _flatNodeList.Count; i++)
+            {
+                if (IsSelectableNode(_flatNodeList[i]))
+                {
+                    return i;
+                }
+            }
+
+            for (int i = start - 1; i >= 0; i--)
+            {
+                if (IsSelectableNode(_flatNodeList[i]))
+                {
+                    return i;
+                }
+            }
+
+            // 兜底：全是分隔符时至少选中一个可见项，而不是置空
+            return start;
+        }
+
+        private bool SelectBestNode(int preferredIndex)
+        {
+            int index = FindBestSelectionIndex(preferredIndex);
+            if (index < 0 || index >= _flatNodeList.Count)
+            {
+                return false;
+            }
+
+            _currentSelectedIndex = index;
+            var node = _flatNodeList[index];
+            FocusAndSelectItem(node);
+            _currentSelectedNode = node;
+            return true;
+        }
+
         /// <summary>
-        /// 自动化专用：前进到下一项；如果已经到达末尾则返回 false，并清空当前选中。
+        /// 自动化专用：前进到下一项；如果已经到达末尾则返回 false，并保留一个合适的选中项。
         /// </summary>
         private bool TryNavigateToNextNodeForAuto()
         {
@@ -2605,16 +3753,31 @@ namespace moshushou
 
             if (nextIndex < 0 || nextIndex >= _flatNodeList.Count)
             {
-                _currentSelectedIndex = _flatNodeList.Count;
-                _currentSelectedNode = null;
-                ClearAllTreeViewSelections();
+                SelectBestNode(_flatNodeList.Count - 1);
                 return false;
             }
 
-            _currentSelectedIndex = nextIndex;
-            var nextNode = _flatNodeList[nextIndex];
-            FocusAndSelectItem(nextNode);
-            return true;
+            for (int i = nextIndex; i < _flatNodeList.Count; i++)
+            {
+                var node = _flatNodeList[i];
+                if (!IsSelectableNode(node))
+                {
+                    continue;
+                }
+
+                if (IsStoreMarkedSent(node.StoreName))
+                {
+                    continue;
+                }
+
+                _currentSelectedIndex = i;
+                FocusAndSelectItem(node);
+                _currentSelectedNode = node;
+                return true;
+            }
+
+            SelectBestNode(_flatNodeList.Count - 1);
+            return false;
         }
 
         /// <summary>
@@ -2782,7 +3945,9 @@ namespace moshushou
         {
             if (string.IsNullOrEmpty(node.StoreName)) return;
 
-            if (_isAutoRunning || Volatile.Read(ref _clipboardSearchGuard) > 0)
+            if (_isAutoRunning ||
+                Volatile.Read(ref _clipboardSearchGuard) > 0 ||
+                Volatile.Read(ref _selectionCopyGuard) > 0)
             {
                 return;
             }
@@ -2791,15 +3956,8 @@ namespace moshushou
             ResetSearchState();
 
             if (Interlocked.CompareExchange(ref _copyingFlag, 1, 0) == 1) return;
-
-            if (node.IsFileNode)
-            {
-                CopyStoreNameOnly(node.StoreName);
-            }
-            else
-            {
-                CopyFullStoreInfoToClipboard(node.StoreName);
-            }
+            // 主列表统一只复制商家名
+            CopyStoreNameOnly(node.StoreName);
         }
 
         private void PasteCurrentStoreName()
@@ -2815,10 +3973,6 @@ namespace moshushou
                 {
                     string storeName = _currentSelectedNode.StoreName;
                     string displayStoreName = storeName;
-                    if (TryParseCustomStoreKey(storeName, out var parsedStoreName, out _))
-                    {
-                        displayStoreName = parsedStoreName;
-                    }
 
                     if (await SetClipboardWithRetryAsync(displayStoreName))
                     {
@@ -2849,13 +4003,18 @@ namespace moshushou
                 return;
             }
             string storeName = _currentSelectedNode.StoreName;
-            if (_currentSelectedNode.IsFileNode)
+            bool isWework = "企业微信".Equals(_currentSelectedNode?.Source);
+            switch (_currentSelectedNode.Strategy)
             {
-                PasteExcelFile(storeName);
-            }
-            else
-            {
-                PasteFullStoreInfo(storeName);
+                case SendStrategy.FileExcel:
+                    PasteExcelFile(storeName);
+                    break;
+                case SendStrategy.TextSegmented:
+                    _ = PasteStoreInfoInSegmentsAsync(storeName, isWework);
+                    break;
+                default:
+                    PasteFullStoreInfo(storeName);
+                    break;
             }
         }
 
@@ -2864,12 +4023,13 @@ namespace moshushou
 
         // MainWindow.xaml.cs
 
-        private async Task<bool> PasteExcelFileAsync(string storeName, bool isWework)
+        private async Task<bool> PasteExcelFileAsync(string storeName, bool isWework, CancellationToken token = default)
         {
             Action<string> Log = (msg) => System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [粘贴文件] {msg}");
             Log($"开始处理文件: {storeName}, isWework: {isWework}");
 
             if (string.IsNullOrEmpty(storeName)) return false;
+            if (token.IsCancellationRequested) return false;
 
             IntPtr targetHwnd = GetForegroundWindow();
             Log($"当前窗口句柄: {targetHwnd}");
@@ -2892,10 +4052,6 @@ namespace moshushou
             }
             bool shouldAppendFixedMessage = payloadMode == StorePayloadMode.Normal;
             string displayStoreName = storeName;
-            if (TryParseCustomStoreKey(storeName, out var parsedStore, out _))
-            {
-                displayStoreName = parsedStore;
-            }
             Log($"[MODE] payloadMode={payloadMode}, shouldAppendFixedMessage={shouldAppendFixedMessage}");
 
             // 剪贴板
@@ -2913,15 +4069,17 @@ namespace moshushou
             }
             Log("剪贴板就绪");
 
-            await Task.Delay(50);
+            try { await Task.Delay(50, token); } catch (OperationCanceledException) { return false; }
 
             var innerTask = await Application.Current.Dispatcher.InvokeAsync(async () =>
             {
+                if (token.IsCancellationRequested) return false;
+
                 if (targetHwnd != GetForegroundWindow())
                 {
                     Log("⚠️ 窗口失焦，抢回焦点...");
                     RobustActivateWindow(targetHwnd);
-                    await Task.Delay(50);
+                    try { await Task.Delay(50, token); } catch (OperationCanceledException) { return false; }
                 }
 
                 var inputRes = await _screenshotHelper.GetInputBoxClickCoordinatesAsync(targetHwnd, isWework);
@@ -2931,7 +4089,7 @@ namespace moshushou
                     int clickY = inputRes.y;
                     Log($"点击坐标: ({clickX}, {clickY})");
                     await MouseHelper.HumanLikeClickAsync(clickX, clickY, 85);
-                    await Task.Delay(35);
+                    try { await Task.Delay(35, token); } catch (OperationCanceledException) { return false; }
                 }
                 else
                 {
@@ -2943,33 +4101,24 @@ namespace moshushou
                 if (AutoSendCheckBox.IsChecked == true || _isAutoRunning)
                 {
                     Log("执行自动发送...");
-                    result = await PasteAndVerifySendAsync(filePath, true);
+                    result = await PasteAndVerifySendAsync(filePath, true, token);
                     if (result)
                     {
                         _currentItemPasted = true;
                         _lastPastedStoreName = storeName;
+                        MarkStoreAsSent(storeName);
                         StatusTextBlock.Text = $"✅ [自动] 已发送文件: {displayStoreName}";
                         Log("✅ 发送成功");
 
                         // 仅普通未发货模式追加固定话术
                         if (shouldAppendFixedMessage)
                         {
-                            await Task.Delay(200); 
+                            try { await Task.Delay(200, token); } catch (OperationCanceledException) { return false; }
                             Log("➕ 追加发送未发货预警...");
                             StatusTextBlock.Text += " + 正在追加预警...";
-                            await PasteAndVerifySendAsync(_searchConfig.FixedMessage, false);
+                            await PasteAndVerifySendAsync(_searchConfig.FixedMessage, false, token);
                         }
-                        // ✅ 自定义话术模式：发送文件后追加发送 B 列话术
-                        else if (payloadMode == StorePayloadMode.CustomMessage)
-                        {
-                            if (TryParseCustomStoreKey(storeName, out _, out var customMessage) && !string.IsNullOrWhiteSpace(customMessage))
-                            {
-                                await Task.Delay(200);
-                                Log($"➕ 追加发送自定义话术: {customMessage}");
-                                StatusTextBlock.Text += " + 正在追加话术...";
-                                await PasteAndVerifySendAsync(customMessage, false);
-                            }
-                        }
+                        // ✅ [重构] 自定义话术模式不再走文件发送路径，已废弃此分支
                     }
                     else Log("❌ 发送失败");
                 }
@@ -3011,12 +4160,13 @@ namespace moshushou
 
         // MainWindow.xaml.cs
 
-        private async Task<bool> PasteFullStoreInfoAsync(string storeName, bool isWework)
+        private async Task<bool> PasteFullStoreInfoAsync(string storeName, bool isWework, CancellationToken token = default)
         {
             Action<string> Log = (msg) => System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [粘贴文本] {msg}");
             Log($"开始处理商家: {storeName}, isWework: {isWework}");
 
             if (string.IsNullOrEmpty(storeName)) return false;
+            if (token.IsCancellationRequested) return false;
 
             // 1. 窗口检查
             IntPtr targetHwnd = GetForegroundWindow();
@@ -3044,10 +4194,6 @@ namespace moshushou
             bool isCustomMode = payloadMode == StorePayloadMode.CustomMessage;
             bool isIssueMode = payloadMode == StorePayloadMode.Issue;
             string displayStoreName = storeName;
-            if (TryParseCustomStoreKey(storeName, out var parsedStore, out _))
-            {
-                displayStoreName = parsedStore;
-            }
 
             var sb = new StringBuilder();
             
@@ -3078,17 +4224,19 @@ namespace moshushou
             }
             Log("剪贴板设置成功");
 
-            await Task.Delay(50);
+            try { await Task.Delay(50, token); } catch (OperationCanceledException) { return false; }
 
             // 4. UI线程操作
             var innerTask = await Application.Current.Dispatcher.InvokeAsync(async () =>
             {
+                if (token.IsCancellationRequested) return false;
+
                 // 焦点复查
                 if (targetHwnd != GetForegroundWindow())
                 {
                     Log($"⚠️ 窗口失焦 (当前: {GetForegroundWindow()})，尝试抢回...");
                     RobustActivateWindow(targetHwnd);
-                    await Task.Delay(50);
+                    try { await Task.Delay(50, token); } catch (OperationCanceledException) { return false; }
                 }
 
                 // 5. 坐标计算与点击
@@ -3101,7 +4249,7 @@ namespace moshushou
                     int clickY = inputRes.y;
                     Log($"执行鼠标点击: ({clickX}, {clickY})");
                     await MouseHelper.HumanLikeClickAsync(clickX, clickY, 85);
-                    await Task.Delay(35);
+                    try { await Task.Delay(35, token); } catch (OperationCanceledException) { return false; }
                 }
                 else
                 {
@@ -3115,11 +4263,12 @@ namespace moshushou
                 {
                     Log("模式: 自动发送");
                     // 注意：PasteAndVerifySendAsync 内部日志未在此处展示，需确保该函数也正常
-                    result = await PasteAndVerifySendAsync(fullText, false);
+                    result = await PasteAndVerifySendAsync(fullText, false, token);
                     if (result)
                     {
                         _currentItemPasted = true;
                         _lastPastedStoreName = storeName;
+                        MarkStoreAsSent(storeName);
                         StatusTextBlock.Text = $"✅ [自动] 已发送: {displayStoreName}";
                         Log("✅ 发送流程完成 (PasteAndVerifySendAsync 返回 true)");
                     }
@@ -3158,6 +4307,605 @@ namespace moshushou
             bool isWework = "企业微信".Equals(_currentSelectedNode?.Source);
             _ = PasteFullStoreInfoAsync(storeName, isWework);
         }
+
+        /// <summary>
+        /// ✅ [重构] 分段发送商家信息（支持中断和断点续传）
+        /// 将数据按 SegmentSize 分段，逐段粘贴发送。如果失败或中断，保留未发送的数据。
+        /// </summary>
+        private async Task<bool> PasteStoreInfoInSegmentsAsync(string storeName, bool isWework, CancellationToken token = default, bool isAutoMode = false)
+        {
+            Action<string> Log = (msg) =>
+            {
+                System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [分段发送] {msg}");
+                DebugLogManager.Log("分段发送", msg);
+            };
+            Log($"开始分段发送: {storeName}, isWework: {isWework}");
+
+            if (string.IsNullOrEmpty(storeName)) return false;
+
+            // 1. 获取数据 (复制)
+            List<string> trackingNumbers;
+            lock (_dataLock)
+            {
+                if (!_storeData.TryGetValue(storeName, out trackingNumbers))
+                {
+                    Log("❌ 未找到商家数据");
+                    return false;
+                }
+                trackingNumbers = trackingNumbers.ToList();
+            }
+
+            int segmentSize = Math.Max(1, _searchConfig.SegmentSize);
+            int totalSegments = (int)Math.Ceiling((double)trackingNumbers.Count / segmentSize);
+            Log($"共 {trackingNumbers.Count} 条，分 {totalSegments} 段，每段 {segmentSize} 条");
+
+            if (totalSegments <= 0)
+            {
+                ClearSegmentFailureInfo(storeName);
+                return true;
+            }
+
+            int startSegmentIndex = 0;
+            int sentCount = 0;
+            if (TryGetSegmentFailureInfo(storeName, out var resumeInfo) && resumeInfo != null)
+            {
+                int resumeFrom = Math.Max(0, Math.Min(totalSegments - 1, resumeInfo.FailedSegment - 1));
+                int sentSegmentsFromState = Math.Max(0, Math.Min(resumeInfo.SentSegments, totalSegments));
+                int sentItemsFromState = Math.Max(0, Math.Min(resumeInfo.SentItems, trackingNumbers.Count));
+                bool hasResumeState =
+                    resumeInfo.FailedSegment > 1 ||
+                    sentSegmentsFromState > 0 ||
+                    sentItemsFromState > 0;
+
+                if (hasResumeState)
+                {
+                    startSegmentIndex = resumeFrom;
+                    int bySegmentCount = Math.Max(0, Math.Min(trackingNumbers.Count, startSegmentIndex * segmentSize));
+                    sentCount = Math.Max(bySegmentCount, sentItemsFromState);
+
+                    Log($"♻️ 检测到断点进度：从第 {startSegmentIndex + 1}/{totalSegments} 段继续，已发送 {sentCount}/{trackingNumbers.Count} 条");
+                    UpdateSegmentProgressVisual(
+                        storeName,
+                        sentSegments: startSegmentIndex,
+                        totalSegments: totalSegments,
+                        sentItems: sentCount,
+                        totalItems: trackingNumbers.Count,
+                        reason: "发送中(断点续发)");
+                }
+            }
+
+            try
+            {
+                for (int i = startSegmentIndex; i < totalSegments; i++)
+                {
+                    int segNum = i + 1;
+
+                    // ✅ 支持中断 (F2 按 ESC 或 token)
+                    bool isEscPressed = false;
+                    // 仅在手动模式下(token为None)检查键盘
+                    // ✅ [FIX] 使用全局API检测 ESC，解决窗口失焦无法停止的问题
+                    if (token == CancellationToken.None)
+                    {
+                         isEscPressed = MouseHelper.IsEscPressed();
+                    }
+                    
+                    if (token.IsCancellationRequested || isEscPressed)
+                    {
+                        Log("🛑 用户中止发送");
+                        Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = "🛑 发送已中止，剩余片段已保留");
+                        await HandlePartialFailure(
+                            storeName,
+                            sentCount,
+                            sentSegments: segNum - 1,
+                            failedSegment: segNum,
+                            totalSegments: totalSegments,
+                            totalItems: trackingNumbers.Count,
+                            reason: "用户停止(F2/ESC)",
+                            moveToRetryArea: !isAutoMode);
+                        return false;
+                    }
+
+                    int startIdx = i * segmentSize;
+                    var segmentItems = trackingNumbers.Skip(startIdx).Take(segmentSize).ToList();
+                    string segmentContent = string.Join("\n", segmentItems);
+
+                    Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = $"📤 正在发送第 {segNum}/{totalSegments} 段 ({segmentItems.Count} 条)...");
+
+                    // 发送 (调用统一发送方法，自带校验)
+                    // 注意：这里我们传入 forceSkipCheck=false，确保每段都校验窗口（尽管会有性能损耗，但符合用户“不允许跳过”的要求）
+                    bool success = await PasteAndVerifySendAsync(segmentContent, false, token);
+                    
+                    if (!success)
+                    {
+                        Log($"❌ 第 {segNum} 段发送失败");
+                        Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = $"❌ 第 {segNum} 段发送失败，剩余已保留到列表末尾");
+                        await HandlePartialFailure(
+                            storeName,
+                            sentCount,
+                            sentSegments: segNum - 1,
+                            failedSegment: segNum,
+                            totalSegments: totalSegments,
+                            totalItems: trackingNumbers.Count,
+                            reason: "发送失败",
+                            moveToRetryArea: !isAutoMode);
+                        return false;
+                    }
+
+                    sentCount += segmentItems.Count;
+                    UpdateSegmentProgressVisual(
+                        storeName,
+                        sentSegments: segNum,
+                        totalSegments: totalSegments,
+                        sentItems: sentCount,
+                        totalItems: trackingNumbers.Count);
+                    
+                    // Delay
+                    if (i < totalSegments - 1)
+                    {
+                        try
+                        {
+                            await Task.Delay(_searchConfig.SegmentDelayMs, token);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            int nextSeg = Math.Min(totalSegments, segNum + 1);
+                            await HandlePartialFailure(
+                                storeName,
+                                sentCount,
+                                sentSegments: segNum,
+                                failedSegment: nextSeg,
+                                totalSegments: totalSegments,
+                                totalItems: trackingNumbers.Count,
+                                reason: "用户停止(F2/ESC)",
+                                moveToRetryArea: !isAutoMode);
+                            return false;
+                        }
+                    }
+                }
+
+                Log("✅ 分段发送完成");
+                UpdateSegmentProgressVisual(
+                    storeName,
+                    sentSegments: totalSegments,
+                    totalSegments: totalSegments,
+                    sentItems: trackingNumbers.Count,
+                    totalItems: trackingNumbers.Count,
+                    reason: "发送完成");
+                await Application.Current.Dispatcher.InvokeAsync(() => SaveFileState());
+                _currentItemPasted = true;
+                _lastPastedStoreName = storeName;
+                MarkStoreAsSent(storeName);
+                Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = $"✅ 分段发送完成: {storeName}");
+                return true;
+            }
+            catch (OperationCanceledException)
+            {
+                int sentSegments = Math.Min(totalSegments, (int)Math.Ceiling((double)sentCount / segmentSize));
+                int failedSegment = Math.Min(totalSegments, sentSegments + 1);
+                await HandlePartialFailure(
+                    storeName,
+                    sentCount,
+                    sentSegments: sentSegments,
+                    failedSegment: failedSegment,
+                    totalSegments: totalSegments,
+                    totalItems: trackingNumbers.Count,
+                    reason: "用户停止(F2/ESC)",
+                    moveToRetryArea: !isAutoMode);
+                return false;
+            }
+            catch (Exception ex)
+            {
+                Log($"💥 异常: {ex.Message}");
+                int sentSegments = Math.Min(totalSegments, (int)Math.Ceiling((double)sentCount / segmentSize));
+                int failedSegment = Math.Min(totalSegments, sentSegments + 1);
+                await HandlePartialFailure(
+                    storeName,
+                    sentCount,
+                    sentSegments: sentSegments,
+                    failedSegment: failedSegment,
+                    totalSegments: totalSegments,
+                    totalItems: trackingNumbers.Count,
+                    reason: "异常中断",
+                    moveToRetryArea: !isAutoMode);
+                return false;
+            }
+        }
+
+        // 辅助：处理部分失败，记录失败进度，并按需要移动到失败列表
+        private async Task HandlePartialFailure(
+            string storeName,
+            int sentCount,
+            int sentSegments,
+            int failedSegment,
+            int totalSegments,
+            int totalItems,
+            string reason,
+            bool moveToRetryArea)
+        {
+            if (string.IsNullOrWhiteSpace(storeName))
+            {
+                return;
+            }
+
+            int safeTotalSegments = Math.Max(1, totalSegments);
+            int safeSentSegments = Math.Max(0, Math.Min(sentSegments, safeTotalSegments));
+            int safeFailedSegment = Math.Max(1, Math.Min(failedSegment, safeTotalSegments));
+            int safeSentItems = Math.Max(0, Math.Min(sentCount, totalItems));
+            int safeTotalItems = Math.Max(0, totalItems);
+            string safeReason = string.IsNullOrWhiteSpace(reason) ? "发送失败" : reason.Trim();
+
+            DebugLogManager.Log(
+                "分段异常",
+                $"商家={storeName}, 失败段={safeFailedSegment}/{safeTotalSegments}, 已发送段={safeSentSegments}, 已发送条数={safeSentItems}/{safeTotalItems}, 原因={safeReason}");
+
+            lock (_segmentFailureLock)
+            {
+                _segmentFailureInfos[storeName] = new SegmentFailureInfo
+                {
+                    FailedSegment = safeFailedSegment,
+                    TotalSegments = safeTotalSegments,
+                    SentSegments = safeSentSegments,
+                    SentItems = safeSentItems,
+                    TotalItems = safeTotalItems,
+                    Reason = safeReason
+                };
+            }
+
+            if (moveToRetryArea)
+            {
+                int preferredIndex = _currentSelectedIndex;
+
+                if (!_failedStores.Contains(storeName))
+                {
+                    _failedStores.Add(storeName);
+                }
+
+                await Application.Current.Dispatcher.InvokeAsync(() =>
+                {
+                    SaveFileState();
+                    ProcessAndDisplayData();
+                    SelectBestNode(preferredIndex);
+                });
+            }
+            else
+            {
+                await Application.Current.Dispatcher.InvokeAsync(() =>
+                {
+                    if (_currentSelectedNode != null &&
+                        string.Equals(_currentSelectedNode.StoreName, storeName, StringComparison.Ordinal) &&
+                        _currentSelectedNode.Strategy == SendStrategy.TextSegmented)
+                    {
+                        ApplySegmentFailureProgressToNode(_currentSelectedNode);
+                    }
+                });
+            }
+        }
+
+        private void ClearSegmentFailureInfo(string storeName)
+        {
+            if (string.IsNullOrWhiteSpace(storeName))
+            {
+                return;
+            }
+
+            lock (_segmentFailureLock)
+            {
+                _segmentFailureInfos.Remove(storeName);
+            }
+        }
+
+        private bool TryGetSegmentFailureInfo(string storeName, out SegmentFailureInfo? info)
+        {
+            lock (_segmentFailureLock)
+            {
+                return _segmentFailureInfos.TryGetValue(storeName, out info);
+            }
+        }
+
+        private bool IsStoreMarkedSent(string storeName)
+        {
+            if (string.IsNullOrWhiteSpace(storeName))
+            {
+                return false;
+            }
+
+            lock (_sentStoreLock)
+            {
+                return _sentStores.Contains(storeName);
+            }
+        }
+
+        private void MarkStoreAsSent(string storeName)
+        {
+            if (string.IsNullOrWhiteSpace(storeName))
+            {
+                return;
+            }
+
+            ClearStoreSentMark(storeName);
+
+            lock (_sentStoreLock)
+            {
+                _sentStores.Add(storeName);
+            }
+
+            RefreshStoreNodeHeader(storeName);
+        }
+
+        private void ClearStoreSentMark(string storeName, bool refreshHeader = false)
+        {
+            if (string.IsNullOrWhiteSpace(storeName))
+            {
+                return;
+            }
+
+            lock (_sentStoreLock)
+            {
+                _sentStores.Remove(storeName);
+            }
+
+            if (refreshHeader)
+            {
+                RefreshStoreNodeHeader(storeName);
+            }
+        }
+
+        private string BuildStoreHeaderText(string storeName, int itemCount, SendStrategy strategy)
+        {
+            string prefix = string.Empty;
+            if (_manualReviewStores.Contains(storeName))
+            {
+                prefix = "❌ [需人工] ";
+            }
+
+            if (strategy == SendStrategy.TextSegmented &&
+                TryGetSegmentFailureInfo(storeName, out var segmentFailureInfo) &&
+                segmentFailureInfo != null)
+            {
+                int segmentSize = Math.Max(1, _searchConfig.SegmentSize);
+                int totalSegments = itemCount > 0
+                    ? (int)Math.Ceiling((double)itemCount / segmentSize)
+                    : 0;
+                prefix += BuildSegmentProgressPrefix(segmentFailureInfo, totalSegments);
+            }
+
+            return $"{prefix}{storeName} ({itemCount}条)";
+        }
+
+        private void RefreshStoreNodeHeader(string storeName)
+        {
+            if (string.IsNullOrWhiteSpace(storeName))
+            {
+                return;
+            }
+
+            void RefreshAction()
+            {
+                if (StoreTreeView.ItemsSource is not IEnumerable<TreeViewNode> nodes)
+                {
+                    return;
+                }
+
+                var targetNode = nodes.FirstOrDefault(n => n.StoreName == storeName);
+                if (targetNode == null)
+                {
+                    return;
+                }
+
+                RefreshStoreNodeHeader(targetNode);
+            }
+
+            if (Application.Current?.Dispatcher == null)
+            {
+                return;
+            }
+
+            if (Application.Current.Dispatcher.CheckAccess())
+            {
+                RefreshAction();
+            }
+            else
+            {
+                Application.Current.Dispatcher.Invoke(RefreshAction);
+            }
+        }
+
+        private void RefreshStoreNodeHeader(TreeViewNode node)
+        {
+            if (node == null || string.IsNullOrWhiteSpace(node.StoreName) || node.StoreName == "FAIL_SEPARATOR")
+            {
+                return;
+            }
+
+            int itemCount = 0;
+            lock (_dataLock)
+            {
+                if (_storeData.TryGetValue(node.StoreName, out var rows))
+                {
+                    itemCount = rows.Count;
+                }
+            }
+
+            node.Header = BuildStoreHeaderText(node.StoreName, itemCount, node.Strategy);
+        }
+
+        private static bool IsSegmentSending(SegmentFailureInfo info)
+        {
+            return !string.IsNullOrWhiteSpace(info.Reason) &&
+                   info.Reason.Contains("发送中", StringComparison.Ordinal);
+        }
+
+        private static bool IsSegmentCompleted(SegmentFailureInfo info, int totalSegments)
+        {
+            int safeTotal = Math.Max(1, totalSegments > 0 ? totalSegments : info.TotalSegments);
+            int safeSent = Math.Max(0, Math.Min(info.SentSegments, safeTotal));
+            bool reasonCompleted = !string.IsNullOrWhiteSpace(info.Reason) &&
+                                   info.Reason.Contains("发送完成", StringComparison.Ordinal);
+            return reasonCompleted || safeSent >= safeTotal;
+        }
+
+        private string BuildSegmentProgressPrefix(SegmentFailureInfo info, int totalSegments)
+        {
+            int safeTotal = Math.Max(1, totalSegments);
+            if (IsSegmentCompleted(info, safeTotal))
+            {
+                return string.Empty;
+            }
+
+            if (IsSegmentSending(info))
+            {
+                int safeSent = Math.Max(0, Math.Min(info.SentSegments, safeTotal));
+                return $"⏳ [分段进度 {safeSent}/{safeTotal}] ";
+            }
+
+            return "⚠️ [分段异常] ";
+        }
+
+        private static string BuildSegmentChildLabel(int segmentNumber, int totalSegments, int itemCount, SegmentFailureInfo? info)
+        {
+            string baseText = $"第 {segmentNumber}/{totalSegments} 段 (共 {itemCount} 条) - 点击复制此段";
+            if (info == null)
+            {
+                return $"📄 {baseText}";
+            }
+
+            int safeTotal = Math.Max(1, totalSegments);
+            if (IsSegmentCompleted(info, safeTotal))
+            {
+                return $"✅ {baseText}";
+            }
+
+            if (IsSegmentSending(info))
+            {
+                int sentSegments = Math.Max(0, Math.Min(info.SentSegments, safeTotal));
+                int nextSegment = Math.Min(safeTotal, sentSegments + 1);
+
+                if (segmentNumber <= sentSegments)
+                {
+                    return $"✅ {baseText}";
+                }
+
+                if (segmentNumber == nextSegment)
+                {
+                    return $"⏳ {baseText}";
+                }
+
+                return $"⏸ {baseText}";
+            }
+
+            if (segmentNumber < info.FailedSegment)
+            {
+                return $"✅ {baseText}";
+            }
+
+            if (segmentNumber == info.FailedSegment)
+            {
+                return $"⚠️ {baseText}";
+            }
+
+            return $"⏸ {baseText}";
+        }
+
+        private void UpdateSegmentProgressVisual(string storeName, int sentSegments, int totalSegments, int sentItems, int totalItems, string reason = "发送中")
+        {
+            if (string.IsNullOrWhiteSpace(storeName))
+            {
+                return;
+            }
+
+            int safeTotalSegments = Math.Max(1, totalSegments);
+            int safeSentSegments = Math.Max(0, Math.Min(sentSegments, safeTotalSegments));
+            int nextSegment = Math.Max(1, Math.Min(safeTotalSegments, safeSentSegments + 1));
+            int safeTotalItems = Math.Max(0, totalItems);
+            int safeSentItems = Math.Max(0, Math.Min(sentItems, safeTotalItems));
+            string safeReason = string.IsNullOrWhiteSpace(reason) ? "发送中" : reason;
+
+            lock (_segmentFailureLock)
+            {
+                _segmentFailureInfos[storeName] = new SegmentFailureInfo
+                {
+                    FailedSegment = nextSegment,
+                    TotalSegments = safeTotalSegments,
+                    SentSegments = safeSentSegments,
+                    SentItems = safeSentItems,
+                    TotalItems = safeTotalItems,
+                    Reason = safeReason
+                };
+            }
+
+            if (Application.Current?.Dispatcher == null)
+            {
+                return;
+            }
+
+            Action refreshAction = () =>
+            {
+                if (StoreTreeView.ItemsSource is not IEnumerable<TreeViewNode> nodes)
+                {
+                    return;
+                }
+
+                var targetNode = nodes.FirstOrDefault(n =>
+                    n != null &&
+                    string.Equals(n.StoreName, storeName, StringComparison.Ordinal) &&
+                    n.Strategy == SendStrategy.TextSegmented);
+
+                if (targetNode != null)
+                {
+                    ApplySegmentFailureProgressToNode(targetNode);
+                }
+            };
+
+            if (Application.Current.Dispatcher.CheckAccess())
+            {
+                refreshAction();
+            }
+            else
+            {
+                Application.Current.Dispatcher.Invoke(refreshAction);
+            }
+        }
+
+        private void ApplySegmentFailureProgressToNode(TreeViewNode node)
+        {
+            if (node == null || node.Strategy != SendStrategy.TextSegmented || string.IsNullOrWhiteSpace(node.StoreName))
+            {
+                return;
+            }
+
+            if (!TryGetSegmentFailureInfo(node.StoreName, out var info) || info == null)
+            {
+                return;
+            }
+
+            int totalSegments = Math.Max(1, node.Children.Count);
+            int itemCount = 0;
+            lock (_dataLock)
+            {
+                if (_storeData.TryGetValue(node.StoreName, out var rows))
+                {
+                    itemCount = rows.Count;
+                }
+            }
+
+            node.Header = BuildStoreHeaderText(node.StoreName, itemCount, node.Strategy);
+
+            for (int i = 0; i < node.Children.Count; i++)
+            {
+                var child = node.Children[i];
+                int childItemCount = child.RawData?
+                    .Split(new[] { "\r\n", "\n" }, StringSplitOptions.RemoveEmptyEntries)
+                    .Length ?? 0;
+                child.Text = BuildSegmentChildLabel(i + 1, totalSegments, childItemCount, info);
+            }
+        }
+
+
+
+
+
+
+
 
 
 
@@ -3267,6 +5015,8 @@ namespace moshushou
             // ✅ 清空运行时状态集合
             _failedStores.Clear();
             _manualReviewStores.Clear();
+            lock (_segmentFailureLock) { _segmentFailureInfos.Clear(); }
+            lock (_sentStoreLock) { _sentStores.Clear(); }
             
             // ✅ [Fix] 重置模式标志，确保每次加载文件时从干净状态开始
             _isIssueMode = false;
@@ -3436,6 +5186,7 @@ namespace moshushou
                             LastSelectedStoreName = "",
                             FailedStores = new List<string>(),
                             ManualReviewStores = new List<string>(),
+                            SegmentFailures = new List<SegmentFailureState>(),
                             DeletedStores = new List<string>(),
                             IsIssueMode = _isIssueMode,
                             IsCustomMessageMode = _isCustomMessageMode
@@ -3466,6 +5217,29 @@ namespace moshushou
                             foreach (var s in stateToRestore.FailedStores) _failedStores.Add(s);
                         if (stateToRestore.ManualReviewStores != null)
                             foreach (var s in stateToRestore.ManualReviewStores) _manualReviewStores.Add(s);
+                        if (stateToRestore.SegmentFailures != null)
+                        {
+                            lock (_segmentFailureLock)
+                            {
+                                foreach (var seg in stateToRestore.SegmentFailures)
+                                {
+                                    if (string.IsNullOrWhiteSpace(seg.StoreName))
+                                    {
+                                        continue;
+                                    }
+
+                                    _segmentFailureInfos[seg.StoreName] = new SegmentFailureInfo
+                                    {
+                                        FailedSegment = Math.Max(1, seg.FailedSegment),
+                                        TotalSegments = Math.Max(1, seg.TotalSegments),
+                                        SentSegments = Math.Max(0, seg.SentSegments),
+                                        SentItems = Math.Max(0, seg.SentItems),
+                                        TotalItems = Math.Max(0, seg.TotalItems),
+                                        Reason = string.IsNullOrWhiteSpace(seg.Reason) ? "发送失败" : seg.Reason
+                                    };
+                                }
+                            }
+                        }
                         System.Diagnostics.Debug.WriteLine($"[文件状态] 已恢复：重试区 {_failedStores.Count} 个，需人工 {_manualReviewStores.Count} 个");
                     }
 
@@ -3490,18 +5264,15 @@ namespace moshushou
                         }
                         else if (_isCustomMessageMode)
                         {
-                            // 🆕 自定义话术模式 (4列)
+                            // ✅ [重构] 自定义话术模式 (4列)
                             // 格式：运单号(1) | 话术(2) | 店铺(3) | 网点(4)
-                            string rawStoreName = GetSafeText(worksheet.Cells[row, 3].Value).Trim();
-                            string message = GetSafeText(worksheet.Cells[row, 2].Value).Trim();
+                            // 直接用商家名（第3列）分组，不再按话术拆分
+                            storeName = GetSafeText(worksheet.Cells[row, 3].Value).Trim();
 
-                            if (string.IsNullOrWhiteSpace(rawStoreName))
+                            if (string.IsNullOrWhiteSpace(storeName))
                             {
                                 continue;
                             }
-                            
-                            // ✅ Composite Key for Grouping: StoreName##Message
-                            storeName = BuildCustomStoreKey(rawStoreName, message);
                             
                             // 拼接完整行 (Tab分隔)
                             var parts = new List<string>();
@@ -3602,6 +5373,21 @@ namespace moshushou
             state.IsCustomMessageMode = _isCustomMessageMode;
             state.FailedStores = _failedStores.ToList();
             state.ManualReviewStores = _manualReviewStores.ToList();
+            lock (_segmentFailureLock)
+            {
+                state.SegmentFailures = _segmentFailureInfos
+                    .Select(kvp => new SegmentFailureState
+                    {
+                        StoreName = kvp.Key,
+                        FailedSegment = kvp.Value.FailedSegment,
+                        TotalSegments = kvp.Value.TotalSegments,
+                        SentSegments = kvp.Value.SentSegments,
+                        SentItems = kvp.Value.SentItems,
+                        TotalItems = kvp.Value.TotalItems,
+                        Reason = kvp.Value.Reason
+                    })
+                    .ToList();
+            }
             
             // 向后兼容：同步旧字段
             _searchConfig.LastSelectedStoreName = state.LastSelectedStoreName;
@@ -3639,12 +5425,7 @@ namespace moshushou
                 sortedStores = _storeData
                     .Select(kvp => 
                     {
-                        // ✅ [Fix Bug 1] Extract Real Store Name for Info Lookup
                         string realKey = kvp.Key;
-                        if (TryParseCustomStoreKey(kvp.Key, out var parsedStore, out _))
-                        {
-                            realKey = parsedStore;
-                        }
                         var info = infoMap.ContainsKey(realKey) ? infoMap[realKey] : null;
                         return new { Kvp = kvp, Info = info };
                     })
@@ -3695,26 +5476,29 @@ namespace moshushou
                 TreeViewNode CreateNode(string storeName, List<string> trackingNumbers)
                 {
                     var payloadMode = ResolveStorePayloadMode(storeName, trackingNumbers);
+                    var strategy = ResolveSendStrategy(payloadMode, trackingNumbers.Count);
+                    int itemCount = trackingNumbers.Count;
 
-                    // ✅ [Support Custom Message Mode] Extract real store name for display
+                    // ✅ [重构] 不再解析复合键，storeName 就是纯商家名
                     string displayStoreName = storeName;
-                    string customMessage = string.Empty;
-                    if (TryParseCustomStoreKey(storeName, out var parsedStore, out var parsedMessage))
-                    {
-                        displayStoreName = parsedStore;
-                        customMessage = parsedMessage?.Trim() ?? string.Empty;
-                    }
 
-                    // ✅ [修复] 检查是否在“需人工”名单中，持久化显示状态
-                    string prefix = _manualReviewStores.Contains(storeName) ? "❌ [需人工] " : "";
+                    SegmentFailureInfo? segmentFailureInfo = null;
+
+                    if (strategy == SendStrategy.TextSegmented &&
+                        TryGetSegmentFailureInfo(storeName, out var tmpFailureInfo) &&
+                        tmpFailureInfo != null)
+                    {
+                        segmentFailureInfo = tmpFailureInfo;
+                    }
 
                     var parentNode = new TreeViewNode
                     {
-                        Header = $"{prefix}{displayStoreName} ({trackingNumbers.Count}条)", // Use display name
-                        StoreName = storeName // Keep full key (with ##) for logic
+                        Header = BuildStoreHeaderText(storeName, itemCount, strategy),
+                        StoreName = storeName,
+                        Strategy = strategy
                     };
 
-                    // ✅ [Fix] Lookup Info using Real Store Name
+                    // 关联商家信息（群名、来源）
                     string lookupName = displayStoreName;
                     var busInfo = infoMap.ContainsKey(lookupName) ? infoMap[lookupName] : null;
                 if (busInfo != null)
@@ -3723,52 +5507,88 @@ namespace moshushou
                     parentNode.GroupName = busInfo.GroupName;
                 }
 
-                if (trackingNumbers.Count > 100)
+                switch (strategy)
                 {
-                    parentNode.IsFileNode = true;
-
-                    if (payloadMode == StorePayloadMode.CustomMessage && !string.IsNullOrWhiteSpace(customMessage))
-                    {
-                        string preview = TruncateWithEllipsis(customMessage, 36);
-                        parentNode.Children.Add(new TreeViewNode
+                    case SendStrategy.FileExcel:
+                        // 2列模式 >100条：保持 Excel 文件发送
+                        try
                         {
-                            Text = preview,
-                            RawData = customMessage
-                        });
-                    }
-
-                    try
-                    {
-                        string filePath = CreateExcelFile(storeName, trackingNumbers, _exportDirectory);
-                        lock (_dataLock) { _exportedFilePaths[storeName] = filePath; }
-                        parentNode.Children.Add(new TreeViewNode { Text = "(单击复制名称，拖拽可导出文件)" });
-                    }
-                    catch (Exception ex)
-                    {
-                        parentNode.Children.Add(new TreeViewNode { Text = $"(文件创建失败: {ex.Message})" });
-                    }
-                }
-                else
-                {
-                    parentNode.IsFileNode = false;
-                    foreach (var number in trackingNumbers)
-                    {
-                        // ✅ 适配显示：如果是问题件模式，内容太长，只截取第一段（运单号）显示
-                        string displayText = number;
-                        if (_isIssueMode && number.Contains("\t"))
-                        {
-                            var parts = number.Split('\t');
-                            if (parts.Length > 2)
-                            {
-                                displayText = $"{parts[0]} - {parts[2]}"; // 显示：运单号 - 原因
-                            }
-                            else
-                            {
-                                displayText = parts[0];
-                            }
+                            string filePath = CreateExcelFile(storeName, trackingNumbers, _exportDirectory);
+                            lock (_dataLock) { _exportedFilePaths[storeName] = filePath; }
+                            parentNode.Children.Add(new TreeViewNode 
+                            { 
+                                Text = "(单击复制名称，拖拽可导出文件)", 
+                                RawData = filePath,
+                                Strategy = SendStrategy.FileExcel,
+                                Source = parentNode.Source // 传递 Source
+                            });
                         }
-                        parentNode.Children.Add(new TreeViewNode { Text = displayText, RawData = number });
-                    }
+                        catch (Exception ex)
+                        {
+                            parentNode.Children.Add(new TreeViewNode { Text = $"(文件创建失败: {ex.Message})" });
+                        }
+                        break;
+
+                    case SendStrategy.TextSegmented:
+                        // ✅ [新功能] 分段显示子节点
+                        int segmentSize = Math.Max(1, _searchConfig.SegmentSize);
+                        int totalSegments = (int)Math.Ceiling((double)itemCount / segmentSize);
+                        
+                        for (int i = 0; i < totalSegments; i++)
+                        {
+                            int startIdx = i * segmentSize;
+                            int count = Math.Min(segmentSize, itemCount - startIdx);
+                            var segment = trackingNumbers.GetRange(startIdx, count);
+                            
+                            // 构建该段的完整文本
+                            var sb = new StringBuilder();
+                            foreach (var line in segment) sb.AppendLine(line);
+                            string segmentText = sb.ToString();
+
+                            parentNode.Children.Add(new TreeViewNode
+                            {
+                                Text = BuildSegmentChildLabel(i + 1, totalSegments, count, segmentFailureInfo),
+                                StoreName = storeName,
+                                RawData = segmentText, // ✅ 存入段数据
+                                Strategy = SendStrategy.TextDirect,
+                                Source = parentNode.Source // ✅ 传递 Source，确保点击子节点时能识别窗口类型
+                            });
+                        }
+
+                        break;
+
+                    default: // TextDirect
+                        // 全部展开显示
+                        foreach (var number in trackingNumbers)
+                        {
+                            string displayText = number;
+                            // 适配多列数据的显示
+                            if (number.Contains("\t"))
+                            {
+                                var parts = number.Split('\t');
+                                if (parts.Length > 0)
+                                {
+                                    string info = "";
+                                    if (parts.Length >= 2) info = parts[1];
+                                    if (_isIssueMode && parts.Length > 2) info = parts[2];
+                                    
+                                    displayText = string.IsNullOrEmpty(info) ? parts[0] : $"{parts[0]} - {info}";
+                                    
+                                    if (displayText.Length > 60)
+                                        displayText = displayText.Substring(0, 57) + "...";
+                                }
+                            }
+                            parentNode.Children.Add(new TreeViewNode 
+                            { 
+                                Text = displayText, 
+                                RawData = number, 
+                                StoreName = storeName,
+                                Strategy = SendStrategy.TextDirect,
+                                Source = parentNode.Source // ✅ 传递 Source
+                            });
+                        }
+
+                        break;
                 }
                 return parentNode;
             }
@@ -3811,12 +5631,6 @@ namespace moshushou
             var payloadMode = ResolveStorePayloadMode(storeName, trackingNumbers);
 
             string displayStoreName = storeName;
-            string customMessage = string.Empty;
-            if (TryParseCustomStoreKey(storeName, out var realStoreName, out var message))
-            {
-                displayStoreName = realStoreName;
-                customMessage = message;
-            }
 
             string safeFileName = string.Join("_", displayStoreName.Split(Path.GetInvalidFileNameChars())).Trim();
             if (string.IsNullOrWhiteSpace(safeFileName))
@@ -3836,34 +5650,12 @@ namespace moshushou
             int itemCount = trackingNumbers?.Count ?? 0;
             string countSuffix = $"(共{itemCount}条)";
 
-            string fileName;
-            if (payloadMode == StorePayloadMode.CustomMessage)
-            {
-                // ✅ 自定义话术模式：文件名使用"店铺名(共XX条)-话术"
-                string safeStorePart = SanitizeFileNamePart(displayStoreName, "未命名商家");
-                string safeMessagePart = SanitizeFileNamePart(customMessage, "");
-                
-                if (!string.IsNullOrWhiteSpace(safeMessagePart))
-                {
-                    // 完整格式：店铺名(共XX条)-话术
-                    string combined = $"{safeStorePart}{countSuffix}-{safeMessagePart}";
-                    fileName = TruncateWithEllipsis(combined, 120) + ".xlsx";
-                }
-                else
-                {
-                    // 无话术时仅用店铺名
-                    fileName = $"{safeStorePart}{countSuffix}.xlsx";
-                }
-            }
-            else
-            {
-                fileName = $"{safeFileName}{suffix}{countSuffix}.xlsx";
-            }
+            string fileName = $"{safeFileName}{suffix}{countSuffix}.xlsx";
 
             string filePath = Path.Combine(outputDir, fileName);
-            if (payloadMode == StorePayloadMode.CustomMessage)
+            // 避免同名文件冲突时覆盖
+            if (File.Exists(filePath))
             {
-                // 避免同话术文件名冲突时覆盖
                 string baseName = Path.GetFileNameWithoutExtension(fileName);
                 int seq = 2;
                 while (File.Exists(filePath))
@@ -4073,6 +5865,14 @@ namespace moshushou
                     // ✅ [修复] 同步清理所有状态，防止幽灵数据
                     _failedStores.Remove(storeName);
                     _manualReviewStores.Remove(storeName);
+                    lock (_segmentFailureLock)
+                    {
+                        _segmentFailureInfos.Remove(storeName);
+                    }
+                    lock (_sentStoreLock)
+                    {
+                        _sentStores.Remove(storeName);
+                    }
                 }
 
                 // ✅ 保存删除后的状态
@@ -4130,7 +5930,7 @@ namespace moshushou
                 if (Math.Abs(position.X - _startPoint.X) > SystemParameters.MinimumHorizontalDragDistance ||
                     Math.Abs(position.Y - _startPoint.Y) > SystemParameters.MinimumVerticalDragDistance)
                 {
-                    if (sender is FrameworkElement element && element.DataContext is TreeViewNode node && node.IsFileNode)
+                    if (sender is FrameworkElement element && element.DataContext is TreeViewNode node && node.Strategy == SendStrategy.FileExcel)
                     {
                         string filePath;
                         lock (_dataLock) { if (!_exportedFilePaths.TryGetValue(node.StoreName, out filePath)) return; }
@@ -4152,10 +5952,11 @@ namespace moshushou
             if (sender is TextBlock textBlock && !string.IsNullOrEmpty(textBlock.Text))
             {
                 string textToCopy = textBlock.Text.Trim();
+                TreeViewNode? boundNode = textBlock.DataContext as TreeViewNode;
                 // 如果 DataContext 有 RawData，优先复制 RawData（如：B列话术完整内容）
-                if (textBlock.DataContext is TreeViewNode node && !string.IsNullOrEmpty(node.RawData))
+                if (boundNode != null && !string.IsNullOrEmpty(boundNode.RawData))
                 {
-                    textToCopy = node.RawData;
+                    textToCopy = boundNode.RawData;
                 }
                 else if (textToCopy.StartsWith("(") && textToCopy.EndsWith(")"))
                 {
@@ -4172,9 +5973,17 @@ namespace moshushou
                 try
                 {
                     // 子项点击以“切换流畅”为优先，使用更轻量的剪贴板重试策略。
-                    if (await SetClipboardWithRetryAsync(textToCopy, maxAttempts: 4, retryDelayMs: 8))
+                    if (await SetClipboardWithRetryAsync(textToCopy, maxAttempts: 10, retryDelayMs: 18))
                     {
-                        StatusTextBlock.Text = $"已复制: {textToCopy}";
+                        int lineCount = CountContentLines(textToCopy);
+                        if (lineCount > 1 || textToCopy.Length > 120)
+                        {
+                            StatusTextBlock.Text = $"✅ 已复制内容（{lineCount}行，右键可预览）";
+                        }
+                        else
+                        {
+                            StatusTextBlock.Text = $"✅ 已复制: {BuildShortCopyPreview(textToCopy)}";
+                        }
                     }
                     else
                     {
@@ -4191,6 +6000,92 @@ namespace moshushou
                 }
                 e.Handled = true;
             }
+        }
+
+        private void TrackingNumber_MouseRightButtonDown(object sender, MouseButtonEventArgs e)
+        {
+            if (sender is not TextBlock textBlock || string.IsNullOrWhiteSpace(textBlock.Text))
+            {
+                return;
+            }
+
+            TreeViewNode? node = textBlock.DataContext as TreeViewNode;
+            if (node == null)
+            {
+                return;
+            }
+
+            // 右键时先选中当前子项，避免仍停留在上一次左键选中项
+            if (FindVisualParent<TreeViewItem>(textBlock) is TreeViewItem treeViewItem)
+            {
+                treeViewItem.IsSelected = true;
+                treeViewItem.Focus();
+            }
+            _currentSelectedNode = node;
+            if (_flatNodeList.Contains(node))
+            {
+                _currentSelectedIndex = _flatNodeList.IndexOf(node);
+            }
+
+            string content = node.RawData;
+            if (string.IsNullOrWhiteSpace(content))
+            {
+                content = textBlock.Text.Trim();
+            }
+
+            if (string.IsNullOrWhiteSpace(content) ||
+                (content.StartsWith("(") && content.EndsWith(")")))
+            {
+                return;
+            }
+
+            string title = string.IsNullOrWhiteSpace(node.Text) ? "内容预览" : node.Text;
+            OpenSegmentPreviewWindow(title, content);
+            e.Handled = true;
+        }
+
+        private void OpenSegmentPreviewWindow(string title, string content)
+        {
+            int lineCount = CountContentLines(content);
+
+            var previewWindow = new SegmentPreviewWindow(title, content)
+            {
+                Owner = this,
+                WindowStartupLocation = WindowStartupLocation.CenterOwner
+            };
+            previewWindow.Show();
+            previewWindow.Activate();
+
+            StatusTextBlock.Text = $"📝 已打开内容预览（{lineCount}行）";
+        }
+
+        private static int CountContentLines(string? content)
+        {
+            if (string.IsNullOrWhiteSpace(content))
+            {
+                return 0;
+            }
+
+            return content
+                .Split(new[] { "\r\n", "\n" }, StringSplitOptions.None)
+                .Count(line => !string.IsNullOrWhiteSpace(line));
+        }
+
+        private static string BuildShortCopyPreview(string content)
+        {
+            if (string.IsNullOrWhiteSpace(content))
+            {
+                return string.Empty;
+            }
+
+            string oneLine = content.Replace("\r", " ").Replace("\n", " ").Trim();
+            const int maxLength = 36;
+            if (oneLine.Length <= maxLength)
+            {
+                return oneLine;
+            }
+
+            return oneLine.Substring(0, maxLength) + "...";
         }
 
         /// <summary>
@@ -4220,21 +6115,46 @@ namespace moshushou
                     SaveFileState(node.StoreName);
                 }
 
-                if (_isAutoRunning || Volatile.Read(ref _clipboardSearchGuard) > 0)
+                if (_isAutoRunning ||
+                    Volatile.Read(ref _clipboardSearchGuard) > 0 ||
+                    Volatile.Read(ref _selectionCopyGuard) > 0)
                 {
                     return;
                 }
 
                 if (Interlocked.CompareExchange(ref _copyingFlag, 1, 0) == 1) return;
 
-                if (node.IsFileNode)
+                // ✅ [修复] 子节点优先复制 RawData (分段或单行)
+                // 排除 FileExcel 模式，因为文件模式下通常期望复制商家名去搜索
+                if (!string.IsNullOrEmpty(node.RawData) && node.Strategy != SendStrategy.FileExcel)
                 {
-                    CopyStoreNameOnly(node.StoreName);
+                    string textToCopy = node.RawData;
+                    Task.Run(async () =>
+                    {
+                        try
+                        {
+                            // 尝试复制 RawData
+                            if (!await SetClipboardWithRetryAsync(textToCopy)) 
+                                throw new Exception("剪贴板被占用");
+                            
+                            Application.Current.Dispatcher.Invoke(() => 
+                                StatusTextBlock.Text = "✅ 已复制选中的内容");
+                        }
+                        catch (Exception ex)
+                        {
+                            Application.Current.Dispatcher.Invoke(() => 
+                                StatusTextBlock.Text = $"❌ 复制失败: {ex.Message}");
+                        }
+                        finally
+                        {
+                            Interlocked.Exchange(ref _copyingFlag, 0);
+                        }
+                    });
+                    return;
                 }
-                else
-                {
-                    CopyFullStoreInfoToClipboard(node.StoreName);
-                }
+
+                // 主列表项统一仅复制商家名，不再复制完整信息
+                CopyStoreNameOnly(node.StoreName);
             }
         }
 
@@ -4272,11 +6192,7 @@ namespace moshushou
                         }
 
                         string displayStoreName = storeName;
-                        if (TryParseCustomStoreKey(storeName, out var parsedStoreName, out _))
-                        {
-                            displayStoreName = parsedStoreName;
-                        }
-                        targetNode.Header = $"{displayStoreName} ({trackingCount}条)";
+                        targetNode.Header = BuildStoreHeaderText(storeName, trackingCount, targetNode.Strategy);
 
                         StatusTextBlock.Text = $"[OCR] ✅ 已更新商家 '{displayStoreName}' 的群名为: {groupName}";
                     }
@@ -4300,10 +6216,6 @@ namespace moshushou
                     if (_isAutoRunning || Volatile.Read(ref _clipboardSearchGuard) > 0) return;
 
                     string displayStoreName = storeName;
-                    if (TryParseCustomStoreKey(storeName, out var parsedStoreName, out _))
-                    {
-                        displayStoreName = parsedStoreName;
-                    }
 
                     if (!await SetClipboardWithRetryAsync(displayStoreName)) throw new Exception("剪贴板被占用");
                     Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = $"已复制商家名称: '{displayStoreName}'");
@@ -4338,10 +6250,6 @@ namespace moshushou
                     bool isCustomMode = payloadMode == StorePayloadMode.CustomMessage;
                     bool isIssueMode = payloadMode == StorePayloadMode.Issue;
                     string displayStoreName = storeName;
-                    if (TryParseCustomStoreKey(storeName, out var parsedStoreName, out _))
-                    {
-                        displayStoreName = parsedStoreName;
-                    }
 
                     var sb = new StringBuilder();
                     if (!isCustomMode)
@@ -4591,37 +6499,13 @@ namespace moshushou
                    processName.Equals("Weixin", StringComparison.OrdinalIgnoreCase);
         }
 
-        private static bool TryParseCustomStoreKey(string storeKey, out string realStoreName, out string message)
-        {
-            realStoreName = storeKey ?? string.Empty;
-            message = string.Empty;
 
-            if (string.IsNullOrEmpty(storeKey))
-            {
-                return false;
-            }
-
-            int splitIndex = storeKey.IndexOf("##", StringComparison.Ordinal);
-            if (splitIndex < 0)
-            {
-                return false;
-            }
-
-            realStoreName = storeKey.Substring(0, splitIndex);
-            message = splitIndex + 2 < storeKey.Length ? storeKey.Substring(splitIndex + 2) : string.Empty;
-            return true;
-        }
 
         private static string NormalizeStoreNameForSearch(string storeName)
         {
             if (string.IsNullOrWhiteSpace(storeName))
             {
                 return string.Empty;
-            }
-
-            if (TryParseCustomStoreKey(storeName, out var parsedStoreName, out _))
-            {
-                return parsedStoreName?.Trim() ?? string.Empty;
             }
 
             return storeName.Trim();
@@ -4632,10 +6516,7 @@ namespace moshushou
             return NormalizeStoreNameForSearch(storeName);
         }
 
-        private static string BuildCustomStoreKey(string realStoreName, string message)
-        {
-            return $"{realStoreName}##{message}";
-        }
+
 
         private static int GetTabColumnCount(string? value)
         {
@@ -4647,13 +6528,11 @@ namespace moshushou
             return value.Split('\t').Length;
         }
 
+        /// <summary>
+        /// 根据数据内容判断负载模式（纯靠 Tab 列数，不再依赖复合键）
+        /// </summary>
         private StorePayloadMode ResolveStorePayloadMode(string storeName, List<string> rows)
         {
-            if (TryParseCustomStoreKey(storeName, out _, out _))
-            {
-                return StorePayloadMode.CustomMessage;
-            }
-
             string? firstRow = rows?.FirstOrDefault(r => !string.IsNullOrWhiteSpace(r));
             int columnCount = GetTabColumnCount(firstRow);
 
@@ -4668,6 +6547,24 @@ namespace moshushou
             }
 
             return StorePayloadMode.Normal;
+        }
+
+        /// <summary>
+        /// 根据模式和数据量决定发送策略
+        /// </summary>
+        private SendStrategy ResolveSendStrategy(StorePayloadMode mode, int itemCount)
+        {
+            // 2列模式：超100条走文件
+            if (mode == StorePayloadMode.Normal && itemCount > 100)
+                return SendStrategy.FileExcel;
+
+            // 4列/5列模式：超过 SegmentSize 走分段
+            if ((mode == StorePayloadMode.CustomMessage || mode == StorePayloadMode.Issue)
+                && itemCount > _searchConfig.SegmentSize)
+                return SendStrategy.TextSegmented;
+
+            // 其余：一次性文本
+            return SendStrategy.TextDirect;
         }
 
         private static string SanitizeWorksheetName(string worksheetName, string fallback)
@@ -5242,6 +7139,7 @@ namespace moshushou
     public class TreeViewNode : INotifyPropertyChanged
     {
         private string _header;
+        private string _text = string.Empty;
         private string _groupName;
         private string _source;
         private bool _isSelected; // ✅ 新增：选中状态字段
@@ -5259,10 +7157,21 @@ namespace moshushou
             }
         }
 
-        public string Text { get; set; }
+        public string Text
+        {
+            get => _text;
+            set
+            {
+                if (_text != value)
+                {
+                    _text = value;
+                    OnPropertyChanged(nameof(Text));
+                }
+            }
+        }
         public string RawData { get; set; }  // ✅ 新增：保存原始完整数据，用于复制
         public string StoreName { get; set; }
-        public bool IsFileNode { get; set; }
+        public SendStrategy Strategy { get; set; } = SendStrategy.TextDirect;
         
         // ✅ 新增：IsSelected 属性 (支持双向绑定)
         public bool IsSelected
@@ -5313,7 +7222,7 @@ namespace moshushou
         public string GroupInfo => string.IsNullOrEmpty(GroupName) ? "" : $"[{Source}] {GroupName}";
         public Visibility HasGroupInfoVisibility => string.IsNullOrEmpty(GroupName) ? Visibility.Collapsed : Visibility.Visible;
 
-        public event PropertyChangedEventHandler PropertyChanged;
+        public event PropertyChangedEventHandler? PropertyChanged;
 
         protected void OnPropertyChanged(string propertyName)
         {

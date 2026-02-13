@@ -8,6 +8,17 @@ namespace moshushou
     /// <summary>
     /// 文件状态类：保存单个文件的完整操作状态
     /// </summary>
+    public class SegmentFailureState
+    {
+        public string StoreName { get; set; } = "";
+        public int FailedSegment { get; set; }
+        public int TotalSegments { get; set; }
+        public int SentSegments { get; set; }
+        public int SentItems { get; set; }
+        public int TotalItems { get; set; }
+        public string Reason { get; set; } = "发送失败";
+    }
+
     public class FileState
     {
         public string FilePath { get; set; } = "";              // 文件完整路径
@@ -15,6 +26,7 @@ namespace moshushou
         public string LastSelectedStoreName { get; set; } = ""; // 上次选中的商家名
         public List<string> FailedStores { get; set; } = new(); // 自动重试区列表
         public List<string> ManualReviewStores { get; set; } = new(); // 需人工列表
+        public List<SegmentFailureState> SegmentFailures { get; set; } = new(); // 分段发送失败进度
         public List<string> DeletedStores { get; set; } = new();     // 已删除的商家列表
         public bool IsIssueMode { get; set; } = false;               // 是否为问题件模式
         public bool IsCustomMessageMode { get; set; } = false;       // 是否为自定义话术模式(4列)
@@ -71,6 +83,16 @@ namespace moshushou
         // ✅ 新增：固定话术（可配置）
         public string FixedMessage { get; set; } = "现同步未发货预警，超时未交件会考核处罚，请尽快处理转出,已售后的及时发起拦截。（注：未处理售后请勿虚假拦截，核实虚假正常考核处罚。字节超时未发出总部将发起拦截）";
 
+        /// <summary>
+        /// 分段发送：每段最大条数（4列/5列模式超过此数量时分段发送）
+        /// </summary>
+        public int SegmentSize { get; set; } = 30;
+
+        /// <summary>
+        /// 分段发送：段间延迟毫秒数
+        /// </summary>
+        public int SegmentDelayMs { get; set; } = 500;
+
         // ... Load 和 Save 方法保持不变 ...
         private static readonly string ConfigPath = Path.Combine(
             AppDomain.CurrentDomain.BaseDirectory, "search_config.json");
@@ -81,7 +103,25 @@ namespace moshushou
                 if (File.Exists(ConfigPath))
                 {
                     string json = File.ReadAllText(ConfigPath);
-                    return JsonSerializer.Deserialize<SearchConfig>(json);
+                    var loadedConfig = JsonSerializer.Deserialize<SearchConfig>(json);
+                    if (loadedConfig != null)
+                    {
+                        bool changed = false;
+
+                        // 企业微信文本限制：分段条数上限统一收敛为 30
+                        if (loadedConfig.SegmentSize <= 0 || loadedConfig.SegmentSize > 30)
+                        {
+                            loadedConfig.SegmentSize = 30;
+                            changed = true;
+                        }
+
+                        if (changed)
+                        {
+                            loadedConfig.Save();
+                        }
+
+                        return loadedConfig;
+                    }
                 }
             }
             catch { }

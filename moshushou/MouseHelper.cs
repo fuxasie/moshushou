@@ -15,6 +15,19 @@ namespace moshushou
         private static extern bool SetCursorPos(int x, int y);
 
         [DllImport("user32.dll")]
+        private static extern short GetAsyncKeyState(int vKey);
+
+        /// <summary>
+        /// Check if the ESC key is currently pressed (Global check).
+        /// </summary>
+        public static bool IsEscPressed()
+        {
+            // VK_ESCAPE = 0x1B
+            // GetAsyncKeyState returns short. High bit set means key is down.
+            return (GetAsyncKeyState(0x1B) & 0x8000) != 0;
+        }
+
+        [DllImport("user32.dll")]
         private static extern void mouse_event(int dwFlags, int dx, int dy, int cButtons, int dwExtraInfo);
 
         [DllImport("user32.dll")]

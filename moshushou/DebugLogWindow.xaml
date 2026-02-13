@@ -1,0 +1,51 @@
+﻿<Window x:Class="moshushou.DebugLogWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Debug Log History"
+        Height="520"
+        Width="980"
+        MinHeight="300"
+        MinWidth="520"
+        Background="#F8FAFC">
+    <Grid Margin="8">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+        </Grid.RowDefinitions>
+
+        <DockPanel Grid.Row="0" LastChildFill="False" Margin="0,0,0,6">
+            <StackPanel Orientation="Horizontal" DockPanel.Dock="Left">
+                <Button x:Name="ClearLogButton"
+                        Content="Clear"
+                        Width="64"
+                        Margin="0,0,6,0"
+                        Click="ClearLogButton_Click"/>
+                <Button x:Name="CopyAllButton"
+                        Content="Copy All"
+                        Width="74"
+                        Margin="0,0,8,0"
+                        Click="CopyAllButton_Click"/>
+                <CheckBox x:Name="AutoScrollCheckBox"
+                          Content="Auto Scroll"
+                          IsChecked="True"
+                          VerticalAlignment="Center"/>
+            </StackPanel>
+
+            <TextBlock x:Name="CounterTextBlock"
+                       DockPanel.Dock="Right"
+                       VerticalAlignment="Center"
+                       Foreground="#475569"
+                       FontSize="12"
+                       Text="0 lines"/>
+        </DockPanel>
+
+        <Border Grid.Row="1" BorderBrush="#CBD5E1" BorderThickness="1" CornerRadius="4" Background="White">
+            <ListBox x:Name="LogListBox"
+                     FontFamily="Consolas"
+                     FontSize="11"
+                     BorderThickness="0"
+                     HorizontalContentAlignment="Stretch"
+                     SelectionMode="Extended"/>
+        </Border>
+    </Grid>
+</Window>
