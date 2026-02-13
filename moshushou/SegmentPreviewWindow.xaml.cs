@@ -9,19 +9,23 @@ namespace moshushou
 {
     public partial class SegmentPreviewWindow : Window
     {
-        private readonly int _lineCount;
+        private readonly string? _allContent;
+        private readonly bool _hasAllContent;
+        private bool _isShowingAll;
 
-        public SegmentPreviewWindow(string segmentTitle, string content)
+        public SegmentPreviewWindow(string segmentTitle, string content, string? allContent = null)
         {
             InitializeComponent();
 
-            string safeTitle = string.IsNullOrWhiteSpace(segmentTitle) ? "Content" : segmentTitle.Trim();
-            string safeContent = content ?? string.Empty;
-            _lineCount = CountNonEmptyLines(safeContent);
+            string safeTitle = string.IsNullOrWhiteSpace(segmentTitle) ? "内容" : segmentTitle.Trim();
+            string currentContent = content ?? string.Empty;
+            _allContent = string.IsNullOrWhiteSpace(allContent) ? null : allContent;
+            _hasAllContent = !string.IsNullOrWhiteSpace(_allContent);
+            _isShowingAll = false;
 
-            Title = $"Content Preview - {safeTitle}";
-            ContentTextBox.Text = safeContent;
-            SummaryTextBlock.Text = $"{_lineCount} lines, {safeContent.Length} chars";
+            Title = $"内容预览 - {safeTitle}";
+            ShowAllButton.Visibility = _hasAllContent ? Visibility.Visible : Visibility.Collapsed;
+            UpdateDisplayedContent(currentContent);
 
             Loaded += (_, _) =>
             {
@@ -47,8 +51,8 @@ namespace moshushou
         {
             bool copied = await TrySetClipboardTextAsync(ContentTextBox.Text ?? string.Empty);
             SummaryTextBlock.Text = copied
-                ? $"Copied all content ({_lineCount} lines)"
-                : "Clipboard busy, copy failed";
+                ? $"已复制当前显示内容（{CountNonEmptyLines(ContentTextBox.Text ?? string.Empty)}行）"
+                : "剪贴板忙，复制失败";
         }
 
         private async void CopyNumbersButton_Click(object sender, RoutedEventArgs e)
@@ -56,14 +60,26 @@ namespace moshushou
             var numbers = ExtractTrackingNumbers(ContentTextBox.Text ?? string.Empty);
             if (numbers.Count == 0)
             {
-                SummaryTextBlock.Text = "No tracking numbers detected";
+                SummaryTextBlock.Text = "未识别到可复制的单号";
                 return;
             }
 
             bool copied = await TrySetClipboardTextAsync(string.Join(Environment.NewLine, numbers));
             SummaryTextBlock.Text = copied
-                ? $"Copied tracking numbers ({numbers.Count})"
-                : "Clipboard busy, copy failed";
+                ? $"已复制单号（{numbers.Count}个）"
+                : "剪贴板忙，复制失败";
+        }
+
+        private void ShowAllButton_Click(object sender, RoutedEventArgs e)
+        {
+            if (!_hasAllContent || string.IsNullOrWhiteSpace(_allContent))
+            {
+                SummaryTextBlock.Text = "没有可显示的全部内容";
+                return;
+            }
+
+            _isShowingAll = true;
+            UpdateDisplayedContent(_allContent);
         }
 
         private void CloseButton_Click(object sender, RoutedEventArgs e)
@@ -124,6 +140,15 @@ namespace moshushou
             }
 
             return results;
+        }
+
+        private void UpdateDisplayedContent(string content)
+        {
+            string safeContent = content ?? string.Empty;
+            ContentTextBox.Text = safeContent;
+            int lineCount = CountNonEmptyLines(safeContent);
+            string tag = _isShowingAll ? "全部" : "当前";
+            SummaryTextBlock.Text = $"{tag}内容：{lineCount}行，{safeContent.Length}字";
         }
 
         private static async Task<bool> TrySetClipboardTextAsync(string text, int maxAttempts = 12, int baseDelayMs = 25)

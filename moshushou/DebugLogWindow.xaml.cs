@@ -1,13 +1,18 @@
-﻿using System;
+using System;
+using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Linq;
 using System.Windows;
+using System.Windows.Controls;
 
 namespace moshushou
 {
     public partial class DebugLogWindow : Window
     {
+        private const int MaxLines = 20000;
         private readonly ObservableCollection<string> _logs = new ObservableCollection<string>();
+        private readonly List<string> _allLogs = new List<string>();
+        private string _filterKeyword = string.Empty;
 
         public DebugLogWindow()
         {
@@ -35,10 +40,15 @@ namespace moshushou
         {
             Dispatcher.InvokeAsync(() =>
             {
-                _logs.Add(line);
-                if (_logs.Count > 12000)
+                _allLogs.Add(line);
+                if (_allLogs.Count > MaxLines)
                 {
-                    _logs.RemoveAt(0);
+                    _allLogs.RemoveAt(0);
+                }
+
+                if (PassesFilters(line))
+                {
+                    _logs.Add(line);
                 }
 
                 UpdateCounter();
@@ -50,6 +60,7 @@ namespace moshushou
         {
             Dispatcher.InvokeAsync(() =>
             {
+                _allLogs.Clear();
                 _logs.Clear();
                 UpdateCounter();
             });
@@ -57,19 +68,19 @@ namespace moshushou
 
         private void RefreshSnapshot()
         {
-            _logs.Clear();
-            foreach (var line in DebugLogManager.GetSnapshot())
+            _allLogs.Clear();
+            _allLogs.AddRange(DebugLogManager.GetSnapshot());
+            if (_allLogs.Count > MaxLines)
             {
-                _logs.Add(line);
+                _allLogs.RemoveRange(0, _allLogs.Count - MaxLines);
             }
 
-            UpdateCounter();
-            ScrollToEndIfNeeded();
+            ApplyFilters();
         }
 
         private void UpdateCounter()
         {
-            CounterTextBlock.Text = $"{_logs.Count} lines";
+            CounterTextBlock.Text = $"{_logs.Count}/{_allLogs.Count} lines";
         }
 
         private void ScrollToEndIfNeeded()
@@ -99,6 +110,107 @@ namespace moshushou
             }
 
             Clipboard.SetText(string.Join(Environment.NewLine, _logs));
+        }
+
+        private void ClearHistoryButton_Click(object sender, RoutedEventArgs e)
+        {
+            StoreSendHistoryRepository.Clear();
+            DebugLogManager.Log("历史", "已清空持久化历史。");
+        }
+
+        private void FilterTextBox_TextChanged(object sender, TextChangedEventArgs e)
+        {
+            _filterKeyword = FilterTextBox.Text?.Trim() ?? string.Empty;
+            ApplyFilters();
+        }
+
+        private void HistoryOnlyCheckBox_Changed(object sender, RoutedEventArgs e)
+        {
+            ApplyFilters();
+        }
+
+        private void ApplyFilters()
+        {
+            _logs.Clear();
+            foreach (var line in _allLogs)
+            {
+                if (PassesFilters(line))
+                {
+                    _logs.Add(line);
+                }
+            }
+
+            UpdateCounter();
+            ScrollToEndIfNeeded();
+        }
+
+        private bool PassesFilters(string line)
+        {
+            if (HistoryOnlyCheckBox.IsChecked == true &&
+                !IsHistoryLine(line))
+            {
+                return false;
+            }
+
+            if (!string.IsNullOrWhiteSpace(_filterKeyword) &&
+                line.IndexOf(_filterKeyword, StringComparison.OrdinalIgnoreCase) < 0)
+            {
+                return false;
+            }
+
+            return true;
+        }
+
+        private static bool IsHistoryLine(string line)
+        {
+            if (string.IsNullOrWhiteSpace(line))
+            {
+                return false;
+            }
+
+            return line.Contains("[历史]", StringComparison.Ordinal) ||
+                   line.Contains("[发送历史]", StringComparison.Ordinal) ||
+                   line.Contains("[点击历史]", StringComparison.Ordinal);
+        }
+
+        private async void ChangeParseButton_Click(object sender, RoutedEventArgs e)
+        {
+            if (Owner is not MainWindow mainWindow)
+            {
+                MessageBox.Show(this, "未找到主窗口，无法应用解析设置。", "提示", MessageBoxButton.OK, MessageBoxImage.Information);
+                return;
+            }
+
+            MainWindow.ParseOverrideDebugContext? context = mainWindow.GetCurrentFileParseContext();
+            if (context == null)
+            {
+                MessageBox.Show(this, "请先在主窗口加载 Excel 文件，再设置解析方式。", "提示", MessageBoxButton.OK, MessageBoxImage.Information);
+                return;
+            }
+
+            var dialog = new ParseModeConfigWindow(context)
+            {
+                Owner = this
+            };
+
+            if (dialog.ShowDialog() != true || dialog.ParseOverride == null)
+            {
+                return;
+            }
+
+            ChangeParseButton.IsEnabled = false;
+            try
+            {
+                bool applied = await mainWindow.ApplyCurrentFileParseOverrideAsync(dialog.ParseOverride);
+                if (applied)
+                {
+                    RefreshSnapshot();
+                }
+            }
+            finally
+            {
+                ChangeParseButton.IsEnabled = true;
+            }
         }
     }
 }

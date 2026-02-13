@@ -1,7 +1,7 @@
 ﻿<Window x:Class="moshushou.SegmentPreviewWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Content Preview"
+        Title="内容预览"
         Height="560"
         Width="860"
         MinHeight="360"
@@ -16,17 +16,22 @@
         <DockPanel Grid.Row="0" LastChildFill="False" Margin="0,0,0,8">
             <StackPanel Orientation="Horizontal" DockPanel.Dock="Left">
                 <Button x:Name="CopyAllButton"
-                        Content="Copy All"
-                        Width="84"
+                        Content="全部复制"
+                        Width="88"
                         Margin="0,0,6,0"
                         Click="CopyAllButton_Click"/>
                 <Button x:Name="CopyNumbersButton"
-                        Content="Copy Nos"
-                        Width="84"
+                        Content="复制单号"
+                        Width="88"
                         Margin="0,0,6,0"
                         Click="CopyNumbersButton_Click"/>
+                <Button x:Name="ShowAllButton"
+                        Content="所有内容"
+                        Width="88"
+                        Margin="0,0,6,0"
+                        Click="ShowAllButton_Click"/>
                 <Button x:Name="CloseButton"
-                        Content="Close"
+                        Content="关闭"
                         Width="64"
                         Click="CloseButton_Click"/>
             </StackPanel>
@@ -36,7 +41,7 @@
                        VerticalAlignment="Center"
                        FontSize="12"
                        Foreground="#475569"
-                       Text="0 lines"/>
+                       Text="0 行"/>
         </DockPanel>
 
         <Border Grid.Row="1"

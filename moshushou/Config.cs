@@ -5,6 +5,36 @@ using System.Text.Json;
 
 namespace moshushou
 {
+    public static class FileParseModes
+    {
+        public const string Auto = "Auto";
+        public const string Magician = "Magician";
+        public const string Issue = "Issue";
+
+        public static string Normalize(string? mode)
+        {
+            if (string.IsNullOrWhiteSpace(mode))
+            {
+                return Auto;
+            }
+
+            string value = mode.Trim();
+            if (value.Equals(Magician, StringComparison.OrdinalIgnoreCase) ||
+                value.Equals("Normal2", StringComparison.OrdinalIgnoreCase))
+            {
+                return Magician;
+            }
+
+            if (value.Equals(Issue, StringComparison.OrdinalIgnoreCase) ||
+                value.Equals("Table", StringComparison.OrdinalIgnoreCase))
+            {
+                return Issue;
+            }
+
+            return Auto;
+        }
+    }
+
     /// <summary>
     /// 文件状态类：保存单个文件的完整操作状态
     /// </summary>
@@ -30,6 +60,18 @@ namespace moshushou
         public List<string> DeletedStores { get; set; } = new();     // 已删除的商家列表
         public bool IsIssueMode { get; set; } = false;               // 是否为问题件模式
         public bool IsCustomMessageMode { get; set; } = false;       // 是否为自定义话术模式(4列)
+    }
+
+    /// <summary>
+    /// 单文件解析覆盖规则：用于手动指定当前文件的解析方式。
+    /// </summary>
+    public class FileParseOverride
+    {
+        public string FilePath { get; set; } = "";
+        public string ParseMode { get; set; } = FileParseModes.Auto; // Auto | Magician | Issue
+        public int TrackingColumn { get; set; } = 1;                 // 1-based
+        public int StoreColumn { get; set; } = 2;                    // 1-based
+        public string TailMessage { get; set; } = "";                // 魔术师格式尾部话术
     }
 
     public class SearchConfig
@@ -80,6 +122,9 @@ namespace moshushou
         // ✅ 新增：自定义话术模式(4列)的独立状态存储
         public FileState LastCustomMessageFileState { get; set; } = new FileState();
 
+        // ✅ 新增：按文件路径保存解析覆盖规则（调试历史中手动配置）
+        public List<FileParseOverride> FileParseOverrides { get; set; } = new();
+
         // ✅ 新增：固定话术（可配置）
         public string FixedMessage { get; set; } = "现同步未发货预警，超时未交件会考核处罚，请尽快处理转出,已售后的及时发起拦截。（注：未处理售后请勿虚假拦截，核实虚假正常考核处罚。字节超时未发出总部将发起拦截）";
 
@@ -112,6 +157,26 @@ namespace moshushou
                         if (loadedConfig.SegmentSize <= 0 || loadedConfig.SegmentSize > 30)
                         {
                             loadedConfig.SegmentSize = 30;
+                            changed = true;
+                        }
+
+                        loadedConfig.FileParseOverrides ??= new List<FileParseOverride>();
+                        int beforeCount = loadedConfig.FileParseOverrides.Count;
+                        loadedConfig.FileParseOverrides = loadedConfig.FileParseOverrides
+                            .Where(item => item != null && !string.IsNullOrWhiteSpace(item.FilePath))
+                            .Select(item =>
+                            {
+                                item.FilePath = item.FilePath.Trim();
+                                item.ParseMode = FileParseModes.Normalize(item.ParseMode);
+                                if (item.TrackingColumn <= 0) item.TrackingColumn = 1;
+                                if (item.StoreColumn <= 0) item.StoreColumn = 2;
+                                item.TailMessage = item.TailMessage?.Trim() ?? string.Empty;
+                                return item;
+                            })
+                            .ToList();
+
+                        if (loadedConfig.FileParseOverrides.Count != beforeCount)
+                        {
                             changed = true;
                         }
 
