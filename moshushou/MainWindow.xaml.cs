@@ -157,6 +157,7 @@ namespace moshushou
         // ✅ 新增：失败归档节点
         private TreeViewNode _failureNode;
         private DebugLogWindow? _debugLogWindow;
+        private BusInfoManagerWindow? _busInfoManagerWindow;
         // ✅ 新增：自动化运行标志
         private bool _isAutoRunning = false;
 
@@ -517,6 +518,132 @@ namespace moshushou
             }
 
             _debugLogWindow.Activate();
+        }
+
+        private void OpenBusInfoManagerButton_Click(object sender, RoutedEventArgs e)
+        {
+            if (_busInfoManagerWindow != null && _busInfoManagerWindow.IsLoaded)
+            {
+                if (_busInfoManagerWindow.WindowState == WindowState.Minimized)
+                {
+                    _busInfoManagerWindow.WindowState = WindowState.Normal;
+                }
+
+                _busInfoManagerWindow.Activate();
+                SyncBusInfoManagerWithCurrentSelection();
+                return;
+            }
+
+            var sourceItems = _businessInfoList
+                .Select(item => new BusinessInfo
+                {
+                    StoreName = item.StoreName,
+                    GroupName = item.GroupName,
+                    Source = item.Source
+                })
+                .ToList();
+
+            _busInfoManagerWindow = new BusInfoManagerWindow(sourceItems)
+            {
+                Owner = this
+            };
+
+            _busInfoManagerWindow.Saved += OnBusInfoManagerSaved;
+            _busInfoManagerWindow.Closed += OnBusInfoManagerClosed;
+            _busInfoManagerWindow.Show();
+
+            SyncBusInfoManagerWithCurrentSelection();
+            StatusTextBlock.Text = "已打开 businfo 映射窗口，可在主列表点选并联动填写。";
+        }
+
+        private void OnBusInfoManagerSaved(List<BusinessInfo> updatedBusinessInfos)
+        {
+            if (updatedBusinessInfos == null)
+            {
+                return;
+            }
+
+            int selectedIndexSnapshot = 0;
+            string? selectedStoreSnapshot = GetCurrentSelectedStoreName(out selectedIndexSnapshot);
+
+            _businessInfoList = updatedBusinessInfos
+                .Select(item => new BusinessInfo
+                {
+                    StoreName = item.StoreName,
+                    GroupName = item.GroupName,
+                    Source = item.Source
+                })
+                .ToList();
+
+            SaveBusinessInfo();
+            ProcessAndDisplayData();
+
+            if (!string.IsNullOrWhiteSpace(selectedStoreSnapshot))
+            {
+                Application.Current.Dispatcher.InvokeAsync(() =>
+                {
+                    RestoreSelection(selectedStoreSnapshot, selectedIndexSnapshot);
+                }, System.Windows.Threading.DispatcherPriority.Loaded);
+            }
+
+            StatusTextBlock.Text = $"✅ 已更新 businfo 映射，共 {_businessInfoList.Count} 条。";
+        }
+
+        private void OnBusInfoManagerClosed(object? sender, EventArgs e)
+        {
+            if (_busInfoManagerWindow != null)
+            {
+                _busInfoManagerWindow.Saved -= OnBusInfoManagerSaved;
+                _busInfoManagerWindow.Closed -= OnBusInfoManagerClosed;
+            }
+
+            _busInfoManagerWindow = null;
+        }
+
+        private void SyncBusInfoManagerWithCurrentSelection()
+        {
+            if (_busInfoManagerWindow == null || !_busInfoManagerWindow.IsLoaded)
+            {
+                return;
+            }
+
+            TreeViewNode? selectedNode = StoreTreeView.SelectedItem as TreeViewNode;
+            if (selectedNode == null || string.IsNullOrWhiteSpace(selectedNode.StoreName))
+            {
+                selectedNode = _currentSelectedNode;
+            }
+
+            if (selectedNode == null || string.IsNullOrWhiteSpace(selectedNode.StoreName) || selectedNode.StoreName == "FAIL_SEPARATOR")
+            {
+                return;
+            }
+
+            TreeViewNode rootNode = selectedNode;
+            if (TryResolveRootNode(selectedNode, out TreeViewNode resolvedRoot) && resolvedRoot != null)
+            {
+                rootNode = resolvedRoot;
+            }
+
+            string storeName = NormalizeStoreNameForBusinessInfo(rootNode.StoreName);
+            if (string.IsNullOrWhiteSpace(storeName))
+            {
+                storeName = rootNode.StoreName?.Trim() ?? string.Empty;
+            }
+
+            if (string.IsNullOrWhiteSpace(storeName))
+            {
+                return;
+            }
+
+            BusinessInfo? mappedInfo = _businessInfoList.FirstOrDefault(item =>
+                string.Equals(
+                    NormalizeStoreNameForBusinessInfo(item.StoreName),
+                    storeName,
+                    StringComparison.OrdinalIgnoreCase));
+
+            string groupName = mappedInfo?.GroupName?.Trim() ?? rootNode.GroupName?.Trim() ?? string.Empty;
+            string source = mappedInfo?.Source?.Trim() ?? rootNode.Source?.Trim() ?? string.Empty;
+            _busInfoManagerWindow.SyncFromMainSelection(storeName, groupName, source);
         }
 
         private void ScrollToSelectedButton_Click(object sender, RoutedEventArgs e)
@@ -2205,7 +2332,7 @@ namespace moshushou
                 // 复用 clickPos, 无需再次查找
                 
                 bool enteredSuccess = false;
-                string cleanTarget = snapshot.SearchText.Replace(" ", "").ToLower();
+                string cleanTarget = snapshot.SearchText.Replace(" ", "").ToLowerInvariant();
 
                     if (clickPos.HasValue)
                     {
@@ -2492,7 +2619,7 @@ namespace moshushou
                             rawTitle = await _screenshotHelper.GetWeChatWindowTitleTextAsync(chatHwnd, snapshot.IsWework);
                         }
 
-                        string cleanTitle = System.Text.RegularExpressions.Regex.Replace(rawTitle ?? "", @"\(\d+.*?\)|（\d+.*?）|\(外部\)|（外部）|\s+", "").ToLower();
+                        string cleanTitle = System.Text.RegularExpressions.Regex.Replace(rawTitle ?? "", @"\(\d+.*?\)|（\d+.*?）|\(外部\)|（外部）|\s+", "").ToLowerInvariant();
                         
                         bool isMatch = false;
                         if (_screenshotHelper.IsFuzzyMatch(snapshot.SearchText, rawTitle)) isMatch = true;
@@ -3811,7 +3938,8 @@ namespace moshushou
                  
                 bool isMatch = _screenshotHelper.IsFuzzyMatch(expectedGroupName, currentTitle);
                 if (!isMatch && !string.IsNullOrEmpty(currentTitle) && 
-                    (currentTitle.Contains(expectedGroupName) || expectedGroupName.Contains(currentTitle)))
+                    (currentTitle.Contains(expectedGroupName, StringComparison.OrdinalIgnoreCase) ||
+                     expectedGroupName.Contains(currentTitle, StringComparison.OrdinalIgnoreCase)))
                 {
                     isMatch = true;
                 }
@@ -6858,6 +6986,8 @@ namespace moshushou
                     SaveFileState(node.StoreName);
                     RecordStoreSelectionHistory(node);
                 }
+
+                SyncBusInfoManagerWithCurrentSelection();
 
                 if (_isAutoRunning ||
                     Volatile.Read(ref _clipboardSearchGuard) > 0 ||

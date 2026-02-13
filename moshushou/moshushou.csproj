@@ -41,6 +41,36 @@
     <None Update="search_config.json">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
+    <None Update="wco_data\mmmojo.dll">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </None>
+    <None Update="wco_data\mmmojo_64.dll">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </None>
+    <None Update="wco_data\Model\FPOCRRecog.xnet">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </None>
+    <None Update="wco_data\Model\OCRDetFP32.xnet.nas">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </None>
+    <None Update="wco_data\Model\OCRParaDetV1.1.0.26.xnet">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </None>
+    <None Update="wco_data\Model\OCRRecogFP32V1.1.0.26.xnet">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </None>
+    <None Update="wco_data\Model\RecDict">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </None>
+    <None Update="wco_data\Model\sohu_simp.txt">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </None>
+    <None Update="wco_data\WeChatOCR.exe">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </None>
+    <None Update="wco_data\x64.config">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </None>
     <None Update="wxonnx\yolo11n_wxscreen_fixed.onnx">
       <CopyToOutputDirectory>Always</CopyToOutputDirectory>
     </None>

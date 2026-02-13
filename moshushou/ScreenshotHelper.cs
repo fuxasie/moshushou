@@ -618,7 +618,11 @@ namespace moshushou
             if (string.IsNullOrWhiteSpace(expected)) return false;
 
             // 1. 快速检查：未处理前如果包含，直接返回 (最快)
-            if (actual.Contains(expected) || expected.Contains(actual)) return true;
+            if (actual.Contains(expected, StringComparison.OrdinalIgnoreCase) ||
+                expected.Contains(actual, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
 
             // ✅ [新增] 规范化特殊字符（OCR 经常把这些字符识别错或遗漏）
             string NormalizeSpecialChars(string s)
@@ -639,7 +643,11 @@ namespace moshushou
             string normalizedOCR = NormalizeSpecialChars(actual);
 
             // 规范化后再检查包含关系
-            if (normalizedOCR.Contains(normalizedTarget) || normalizedTarget.Contains(normalizedOCR)) return true;
+            if (normalizedOCR.Contains(normalizedTarget, StringComparison.OrdinalIgnoreCase) ||
+                normalizedTarget.Contains(normalizedOCR, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
 
             // 2. 深度清洗：
             // - 去除所有空白字符 (\s)
@@ -648,7 +656,7 @@ namespace moshushou
             string pattern = @"\s+|[.,;:'""()\-\[\]{}<>/\\|、，。；：""（）—…\.~～〜]";
 
             // ✅ 定义局部函数，供后续分词匹配使用
-            string Clean(string s) => Regex.Replace(s, pattern, "").ToLower();
+            string Clean(string s) => Regex.Replace(s, pattern, "").ToLowerInvariant();
 
             string cleanTarget = Clean(normalizedTarget);
             string cleanOCR = Clean(normalizedOCR);

@@ -406,6 +406,8 @@
                 </TreeView>
             </Border>
 
+
+
             <!-- 状态栏 - 现代化设计 -->
             <Border Grid.Row="3" 
                     Margin="0,4,0,0" 
@@ -415,53 +417,76 @@
                     CornerRadius="0,0,4,4"
                     Padding="8,5">
                 <Grid>
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="Auto"/>
-                        <ColumnDefinition Width="*"/>
-                        <ColumnDefinition Width="Auto"/>
-                        <ColumnDefinition Width="Auto"/>
-                        <ColumnDefinition Width="Auto"/>
-                    </Grid.ColumnDefinitions>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/>
+                    </Grid.RowDefinitions>
 
-                    <TextBlock Grid.Column="0"
-                               Text="●"
-                               FontSize="10"
-                               Foreground="#10B981"
-                               Margin="0,0,6,0"
-                               VerticalAlignment="Center"/>
+                    <Grid Grid.Row="0" Margin="0,0,0,4">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
+                        </Grid.ColumnDefinitions>
 
-                    <TextBlock Grid.Column="1"
-                               x:Name="StatusTextBlock" 
-                               Text="就绪" 
-                               FontSize="10"
-                               FontWeight="Medium"
-                               Foreground="#4A5568"
-                               VerticalAlignment="Center"/>
+                        <TextBlock Grid.Column="0"
+                                   x:Name="ListProgressTextBlock"
+                                   Text="后续 0 项 / 共 0 商家"
+                                   FontSize="11"
+                                   FontWeight="SemiBold"
+                                   Foreground="#334155"
+                                   VerticalAlignment="Center"/>
 
-                    <TextBlock Grid.Column="2"
-                               x:Name="ListProgressTextBlock"
-                               Text="后续 0 项 / 共 0 商家"
-                               FontSize="10"
-                               FontWeight="SemiBold"
-                               Foreground="#64748B"
-                               VerticalAlignment="Center"
-                               Margin="8,0,0,0"/>
+                        <StackPanel Grid.Column="1" Orientation="Horizontal">
+                            <Button x:Name="ScrollToSelectedButton"
+                                    Content="⌖"
+                                    ToolTip="定位选中项"
+                                    Style="{StaticResource PrimaryActionButton}"
+                                    Margin="8,0,0,0"
+                                    Click="ScrollToSelectedButton_Click"/>
 
-                    <Button Grid.Column="3"
-                            x:Name="ScrollToSelectedButton"
-                            Content="⌖"
-                            ToolTip="定位选中项"
-                            Style="{StaticResource PrimaryActionButton}"
-                            Margin="8,0,0,0"
-                            Click="ScrollToSelectedButton_Click"/>
+                            <Button x:Name="OpenBusInfoManagerButton"
+                                    Content="🗂"
+                                    ToolTip="管理 businfo 映射"
+                                    Style="{StaticResource PrimaryActionButton}"
+                                    Margin="4,0,0,0"
+                                    Click="OpenBusInfoManagerButton_Click"/>
 
-                    <Button Grid.Column="4"
-                            x:Name="OpenDebugLogWindowButton"
-                            Content="T"
-                            ToolTip="调试历史"
-                            Style="{StaticResource PrimaryActionButton}"
-                            Margin="4,0,0,0"
-                            Click="OpenDebugLogWindowButton_Click"/>
+                            <Button x:Name="OpenDebugLogWindowButton"
+                                    Content="T"
+                                    ToolTip="调试历史"
+                                    Style="{StaticResource PrimaryActionButton}"
+                                    Margin="4,0,0,0"
+                                    Click="OpenDebugLogWindowButton_Click"/>
+                        </StackPanel>
+                    </Grid>
+
+                    <Border Grid.Row="1" 
+                            BorderThickness="0,1,0,0" 
+                            BorderBrush="#F1F5F9" 
+                            Padding="0,4,0,0">
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto"/>
+                                <ColumnDefinition Width="*"/>
+                            </Grid.ColumnDefinitions>
+                            
+                            <TextBlock Grid.Column="0"
+                                       Text="●"
+                                       FontSize="10"
+                                       Foreground="#10B981"
+                                       Margin="0,0,6,0"
+                                       VerticalAlignment="Center"/>
+
+                            <TextBlock Grid.Column="1"
+                                       x:Name="StatusTextBlock" 
+                                       Text="就绪" 
+                                       FontSize="11"
+                                       FontWeight="Normal"
+                                       Foreground="#64748B"
+                                       VerticalAlignment="Center"
+                                       TextTrimming="CharacterEllipsis"/>
+                        </Grid>
+                    </Border>
                 </Grid>
             </Border>
         </Grid>

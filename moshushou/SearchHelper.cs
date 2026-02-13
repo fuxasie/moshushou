@@ -258,14 +258,18 @@ namespace moshushou
                 if (processName.Equals("WXWork", StringComparison.OrdinalIgnoreCase))
                 {
                     if (clazz.Equals("WeWorkWindow", StringComparison.OrdinalIgnoreCase)) currentScore += 50;
-                    if (title.Contains("企业微信")) currentScore += 20;
+                    if (title.Contains("企业微信", StringComparison.OrdinalIgnoreCase)) currentScore += 20;
                     // 排除掉托盘气泡、悬浮球等小窗口（通过尺寸判断，暂略，简单场景可见性+类名通常够了）
                 }
                 // [个人微信特有逻辑]
                 else 
                 {
                     if (clazz.Equals("WeChatMainWndForPC", StringComparison.OrdinalIgnoreCase)) currentScore += 50;
-                    if (title.Equals("微信") || title.Equals("WeChat")) currentScore += 20;
+                    if (title.Equals("微信", StringComparison.OrdinalIgnoreCase) ||
+                        title.Equals("WeChat", StringComparison.OrdinalIgnoreCase))
+                    {
+                        currentScore += 20;
+                    }
                 }
 
                 // 只有分数高的才替换

@@ -69,6 +69,15 @@
             <Setter Property="Background" Value="#1F2937"/>
         </Style>
 
+        <!-- 标准主要操作按钮 (用于文字按钮) -->
+        <Style x:Key="StandardPrimaryButton" TargetType="Button" BasedOn="{StaticResource ModernButton}">
+            <Setter Property="Background" Value="#1F2937"/>
+            <Setter Property="Foreground" Value="White"/>
+            <Setter Property="Padding" Value="16,6"/>
+            <Setter Property="FontSize" Value="12"/>
+            <Setter Property="FontWeight" Value="SemiBold"/>
+        </Style>
+
         <!-- 现代化复选框样式 -->
         <Style x:Key="ModernCheckBox" TargetType="CheckBox">
             <Setter Property="VerticalAlignment" Value="Center"/>
