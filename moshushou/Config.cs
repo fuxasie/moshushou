@@ -71,6 +71,7 @@ namespace moshushou
         public string ParseMode { get; set; } = FileParseModes.Auto; // Auto | Magician | Issue
         public int TrackingColumn { get; set; } = 1;                 // 1-based
         public int StoreColumn { get; set; } = 2;                    // 1-based
+        public int IssueSegmentStartCount { get; set; } = 30;        // 问题件：达到该条数后开始分段（>=2）
         public string TailMessage { get; set; } = "";                // 魔术师格式尾部话术
     }
 
@@ -170,9 +171,19 @@ namespace moshushou
                                 item.ParseMode = FileParseModes.Normalize(item.ParseMode);
                                 if (item.TrackingColumn <= 0) item.TrackingColumn = 1;
                                 if (item.StoreColumn <= 0) item.StoreColumn = 2;
+                                if (item.IssueSegmentStartCount < 2)
+                                {
+                                    item.IssueSegmentStartCount = Math.Max(2, loadedConfig.SegmentSize);
+                                }
                                 item.TailMessage = item.TailMessage?.Trim() ?? string.Empty;
                                 return item;
                             })
+                            .ToList();
+
+                        // 同一文件可能因历史路径格式差异产生多条规则，按规范化路径去重并保留最后一条。
+                        loadedConfig.FileParseOverrides = loadedConfig.FileParseOverrides
+                            .GroupBy(item => NormalizePathKey(item.FilePath), StringComparer.OrdinalIgnoreCase)
+                            .Select(group => group.Last())
                             .ToList();
 
                         if (loadedConfig.FileParseOverrides.Count != beforeCount)
@@ -208,6 +219,23 @@ namespace moshushou
                 File.WriteAllText(ConfigPath, json);
             }
             catch { }
+        }
+
+        private static string NormalizePathKey(string path)
+        {
+            if (string.IsNullOrWhiteSpace(path))
+            {
+                return string.Empty;
+            }
+
+            try
+            {
+                return Path.GetFullPath(path.Trim());
+            }
+            catch
+            {
+                return path.Trim();
+            }
         }
     }
 }

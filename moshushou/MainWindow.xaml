@@ -41,109 +41,7 @@
             </Style.Triggers>
         </Style>
 
-        <!-- 现代化按钮样式 -->
-        <Style x:Key="ModernButton" TargetType="Button">
-            <Setter Property="Padding" Value="12,6"/>
-            <Setter Property="FontSize" Value="11"/>
-            <Setter Property="FontWeight" Value="Medium"/>
-            <Setter Property="BorderThickness" Value="0"/>
-            <Setter Property="Foreground" Value="White"/>
-            <Setter Property="Cursor" Value="Hand"/>
-            <Setter Property="Template">
-                <Setter.Value>
-                    <ControlTemplate TargetType="Button">
-                        <Border x:Name="border"
-                                Background="{TemplateBinding Background}" 
-                                CornerRadius="4" 
-                                Padding="{TemplateBinding Padding}">
-                            <ContentPresenter HorizontalAlignment="Center" 
-                                            VerticalAlignment="Center"/>
-                        </Border>
-                        <ControlTemplate.Triggers>
-                            <Trigger Property="IsMouseOver" Value="True">
-                                <Setter TargetName="border" Property="Effect">
-                                    <Setter.Value>
-                                        <DropShadowEffect ShadowDepth="2" 
-                                                        BlurRadius="8" 
-                                                        Opacity="0.3"/>
-                                    </Setter.Value>
-                                </Setter>
-                            </Trigger>
-                        </ControlTemplate.Triggers>
-                    </ControlTemplate>
-                </Setter.Value>
-            </Setter>
-            <Style.Triggers>
-                <Trigger Property="IsMouseOver" Value="True">
-                    <Setter Property="Opacity" Value="0.9"/>
-                </Trigger>
-                <Trigger Property="IsPressed" Value="True">
-                    <Setter Property="Opacity" Value="0.75"/>
-                    <Setter Property="RenderTransform">
-                        <Setter.Value>
-                            <ScaleTransform ScaleX="0.98" ScaleY="0.98"/>
-                        </Setter.Value>
-                    </Setter>
-                </Trigger>
-            </Style.Triggers>
-        </Style>
 
-        <!-- 图标按钮样式 -->
-        <Style x:Key="IconButton" TargetType="Button" BasedOn="{StaticResource ModernButton}">
-            <Setter Property="Padding" Value="8,6"/>
-            <Setter Property="FontSize" Value="14"/>
-            <Setter Property="MinWidth" Value="36"/>
-            <Setter Property="MinHeight" Value="32"/>
-        </Style>
-
-        <!-- 现代化复选框样式 -->
-        <Style x:Key="ModernCheckBox" TargetType="CheckBox">
-            <Setter Property="VerticalAlignment" Value="Center"/>
-            <Setter Property="FontSize" Value="11"/>
-            <Setter Property="FontWeight" Value="Medium"/>
-            <Setter Property="Padding" Value="6,0,0,0"/>
-            <Setter Property="Foreground" Value="#2D3748"/>
-            <Setter Property="Cursor" Value="Hand"/>
-        </Style>
-
-        <!-- 折叠按钮样式 -->
-        <Style x:Key="ToggleButton" TargetType="ToggleButton">
-            <Setter Property="Background" Value="Transparent"/>
-            <Setter Property="BorderThickness" Value="0"/>
-            <Setter Property="Cursor" Value="Hand"/>
-            <Setter Property="Padding" Value="6,4"/>
-            <Setter Property="MinWidth" Value="36"/>
-            <Setter Property="MinHeight" Value="32"/>
-            <Setter Property="Template">
-                <Setter.Value>
-                    <ControlTemplate TargetType="ToggleButton">
-                        <Border x:Name="border"
-                                Background="{TemplateBinding Background}" 
-                                Padding="{TemplateBinding Padding}"
-                                CornerRadius="4">
-                            <ContentPresenter HorizontalAlignment="Center" 
-                                            VerticalAlignment="Center"/>
-                        </Border>
-                        <ControlTemplate.Triggers>
-                            <Trigger Property="IsChecked" Value="True">
-                                <Setter TargetName="border" Property="Background" Value="#E2E8F0"/>
-                            </Trigger>
-                        </ControlTemplate.Triggers>
-                    </ControlTemplate>
-                </Setter.Value>
-            </Setter>
-            <Style.Triggers>
-                <Trigger Property="IsMouseOver" Value="True">
-                    <Setter Property="Background" Value="#EDF2F7"/>
-                </Trigger>
-            </Style.Triggers>
-        </Style>
-
-        <!-- 渐变背景 -->
-        <LinearGradientBrush x:Key="HeaderGradient" StartPoint="0,0" EndPoint="0,1">
-            <GradientStop Color="#FFFFFF" Offset="0"/>
-            <GradientStop Color="#F7FAFC" Offset="1"/>
-        </LinearGradientBrush>
     </Window.Resources>
 
     <Border CornerRadius="8" 
@@ -521,6 +419,8 @@
                         <ColumnDefinition Width="Auto"/>
                         <ColumnDefinition Width="*"/>
                         <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="Auto"/>
                     </Grid.ColumnDefinitions>
 
                     <TextBlock Grid.Column="0"
@@ -538,17 +438,29 @@
                                Foreground="#4A5568"
                                VerticalAlignment="Center"/>
 
-                    <Button Grid.Column="2"
-                            x:Name="OpenDebugLogWindowButton"
-                            Content="调试历史"
+                    <TextBlock Grid.Column="2"
+                               x:Name="ListProgressTextBlock"
+                               Text="后续 0 项 / 共 0 商家"
+                               FontSize="10"
+                               FontWeight="SemiBold"
+                               Foreground="#64748B"
+                               VerticalAlignment="Center"
+                               Margin="8,0,0,0"/>
+
+                    <Button Grid.Column="3"
+                            x:Name="ScrollToSelectedButton"
+                            Content="⌖"
+                            ToolTip="定位选中项"
+                            Style="{StaticResource PrimaryActionButton}"
                             Margin="8,0,0,0"
-                            Padding="8,2"
-                            FontSize="10"
-                            FontWeight="SemiBold"
-                            Foreground="White"
-                            Background="#1F2937"
-                            BorderThickness="0"
-                            Cursor="Hand"
+                            Click="ScrollToSelectedButton_Click"/>
+
+                    <Button Grid.Column="4"
+                            x:Name="OpenDebugLogWindowButton"
+                            Content="T"
+                            ToolTip="调试历史"
+                            Style="{StaticResource PrimaryActionButton}"
+                            Margin="4,0,0,0"
                             Click="OpenDebugLogWindowButton_Click"/>
                 </Grid>
             </Border>

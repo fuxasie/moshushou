@@ -168,6 +168,7 @@ namespace moshushou
         private string _lastLoadedFilePath = string.Empty;
         private int _lastLoadedColumnCount = 0;
         private string _activeTailMessage = string.Empty;
+        private int _activeIssueSegmentStartCount = 30;
 
 
 
@@ -338,6 +339,7 @@ namespace moshushou
             StoreTreeView.SelectedItemChanged += StoreTreeView_SelectedItemChanged;
             this.Loaded += MainWindow_Loaded;
             this.Closing += MainWindow_Closing;
+            UpdateListProgressStatus();
         }
 
         private void MainWindow_Loaded(object sender, RoutedEventArgs e)
@@ -517,6 +519,50 @@ namespace moshushou
             _debugLogWindow.Activate();
         }
 
+        private void ScrollToSelectedButton_Click(object sender, RoutedEventArgs e)
+        {
+            TreeViewNode? targetNode = StoreTreeView.SelectedItem as TreeViewNode;
+            if (targetNode == null || string.IsNullOrWhiteSpace(targetNode.StoreName))
+            {
+                targetNode = _currentSelectedNode;
+            }
+
+            if ((targetNode == null || string.IsNullOrWhiteSpace(targetNode.StoreName)) &&
+                _currentSelectedIndex >= 0 &&
+                _currentSelectedIndex < _flatNodeList.Count)
+            {
+                targetNode = _flatNodeList[_currentSelectedIndex];
+            }
+
+            if (targetNode == null || string.IsNullOrWhiteSpace(targetNode.StoreName))
+            {
+                StatusTextBlock.Text = "当前没有可定位的选中项";
+                return;
+            }
+
+            _currentSelectedNode = targetNode;
+            if (_flatNodeList.Count == 0)
+            {
+                RebuildFlatNodeList();
+            }
+            if (_flatNodeList.Contains(targetNode))
+            {
+                _currentSelectedIndex = _flatNodeList.IndexOf(targetNode);
+            }
+
+            SyncTreeViewSelection(targetNode);
+            Application.Current.Dispatcher.InvokeAsync(() =>
+            {
+                if (StoreTreeView.ItemContainerGenerator.ContainerFromItem(targetNode) is TreeViewItem container)
+                {
+                    container.Focus();
+                }
+            }, System.Windows.Threading.DispatcherPriority.Background);
+
+            StatusTextBlock.Text = $"已定位到：{targetNode.StoreName}";
+            UpdateListProgressStatus();
+        }
+
         public sealed class ParseOverrideDebugContext
         {
             public string FilePath { get; init; } = string.Empty;
@@ -524,6 +570,7 @@ namespace moshushou
             public string ParseMode { get; init; } = FileParseModes.Auto;
             public int TrackingColumn { get; init; } = 1;
             public int StoreColumn { get; init; } = 2;
+            public int IssueSegmentStartCount { get; init; } = 30;
             public string TailMessage { get; init; } = string.Empty;
         }
 
@@ -553,6 +600,7 @@ namespace moshushou
                 ParseMode = parseMode,
                 TrackingColumn = Math.Max(1, fileOverride?.TrackingColumn ?? 1),
                 StoreColumn = Math.Max(1, fileOverride?.StoreColumn ?? defaultStoreColumn),
+                IssueSegmentStartCount = ResolveIssueSegmentStartCount(fileOverride),
                 TailMessage = fileOverride?.TailMessage?.Trim() ?? GetCurrentTailMessage()
             };
         }
@@ -583,10 +631,16 @@ namespace moshushou
                 return false;
             }
 
+            FileParseOverride? previousOverride = FindFileParseOverride(filePath);
+            int previousIssueSegmentStartCount = ResolveIssueSegmentStartCount(previousOverride);
             string parseMode = FileParseModes.Normalize(overrideRule?.ParseMode);
             int trackingColumn = Math.Max(1, overrideRule?.TrackingColumn ?? 1);
             int storeColumn = Math.Max(1, overrideRule?.StoreColumn ?? 2);
+            int issueSegmentStartCount = Math.Max(2, overrideRule?.IssueSegmentStartCount ?? GetDefaultSegmentSize());
             string tailMessage = overrideRule?.TailMessage?.Trim() ?? string.Empty;
+            bool issueSegmentStartChanged =
+                string.Equals(parseMode, FileParseModes.Issue, StringComparison.Ordinal) &&
+                issueSegmentStartCount != previousIssueSegmentStartCount;
 
             if (string.Equals(parseMode, FileParseModes.Magician, StringComparison.Ordinal) &&
                 string.IsNullOrWhiteSpace(tailMessage))
@@ -596,20 +650,35 @@ namespace moshushou
             }
 
             _searchConfig.FileParseOverrides ??= new List<FileParseOverride>();
+            string normalizedCurrentFilePath = NormalizeFilePathKey(filePath);
             _searchConfig.FileParseOverrides.RemoveAll(item =>
-                !string.IsNullOrWhiteSpace(item?.FilePath) &&
-                string.Equals(item.FilePath, filePath, StringComparison.OrdinalIgnoreCase));
+                item != null &&
+                !string.IsNullOrWhiteSpace(item.FilePath) &&
+                string.Equals(
+                    NormalizeFilePathKey(item.FilePath),
+                    normalizedCurrentFilePath,
+                    StringComparison.OrdinalIgnoreCase));
 
             if (!string.Equals(parseMode, FileParseModes.Auto, StringComparison.Ordinal))
             {
                 _searchConfig.FileParseOverrides.Add(new FileParseOverride
                 {
-                    FilePath = filePath,
+                    FilePath = normalizedCurrentFilePath,
                     ParseMode = parseMode,
                     TrackingColumn = trackingColumn,
                     StoreColumn = storeColumn,
+                    IssueSegmentStartCount = issueSegmentStartCount,
                     TailMessage = tailMessage
                 });
+            }
+
+            bool segmentProgressReset = false;
+            if (issueSegmentStartChanged)
+            {
+                segmentProgressReset = ResetIssueSegmentStateForCurrentFile(filePath);
+                DebugLogManager.Log(
+                    "ParseMode",
+                    $"问题件分段起始条数变更：{previousIssueSegmentStartCount} -> {issueSegmentStartCount}，已清空历史分段勾选/进度");
             }
 
             _searchConfig.Save();
@@ -617,11 +686,12 @@ namespace moshushou
             string modeTip = parseMode switch
             {
                 FileParseModes.Magician => "魔术师格式（两列表格+尾部话术）",
-                FileParseModes.Issue => $"问题件格式（运单列={trackingColumn}，店铺列={storeColumn}）",
+                FileParseModes.Issue => $"问题件格式（运单列={trackingColumn}，店铺列={storeColumn}，分段起始条数={issueSegmentStartCount}）",
                 _ => "自动识别"
             };
+            string resetTip = segmentProgressReset ? "，已清空历史分段勾选/进度" : string.Empty;
 
-            StatusTextBlock.Text = $"已应用解析规则：{modeTip}，正在重载文件...";
+            StatusTextBlock.Text = $"已应用解析规则：{modeTip}{resetTip}，正在重载文件...";
             DebugLogManager.Log("ParseMode", $"应用解析规则：{modeTip} | 文件={Path.GetFileName(filePath)}");
 
             LoadExcelButton.IsEnabled = false;
@@ -641,6 +711,62 @@ namespace moshushou
             }
         }
 
+        private bool ResetIssueSegmentStateForCurrentFile(string filePath)
+        {
+            if (_searchConfig == null || string.IsNullOrWhiteSpace(filePath))
+            {
+                return false;
+            }
+
+            bool changed = false;
+            string normalizedFilePath = NormalizeFilePathKey(filePath);
+
+            _searchConfig.LastIssueFileState ??= new FileState();
+            var issueState = _searchConfig.LastIssueFileState;
+            if (!string.IsNullOrWhiteSpace(issueState.FilePath) &&
+                string.Equals(
+                    NormalizeFilePathKey(issueState.FilePath),
+                    normalizedFilePath,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                if (issueState.SegmentFailures != null && issueState.SegmentFailures.Count > 0)
+                {
+                    issueState.SegmentFailures.Clear();
+                    changed = true;
+                }
+                else if (issueState.SegmentFailures == null)
+                {
+                    issueState.SegmentFailures = new List<SegmentFailureState>();
+                }
+            }
+
+            lock (_segmentFailureLock)
+            {
+                if (_segmentFailureInfos.Count > 0)
+                {
+                    _segmentFailureInfos.Clear();
+                    changed = true;
+                }
+            }
+
+            lock (_sentStoreLock)
+            {
+                if (_sentStores.Count > 0)
+                {
+                    _sentStores.Clear();
+                    changed = true;
+                }
+            }
+
+            if (_ctrlSpaceSegmentCursor.Count > 0)
+            {
+                _ctrlSpaceSegmentCursor.Clear();
+                changed = true;
+            }
+
+            return changed;
+        }
+
         private FileParseOverride? FindFileParseOverride(string filePath)
         {
             if (_searchConfig?.FileParseOverrides == null || string.IsNullOrWhiteSpace(filePath))
@@ -648,11 +774,16 @@ namespace moshushou
                 return null;
             }
 
-            string normalizedFilePath = filePath.Trim();
-            return _searchConfig.FileParseOverrides.FirstOrDefault(item =>
-                item != null &&
-                !string.IsNullOrWhiteSpace(item.FilePath) &&
-                string.Equals(item.FilePath.Trim(), normalizedFilePath, StringComparison.OrdinalIgnoreCase));
+            string normalizedFilePath = NormalizeFilePathKey(filePath);
+            return _searchConfig.FileParseOverrides
+                .Where(item =>
+                    item != null &&
+                    !string.IsNullOrWhiteSpace(item.FilePath) &&
+                    string.Equals(
+                        NormalizeFilePathKey(item.FilePath),
+                        normalizedFilePath,
+                        StringComparison.OrdinalIgnoreCase))
+                .LastOrDefault();
         }
 
         private string GetCurrentTailMessage()
@@ -665,6 +796,82 @@ namespace moshushou
 
             _activeTailMessage = fallback;
             return fallback;
+        }
+
+        private int GetDefaultSegmentSize()
+        {
+            int size = _searchConfig?.SegmentSize ?? 30;
+            if (size <= 0)
+            {
+                size = 30;
+            }
+
+            return size;
+        }
+
+        private static string NormalizeFilePathKey(string path)
+        {
+            if (string.IsNullOrWhiteSpace(path))
+            {
+                return string.Empty;
+            }
+
+            try
+            {
+                return Path.GetFullPath(path.Trim());
+            }
+            catch
+            {
+                return path.Trim();
+            }
+        }
+
+        private int ResolveIssueSegmentStartCount(FileParseOverride? fileOverride)
+        {
+            int fallback = Math.Max(2, GetDefaultSegmentSize());
+            if (fileOverride == null)
+            {
+                return fallback;
+            }
+
+            return fileOverride.IssueSegmentStartCount >= 2
+                ? fileOverride.IssueSegmentStartCount
+                : fallback;
+        }
+
+        private int GetSegmentSizeForPayloadMode(StorePayloadMode mode)
+        {
+            if (mode == StorePayloadMode.Issue)
+            {
+                return Math.Max(2, _activeIssueSegmentStartCount);
+            }
+
+            return Math.Max(1, GetDefaultSegmentSize());
+        }
+
+        private int GetSegmentSizeForStore(string storeName)
+        {
+            if (string.IsNullOrWhiteSpace(storeName))
+            {
+                return Math.Max(1, GetDefaultSegmentSize());
+            }
+
+            List<string>? rows = null;
+            lock (_dataLock)
+            {
+                if (_storeData.TryGetValue(storeName, out var foundRows) && foundRows != null)
+                {
+                    rows = foundRows.ToList();
+                }
+            }
+
+            if (rows == null || rows.Count == 0)
+            {
+                return Math.Max(1, GetDefaultSegmentSize());
+            }
+
+            StorePayloadMode mode = ResolveStorePayloadMode(storeName, rows);
+            return GetSegmentSizeForPayloadMode(mode);
         }
 
 
@@ -2867,7 +3074,7 @@ namespace moshushou
             }
             if (sentItems <= 0)
             {
-                int segmentSize = Math.Max(1, _searchConfig.SegmentSize);
+                int segmentSize = GetSegmentSizeForStore(rootNode.StoreName);
                 sentItems = Math.Min(totalItems, sentSegments * segmentSize);
             }
 
@@ -4542,7 +4749,8 @@ namespace moshushou
                 trackingNumbers = trackingNumbers.ToList();
             }
 
-            int segmentSize = Math.Max(1, _searchConfig.SegmentSize);
+            StorePayloadMode payloadMode = ResolveStorePayloadMode(storeName, trackingNumbers);
+            int segmentSize = GetSegmentSizeForPayloadMode(payloadMode);
             int totalSegments = (int)Math.Ceiling((double)trackingNumbers.Count / segmentSize);
             Log($"共 {trackingNumbers.Count} 条，分 {totalSegments} 段，每段 {segmentSize} 条");
 
@@ -5027,7 +5235,7 @@ namespace moshushou
                 TryGetSegmentFailureInfo(storeName, out var segmentFailureInfo) &&
                 segmentFailureInfo != null)
             {
-                int segmentSize = Math.Max(1, _searchConfig.SegmentSize);
+                int segmentSize = GetSegmentSizeForStore(storeName);
                 int totalSegments = itemCount > 0
                     ? (int)Math.Ceiling((double)itemCount / segmentSize)
                     : 0;
@@ -5386,6 +5594,7 @@ namespace moshushou
             // ✅ [Fix] 重置模式标志，确保每次加载文件时从干净状态开始
             _isIssueMode = false;
             _isCustomMessageMode = false;
+            _activeIssueSegmentStartCount = Math.Max(2, GetDefaultSegmentSize());
 
 
 
@@ -5459,6 +5668,8 @@ namespace moshushou
                     int manualStoreColumn = 2;
                     int manualColumnCount = 0;
                     _activeTailMessage = _searchConfig?.FixedMessage ?? string.Empty;
+                    _activeIssueSegmentStartCount = ResolveIssueSegmentStartCount(fileParseOverride);
+                    DebugLogManager.Log("ParseMode", $"当前问题件分段起始条数={_activeIssueSegmentStartCount} | 文件={Path.GetFileName(filePath)}");
 
                     if (string.Equals(parseMode, FileParseModes.Magician, StringComparison.Ordinal))
                     {
@@ -5489,7 +5700,7 @@ namespace moshushou
                         if (useManualTableParse)
                         {
                             System.Diagnostics.Debug.WriteLine(
-                                $"[模式识别] 命中手动规则：问题件格式，运单列={manualTrackingColumn}，店铺列={manualStoreColumn}，有效列数={manualColumnCount}");
+                                $"[模式识别] 命中手动规则：问题件格式，运单列={manualTrackingColumn}，店铺列={manualStoreColumn}，分段起始条数={_activeIssueSegmentStartCount}，有效列数={manualColumnCount}");
                         }
                         else
                         {
@@ -5557,6 +5768,12 @@ namespace moshushou
                             System.Diagnostics.Debug.WriteLine("[模式识别] 未匹配问题件/自定义结构，使用【未发货模式】");
                         }
                     }
+
+                    string resolvedModeName = _isIssueMode ? "Issue" : (_isCustomMessageMode ? "CustomMessage" : "Normal");
+                    string overrideModeName = fileParseOverride == null ? "None" : FileParseModes.Normalize(fileParseOverride.ParseMode);
+                    DebugLogManager.Log(
+                        "ParseMode",
+                        $"生效模式={resolvedModeName} | 覆盖规则={overrideModeName} | 问题件分段起始条数={_activeIssueSegmentStartCount} | 默认分段={GetDefaultSegmentSize()}");
 
                     // ✅ 根据模式选择对应的 FileState 进行状态恢复
                     if (_searchConfig != null)
@@ -5770,6 +5987,7 @@ namespace moshushou
                 {
                     StatusTextBlock.Text = $"文件读取错误: {ex.Message}";
                     StoreTreeView.ItemsSource = null;
+                    UpdateListProgressStatus();
                 });
             }
         }
@@ -5970,7 +6188,7 @@ namespace moshushou
 
                     case SendStrategy.TextSegmented:
                         // ✅ [新功能] 分段显示子节点
-                        int segmentSize = Math.Max(1, _searchConfig.SegmentSize);
+                        int segmentSize = GetSegmentSizeForPayloadMode(payloadMode);
                         int totalSegments = (int)Math.Ceiling((double)itemCount / segmentSize);
                         
                         for (int i = 0; i < totalSegments; i++)
@@ -6060,6 +6278,7 @@ namespace moshushou
 
                 string filterInfo = _currentFilter.Count > 0 ? $"（已筛选 {_currentFilter.Count} 个关键词）" : "";
                 StatusTextBlock.Text = $"处理完成，共显示 {sortedStores.Count} 个商家{filterInfo}";
+                UpdateListProgressStatus();
             });
         }
 
@@ -6350,14 +6569,28 @@ namespace moshushou
 
         private void TreeViewItem_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
         {
-            if (sender is FrameworkElement element && element.DataContext is TreeViewNode node && !string.IsNullOrEmpty(node.StoreName))
+            _startPoint = e.GetPosition(null);
+
+            if (sender is FrameworkElement element && element.DataContext is TreeViewNode node && !string.IsNullOrWhiteSpace(node.StoreName))
             {
                 if (FindVisualParent<TreeViewItem>(element) is TreeViewItem treeViewItem)
                 {
-                    treeViewItem.IsSelected = true;
+                    if (!treeViewItem.IsSelected)
+                    {
+                        treeViewItem.IsSelected = true;
+                    }
+                    treeViewItem.Focus();
                 }
-                TriggerCopyOperation(node);
-                e.Handled = true;
+
+                _currentSelectedNode = node;
+                if (_flatNodeList.Count == 0)
+                {
+                    RebuildFlatNodeList();
+                }
+                if (_flatNodeList.Contains(node))
+                {
+                    _currentSelectedIndex = _flatNodeList.IndexOf(node);
+                }
             }
         }
 
@@ -6617,6 +6850,7 @@ namespace moshushou
                 {
                     _currentSelectedIndex = _flatNodeList.IndexOf(node);
                 }
+                UpdateListProgressStatus();
                 
                 // ✅ 保存当前选中的商家名，用于下次打开相同文件时恢复
                 if (node.StoreName != "FAIL_SEPARATOR")
@@ -6880,9 +7114,17 @@ namespace moshushou
         // ✅ 新增：选中事件自动滚动
         private void TreeViewItem_Selected(object sender, RoutedEventArgs e)
         {
-            if (sender is TreeViewItem item)
+            if (e.OriginalSource is TreeViewItem item && item.DataContext is TreeViewNode node)
             {
-                item.BringIntoView();
+                _currentSelectedNode = node;
+                if (_flatNodeList.Count == 0)
+                {
+                    RebuildFlatNodeList();
+                }
+                if (_flatNodeList.Contains(node))
+                {
+                    _currentSelectedIndex = _flatNodeList.IndexOf(node);
+                }
             }
         }
 
@@ -6891,31 +7133,19 @@ namespace moshushou
         /// </summary>
         private void StoreTreeView_ScrollChanged(object sender, ScrollChangedEventArgs e)
         {
-            if (_currentSelectedNode == null || string.IsNullOrEmpty(_currentSelectedNode.StoreName))
+            // 不在滚动时强制恢复旧选中项，避免拖动滚动条后锁死在上一个节点。
+            if (StoreTreeView.SelectedItem is TreeViewNode selectedNode &&
+                !string.IsNullOrWhiteSpace(selectedNode.StoreName))
             {
-                return;
-            }
-
-            if (_currentSelectedNode.StoreName == "FAIL_SEPARATOR")
-            {
-                return;
-            }
-
-            if (_flatNodeList.Count == 0)
-            {
-                RebuildFlatNodeList();
-            }
-
-            if (!_flatNodeList.Contains(_currentSelectedNode))
-            {
-                return;
-            }
-
-            // 仅在状态被意外清掉时恢复，不主动滚动，避免打断用户拖动列表。
-            if (!_currentSelectedNode.IsSelected)
-            {
-                ClearAllTreeViewSelections();
-                _currentSelectedNode.IsSelected = true;
+                _currentSelectedNode = selectedNode;
+                if (_flatNodeList.Count == 0)
+                {
+                    RebuildFlatNodeList();
+                }
+                if (_flatNodeList.Contains(selectedNode))
+                {
+                    _currentSelectedIndex = _flatNodeList.IndexOf(selectedNode);
+                }
             }
         }
 
@@ -6959,14 +7189,145 @@ namespace moshushou
         /// </summary>
         private void ClearAllTreeViewSelections()
         {
-            // 直接遍历扁平化列表，效率更高且覆盖所有节点（包括不可见的）
-            foreach (var node in _flatNodeList)
+            foreach (var node in EnumerateAllTreeNodes())
             {
                 if (node != _currentSelectedNode && node.IsSelected)
                 {
                     node.IsSelected = false;
                 }
             }
+        }
+
+        private IEnumerable<TreeViewNode> EnumerateAllTreeNodes()
+        {
+            if (_treeViewCollection == null)
+            {
+                yield break;
+            }
+
+            foreach (var root in _treeViewCollection)
+            {
+                foreach (var node in EnumerateTreeNodesRecursive(root))
+                {
+                    yield return node;
+                }
+            }
+        }
+
+        private static IEnumerable<TreeViewNode> EnumerateTreeNodesRecursive(TreeViewNode? node)
+        {
+            if (node == null)
+            {
+                yield break;
+            }
+
+            yield return node;
+
+            if (node.Children == null)
+            {
+                yield break;
+            }
+
+            foreach (var child in node.Children)
+            {
+                foreach (var nested in EnumerateTreeNodesRecursive(child))
+                {
+                    yield return nested;
+                }
+            }
+        }
+
+        private void UpdateListProgressStatus()
+        {
+            void UpdateCore()
+            {
+                if (ListProgressTextBlock == null)
+                {
+                    return;
+                }
+
+                List<TreeViewNode> storeNodes = GetTopLevelStoreNodesSnapshot();
+                int totalStores = storeNodes.Count;
+                if (totalStores <= 0)
+                {
+                    ListProgressTextBlock.Text = "后续 0 项 / 共 0 商家";
+                    return;
+                }
+
+                TreeViewNode? currentRoot = ResolveCurrentRootNodeForProgress(storeNodes);
+                int currentIndex = currentRoot == null ? -1 : storeNodes.IndexOf(currentRoot);
+                if (currentIndex < 0 && currentRoot != null)
+                {
+                    currentIndex = storeNodes.FindIndex(n =>
+                        string.Equals(n.StoreName, currentRoot.StoreName, StringComparison.Ordinal));
+                }
+
+                int remaining = currentIndex >= 0
+                    ? Math.Max(0, totalStores - currentIndex - 1)
+                    : totalStores;
+                ListProgressTextBlock.Text = $"后续 {remaining} 项 / 共 {totalStores} 商家";
+            }
+
+            if (Application.Current?.Dispatcher == null)
+            {
+                return;
+            }
+
+            if (Application.Current.Dispatcher.CheckAccess())
+            {
+                UpdateCore();
+            }
+            else
+            {
+                Application.Current.Dispatcher.Invoke(UpdateCore);
+            }
+        }
+
+        private List<TreeViewNode> GetTopLevelStoreNodesSnapshot()
+        {
+            IEnumerable<TreeViewNode>? source = _treeViewCollection;
+            if (source == null && StoreTreeView.ItemsSource is IEnumerable<TreeViewNode> uiSource)
+            {
+                source = uiSource;
+            }
+
+            if (source == null)
+            {
+                return new List<TreeViewNode>();
+            }
+
+            return source
+                .Where(node => IsSelectableNode(node))
+                .ToList();
+        }
+
+        private TreeViewNode? ResolveCurrentRootNodeForProgress(List<TreeViewNode> storeNodes)
+        {
+            TreeViewNode? currentNode = StoreTreeView.SelectedItem as TreeViewNode ?? _currentSelectedNode;
+            if ((currentNode == null || !IsSelectableNode(currentNode)) &&
+                _currentSelectedIndex >= 0 &&
+                _currentSelectedIndex < _flatNodeList.Count)
+            {
+                currentNode = _flatNodeList[_currentSelectedIndex];
+            }
+
+            if (currentNode == null || !IsSelectableNode(currentNode))
+            {
+                return null;
+            }
+
+            if (storeNodes.Contains(currentNode))
+            {
+                return currentNode;
+            }
+
+            if (TryResolveRootNode(currentNode, out TreeViewNode rootNode) && IsSelectableNode(rootNode))
+            {
+                return rootNode;
+            }
+
+            return storeNodes.FirstOrDefault(n =>
+                string.Equals(n.StoreName, currentNode.StoreName, StringComparison.Ordinal));
         }
 
         /// <summary>
@@ -7090,6 +7451,17 @@ namespace moshushou
         /// </summary>
         private StorePayloadMode ResolveStorePayloadMode(string storeName, List<string> rows)
         {
+            // 手动/自动已识别为问题件时，优先按问题件处理（确保使用问题件分段阈值）
+            if (_isIssueMode)
+            {
+                return StorePayloadMode.Issue;
+            }
+
+            if (_isCustomMessageMode)
+            {
+                return StorePayloadMode.CustomMessage;
+            }
+
             string? firstRow = rows?.FirstOrDefault(r => !string.IsNullOrWhiteSpace(r));
             int columnCount = GetTabColumnCount(firstRow);
 
@@ -7115,9 +7487,9 @@ namespace moshushou
             if (mode == StorePayloadMode.Normal && itemCount > 100)
                 return SendStrategy.FileExcel;
 
-            // 4列/5列模式：超过 SegmentSize 走分段
+            // 4列/5列模式：超过对应分段起始条数走分段（问题件可由解析设置覆盖）
             if ((mode == StorePayloadMode.CustomMessage || mode == StorePayloadMode.Issue)
-                && itemCount > _searchConfig.SegmentSize)
+                && itemCount > GetSegmentSizeForPayloadMode(mode))
                 return SendStrategy.TextSegmented;
 
             // 其余：一次性文本

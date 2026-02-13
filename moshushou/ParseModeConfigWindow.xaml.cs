@@ -39,6 +39,7 @@ namespace moshushou
 
             TrackingColumnTextBox.Text = Math.Max(1, _context.TrackingColumn).ToString();
             StoreColumnTextBox.Text = Math.Max(1, _context.StoreColumn).ToString();
+            IssueSegmentStartCountTextBox.Text = Math.Max(2, _context.IssueSegmentStartCount).ToString();
             TailMessageTextBox.Text = _context.TailMessage ?? string.Empty;
 
             UpdateInputState();
@@ -67,11 +68,11 @@ namespace moshushou
             {
                 if (_context.DetectedColumnCount > 0)
                 {
-                    HintTextBlock.Text = $"问题件格式：将按整行内容发送（Tab分割）。请填写运单号列和商家名列。当前检测列数：{_context.DetectedColumnCount}。";
+                    HintTextBlock.Text = $"问题件格式：将按整行内容发送（Tab分割）。请填写运单号列、商家名列和分段起始条数（>=2）。当前检测列数：{_context.DetectedColumnCount}。";
                 }
                 else
                 {
-                    HintTextBlock.Text = "问题件格式：将按整行内容发送（Tab分割）。请填写运单号列和商家名列。";
+                    HintTextBlock.Text = "问题件格式：将按整行内容发送（Tab分割）。请填写运单号列、商家名列和分段起始条数（>=2）。";
                 }
             }
             else if (isMagicianMode)
@@ -94,6 +95,7 @@ namespace moshushou
             string parseMode = GetSelectedMode();
             int trackingColumn = Math.Max(1, _context.TrackingColumn);
             int storeColumn = Math.Max(1, _context.StoreColumn);
+            int issueSegmentStartCount = Math.Max(2, _context.IssueSegmentStartCount);
             string tailMessage = TailMessageTextBox.Text?.Trim() ?? string.Empty;
 
             if (string.Equals(parseMode, FileParseModes.Issue, StringComparison.Ordinal))
@@ -107,6 +109,12 @@ namespace moshushou
                 if (!int.TryParse(StoreColumnTextBox.Text?.Trim(), out storeColumn) || storeColumn <= 0)
                 {
                     MessageBox.Show(this, "商家名列必须是大于 0 的整数。", "输入错误", MessageBoxButton.OK, MessageBoxImage.Warning);
+                    return;
+                }
+
+                if (!int.TryParse(IssueSegmentStartCountTextBox.Text?.Trim(), out issueSegmentStartCount) || issueSegmentStartCount < 2)
+                {
+                    MessageBox.Show(this, "分段起始条数必须是大于等于 2 的整数。", "输入错误", MessageBoxButton.OK, MessageBoxImage.Warning);
                     return;
                 }
             }
@@ -125,6 +133,7 @@ namespace moshushou
                 ParseMode = parseMode,
                 TrackingColumn = trackingColumn,
                 StoreColumn = storeColumn,
+                IssueSegmentStartCount = issueSegmentStartCount,
                 TailMessage = tailMessage
             };
 
