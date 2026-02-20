@@ -133,8 +133,6 @@
                                   Content="⚡ 发送"
                                   Margin="8,0,0,0"
                                   Style="{StaticResource ModernCheckBox}"/>
-
-
                     </StackPanel>
                 </Grid>
             </Border>
@@ -249,6 +247,7 @@
                           Background="Transparent"
                           Padding="6"
                           BorderThickness="0">
+
                     <!-- 
                         *** TreeView 主模板已改造 *** 
                         现在，每个商家项由一个包含两行文本的StackPanel组成，
@@ -457,6 +456,14 @@
                                     Style="{StaticResource PrimaryActionButton}"
                                     Margin="4,0,0,0"
                                     Click="OpenDebugLogWindowButton_Click"/>
+
+                            <!-- 新移动的杂项设置按钮 -->
+                            <Button x:Name="SettingsButton"
+                                    Content="⚙"
+                                    ToolTip="杂项设置"
+                                    Style="{StaticResource PrimaryActionButton}"
+                                    Margin="4,0,0,0"
+                                    Click="SettingsButton_Click"/>
                         </StackPanel>
                     </Grid>
 

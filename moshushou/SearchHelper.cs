@@ -386,7 +386,7 @@ namespace moshushou
                         try { Clipboard.Clear(); } catch { }
 
                         // 写入新数据
-                        Clipboard.SetDataObject(text, true);
+                        Clipboard.SetDataObject(text, false);
 
                         // ✅ [修复] 立即读取校验，确保写入成功
                         // 注意：有时 SetDataObject 不抛异常但实际没写入，所以必须校验

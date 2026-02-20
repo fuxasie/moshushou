@@ -139,6 +139,12 @@ namespace moshushou
         /// </summary>
         public int SegmentDelayMs { get; set; } = 500;
 
+        // ✅ 新增：OSD 悬浮窗显示开关
+        public bool EnableOsdWindow { get; set; } = true;
+        
+        // ✅ 新增：按 Ctrl+空格 发送后是否禁止自动跳下一项
+        public bool SkipNextOnCtrlSpace { get; set; } = false;
+
         // ... Load 和 Save 方法保持不变 ...
         private static readonly string ConfigPath = Path.Combine(
             AppDomain.CurrentDomain.BaseDirectory, "search_config.json");

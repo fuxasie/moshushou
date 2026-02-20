@@ -140,6 +140,12 @@ namespace moshushou
         private IntPtr _lastLayoutVerifiedHwnd = IntPtr.Zero;
         private bool? _lastLayoutVerifiedIsWework = null;
 
+        // ✅ 防抖写入和防抖复制：防止快速切换商家列表时造成的卡顿
+        private System.Windows.Threading.DispatcherTimer _selectionSaveDebounceTimer;
+        private string _pendingSaveStoreName;
+        private System.Windows.Threading.DispatcherTimer _selectionCopyDebounceTimer;
+        private TreeViewNode _pendingCopyNode;
+
         // 防止自动化搜索阶段被“选中即复制”逻辑污染剪贴板
         private int _clipboardSearchGuard = 0;
         // 标记最近一次自动流程失败是否发生在“已进入群聊并执行发送”阶段
@@ -183,6 +189,8 @@ namespace moshushou
         private const int HOTKEY_F2 = 9008;
         private const int HOTKEY_CTRL_SPACE = 9009;
         private const int HOTKEY_CTRL_SHIFT_SPACE = 9010;
+        private const int HOTKEY_W = 9011;
+        private const int HOTKEY_S = 9012;
         private const uint VK_F1 = 0x70;
         private const uint VK_F2 = 0x71;
 
@@ -261,6 +269,8 @@ namespace moshushou
         private const uint VK_RETURN = 0x0D;
         private const uint VK_OEM_7 = 0xDE;
         private const uint VK_SPACE = 0x20;
+        private const uint VK_W = 0x57;
+        private const uint VK_S = 0x53;
         private const int VK_CONTROL_KEY = 0x11;
         private const int VK_LCONTROL_KEY = 0xA2;
         private const int VK_RCONTROL_KEY = 0xA3;
@@ -291,6 +301,16 @@ namespace moshushou
             _inputSimulator = new InputSimulator();
 
             LoadBusinessInfo();
+
+            // 初始化选中防抖：控制文件状态写入频率
+            _selectionSaveDebounceTimer = new System.Windows.Threading.DispatcherTimer();
+            _selectionSaveDebounceTimer.Interval = TimeSpan.FromMilliseconds(500);
+            _selectionSaveDebounceTimer.Tick += SelectionSaveDebounceTimer_Tick;
+
+            // 初始化选中复制防抖：控制连续按下上下键时抢剪贴板
+            _selectionCopyDebounceTimer = new System.Windows.Threading.DispatcherTimer();
+            _selectionCopyDebounceTimer.Interval = TimeSpan.FromMilliseconds(200);
+            _selectionCopyDebounceTimer.Tick += SelectionCopyDebounceTimer_Tick;
 
 
             ExcelPackage.License.SetNonCommercialPersonal("fff");
@@ -367,6 +387,65 @@ namespace moshushou
             }
         }
  
+        private void SelectionCopyDebounceTimer_Tick(object sender, EventArgs e)
+        {
+            _selectionCopyDebounceTimer.Stop();
+            var nodeToCopy = _pendingCopyNode;
+            if (nodeToCopy == null) return;
+
+            if (_isAutoRunning ||
+                Volatile.Read(ref _clipboardSearchGuard) > 0 ||
+                Volatile.Read(ref _selectionCopyGuard) > 0)
+            {
+                return;
+            }
+
+            if (Interlocked.CompareExchange(ref _copyingFlag, 1, 0) == 1) return;
+
+            // ✅ [修复] 子节点优先复制 RawData (分段或单行)
+            if (!string.IsNullOrEmpty(nodeToCopy.RawData) && nodeToCopy.Strategy != SendStrategy.FileExcel)
+            {
+                string textToCopy = nodeToCopy.RawData;
+                Task.Run(async () =>
+                {
+                    try
+                    {
+                        if (!await SetClipboardWithRetryAsync(textToCopy)) 
+                            throw new Exception("剪贴板被占用");
+                        
+                        Application.Current.Dispatcher.Invoke(() => 
+                            StatusTextBlock.Text = "✅ 已复制选中的内容");
+                    }
+                    catch (Exception ex)
+                    {
+                        Application.Current.Dispatcher.Invoke(() => 
+                            StatusTextBlock.Text = $"❌ 复制失败: {ex.Message}");
+                    }
+                    finally
+                    {
+                        Interlocked.Exchange(ref _copyingFlag, 0);
+                    }
+                });
+                return;
+            }
+
+            // 主列表复制内容跟随搜索模式
+            CopyPreferredSearchText(nodeToCopy);
+            Interlocked.Exchange(ref _copyingFlag, 0);
+        }
+
+        private void SelectionSaveDebounceTimer_Tick(object sender, EventArgs e)
+        {
+            _selectionSaveDebounceTimer.Stop();
+            if (!string.IsNullOrEmpty(_pendingSaveStoreName) && _pendingSaveStoreName != "FAIL_SEPARATOR")
+            {
+                SaveFileState(_pendingSaveStoreName);
+                
+                // 也执行一次针对这节点的选择历史记录，需要在数据中再匹配一下 Node
+                var node = _flatNodeList?.FirstOrDefault(n => n.StoreName == _pendingSaveStoreName);
+                if (node != null) RecordStoreSelectionHistory(node);
+            }
+        }
 
         private string GetWindowClass(IntPtr hwnd)
         {
@@ -497,6 +576,15 @@ namespace moshushou
                 TogglePollingModeButton.Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#3B82F6")); 
                 StatusTextBlock.Text = "已切换为 [群名搜索] 模式";
             }
+        }
+
+        private void SettingsButton_Click(object sender, RoutedEventArgs e)
+        {
+            var settingsWindow = new SettingsWindow(_searchConfig)
+            {
+                Owner = this
+            };
+            settingsWindow.ShowDialog();
         }
 
         private void OpenDebugLogWindowButton_Click(object sender, RoutedEventArgs e)
@@ -1101,6 +1189,9 @@ namespace moshushou
                     _ctrlSpaceFallbackActive = spaceFallbackRegistered;
                 }
 
+                bool wRegistered = RegisterHotKey(_windowHandle, HOTKEY_W, MOD_CONTROL, VK_W);
+                bool sRegistered = RegisterHotKey(_windowHandle, HOTKEY_S, MOD_CONTROL, VK_S);
+
                 // 2. 注册新增的 F1 / F2 (无修饰键)
                 bool f1Registered = RegisterHotKey(_windowHandle, HOTKEY_F1, 0, VK_F1);
                 bool f2Registered = RegisterHotKey(_windowHandle, HOTKEY_F2, 0, VK_F2);
@@ -1112,12 +1203,14 @@ namespace moshushou
                     enterRegistered &&
                     quoteRegistered &&
                     (spaceRegistered || spaceFallbackRegistered) &&
+                    wRegistered &&
+                    sRegistered &&
                     f1Registered &&
                     f2Registered)
                 {
                     _globalHotkeysRegistered = true;
                     string ctrlSpaceTip = _ctrlSpaceFallbackActive ? "Ctrl+Shift+Space快捷粘贴(兼容)" : "Ctrl+Space快捷粘贴";
-                    StatusTextBlock.Text = $"快捷键：F1开始自动/F2停止，Ctrl+↑↓切换，Ctrl+←复制店铺，Ctrl+→粘贴发送，{ctrlSpaceTip}，Ctrl+Enter手动搜索，Ctrl+'识别群名";
+                    StatusTextBlock.Text = $"快捷键：F1开始自动/F2停止，Ctrl+↑↓/WS切换，Ctrl+←复制店铺，Ctrl+→粘贴发送，{ctrlSpaceTip}，Ctrl+Enter手动搜索，Ctrl+'识别群名";
                 }
                 else
                 {
@@ -1146,6 +1239,8 @@ namespace moshushou
                 UnregisterHotKey(_windowHandle, HOTKEY_QUOTE);
                 UnregisterHotKey(_windowHandle, HOTKEY_CTRL_SPACE);
                 UnregisterHotKey(_windowHandle, HOTKEY_CTRL_SHIFT_SPACE);
+                UnregisterHotKey(_windowHandle, HOTKEY_W);
+                UnregisterHotKey(_windowHandle, HOTKEY_S);
 
                 // 注销 F1 / F2
                 UnregisterHotKey(_windowHandle, HOTKEY_F1);
@@ -1169,15 +1264,15 @@ namespace moshushou
                 int id = wParam.ToInt32();
                 bool shouldHandle = false;
 
-                if (id == HOTKEY_UP)
+                if (id == HOTKEY_UP || id == HOTKEY_W)
                 {
-                    // 向上导航 (保持原样)
+                    // 向上导航 
                     Application.Current.Dispatcher.Invoke(() => NavigateTreeView(-1));
                     shouldHandle = true;
                 }
-                else if (id == HOTKEY_DOWN)
+                else if (id == HOTKEY_DOWN || id == HOTKEY_S)
                 {
-                    // 向下导航 (保持原样)
+                    // 向下导航 
                     Application.Current.Dispatcher.Invoke(() => NavigateTreeView(1));
                     shouldHandle = true;
                 }
@@ -3209,7 +3304,15 @@ namespace moshushou
             }
 
             _ctrlSpaceSegmentCursor[rootNode.StoreName] = 0;
-            await AdvanceToNextMainNodeAndCopyStoreNameAsync(rootNode);
+            
+            if (_searchConfig.SkipNextOnCtrlSpace)
+            {
+                StatusTextBlock.Text += " (勾选了不跳转，停留在当前项)";
+            }
+            else
+            {
+                await AdvanceToNextMainNodeAndCopyStoreNameAsync(rootNode);
+            }
         }
 
         private async Task HandleCtrlSpaceSegmentedAsync(TreeViewNode rootNode, TreeViewNode selectedNode, bool autoSend)
@@ -3345,7 +3448,14 @@ namespace moshushou
                 ClearStoreSentMark(rootNode.StoreName, refreshHeader: true);
                 RecordStoreSendHistory(rootNode.StoreName, "Ctrl+Space粘贴", true, "快捷键分段粘贴完成");
             }
-            await AdvanceToNextMainNodeAndCopyStoreNameAsync(rootNode);
+            if (_searchConfig.SkipNextOnCtrlSpace)
+            {
+                StatusTextBlock.Text += " (勾选了不跳转，停留在当前项)";
+            }
+            else
+            {
+                await AdvanceToNextMainNodeAndCopyStoreNameAsync(rootNode);
+            }
         }
 
         private bool ResetCompletedSegmentedStoreProgress(TreeViewNode rootNode, bool refreshHeader = true)
@@ -3869,7 +3979,7 @@ namespace moshushou
                 {
                     var data = new DataObject();
                     data.SetData(DataFormats.FileDrop, new string[] { filePath });
-                    Clipboard.SetDataObject(data, true);
+                    Clipboard.SetDataObject(data, false);
                     return true;
                 }
                 catch { return false; }
@@ -7160,6 +7270,20 @@ namespace moshushou
                 _currentSelectedNode = node;
                 ResetSearchState();
 
+                if (node.StoreName != "FAIL_SEPARATOR")
+                {
+                    if (_searchConfig.EnableOsdWindow)
+                    {
+                        string seqPrefix = "";
+                        int index = _flatNodeList.IndexOf(node);
+                        if (index >= 0)
+                        {
+                            seqPrefix = $"[{index + 1}] ";
+                        }
+                        OsdWindow.ShowMessage(node.StoreName, seqPrefix);
+                    }
+                }
+
                 // ✅ 切换到新项时，检查是否需要重置粘贴状态
                 if (_lastPastedStoreName != node.StoreName)
                 {
@@ -7172,55 +7296,20 @@ namespace moshushou
                 }
                 UpdateListProgressStatus();
                 
-                // ✅ 保存当前选中的商家名，用于下次打开相同文件时恢复
+                // ✅ 取消以前的同步调用，改用防抖保存
                 if (node.StoreName != "FAIL_SEPARATOR")
                 {
-                    SaveFileState(node.StoreName);
-                    RecordStoreSelectionHistory(node);
+                    _pendingSaveStoreName = node.StoreName;
+                    _selectionSaveDebounceTimer.Stop();
+                    _selectionSaveDebounceTimer.Start();
                 }
 
                 SyncBusInfoManagerWithCurrentSelection();
 
-                if (_isAutoRunning ||
-                    Volatile.Read(ref _clipboardSearchGuard) > 0 ||
-                    Volatile.Read(ref _selectionCopyGuard) > 0)
-                {
-                    return;
-                }
-
-                if (Interlocked.CompareExchange(ref _copyingFlag, 1, 0) == 1) return;
-
-                // ✅ [修复] 子节点优先复制 RawData (分段或单行)
-                // 排除 FileExcel 模式，因为文件模式下通常期望复制商家名去搜索
-                if (!string.IsNullOrEmpty(node.RawData) && node.Strategy != SendStrategy.FileExcel)
-                {
-                    string textToCopy = node.RawData;
-                    Task.Run(async () =>
-                    {
-                        try
-                        {
-                            // 尝试复制 RawData
-                            if (!await SetClipboardWithRetryAsync(textToCopy)) 
-                                throw new Exception("剪贴板被占用");
-                            
-                            Application.Current.Dispatcher.Invoke(() => 
-                                StatusTextBlock.Text = "✅ 已复制选中的内容");
-                        }
-                        catch (Exception ex)
-                        {
-                            Application.Current.Dispatcher.Invoke(() => 
-                                StatusTextBlock.Text = $"❌ 复制失败: {ex.Message}");
-                        }
-                        finally
-                        {
-                            Interlocked.Exchange(ref _copyingFlag, 0);
-                        }
-                    });
-                    return;
-                }
-
-                // 主列表复制内容跟随搜索模式：群名模式优先群名，商家模式用商家名
-                CopyPreferredSearchText(node);
+                // 启动复制文字的防抖触发
+                _pendingCopyNode = node;
+                _selectionCopyDebounceTimer.Stop();
+                _selectionCopyDebounceTimer.Start();
             }
         }
 
@@ -7413,7 +7502,7 @@ namespace moshushou
                     {
                         try
                         {
-                            Clipboard.SetDataObject(data, true);
+                            Clipboard.SetDataObject(data, false);
                             return true;
                         }
                         catch (Exception ex)
@@ -8377,18 +8466,25 @@ namespace moshushou
             {
                 try
                 {
-                    // 确保布局更新
-                    StoreTreeView.UpdateLayout();
-                    
-                    // ✅ 修复：使用自定义滚动方法替代不存在的 ScrollIntoView
-                    ScrollToNode(node);
-
-                    // 尝试获取容器以设置焦点
-                    var container = StoreTreeView.ItemContainerGenerator.ContainerFromItem(node) as TreeViewItem;
-                    if (container != null)
+                    // 延迟到界面空闲时再执行滚动
+                    Application.Current.Dispatcher.InvokeAsync(() =>
                     {
-                        container.Focus();
-                    }
+                        try
+                        {
+                            StoreTreeView.UpdateLayout();
+                            ScrollToNode(node);
+                            
+                            var container = StoreTreeView.ItemContainerGenerator.ContainerFromItem(node) as TreeViewItem;
+                            if (container != null)
+                            {
+                                container.Focus();
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            Debug.WriteLine($"选中项滚动失败: {ex.Message}");
+                        }
+                    }, System.Windows.Threading.DispatcherPriority.ContextIdle);
 
                     // 触发后续的业务逻辑（如复制）
                     TriggerCopyOperation(node);
@@ -8407,40 +8503,94 @@ namespace moshushou
         private void ScrollToNode(TreeViewNode node)
         {
             if (node == null) return;
-
-            // 1. 尝试直接获取容器并滚动 (如果已生成)
-            var container = StoreTreeView.ItemContainerGenerator.ContainerFromItem(node) as TreeViewItem;
-            if (container != null)
+            
+            // 尝试在整体树状结构中递归寻找并展开到该节点
+            var tvi = FindAndExpandTreeViewItem(StoreTreeView, node);
+            if (tvi != null)
             {
-                container.BringIntoView();
-                return;
+                tvi.BringIntoView();
             }
-
-            // 2. 如果容器未生成 (被虚拟化)，使用 VirtualizingStackPanel 的索引滚动
-            int index = _flatNodeList.IndexOf(node);
-            if (index >= 0)
+            else
             {
-                var vsp = FindVisualChild<VirtualizingStackPanel>(StoreTreeView);
-                if (vsp != null)
+                // 如果实在没找到（如虚拟化极为深层且未生成），提供一个兜底方案：
+                // 使用原先尝试提取 VirtualizingStackPanel 并反射调用 BringIndexIntoView 的方法
+                int index = _flatNodeList.IndexOf(node);
+                if (index >= 0)
                 {
-                    try
+                    var vsp = FindVisualChild<VirtualizingStackPanel>(StoreTreeView);
+                    if (vsp != null)
                     {
-                        // BringIndexIntoView 是 protected 方法，需要反射调用
-                        var method = typeof(VirtualizingStackPanel).GetMethod("BringIndexIntoView", 
-                            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Public);
-                        
-                        if (method != null)
+                        try
                         {
-                            method.Invoke(vsp, new object[] { index });
-                            StoreTreeView.UpdateLayout(); // 滚动后强制更新布局以生成容器
+                            var method = typeof(VirtualizingStackPanel).GetMethod("BringIndexIntoView", 
+                                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Public);
+                            if (method != null)
+                            {
+                                method.Invoke(vsp, new object[] { index });
+                                StoreTreeView.UpdateLayout();
+                                // 再次获取看能不能得到
+                                var containerAfterScroll = StoreTreeView.ItemContainerGenerator.ContainerFromItem(node) as TreeViewItem;
+                                containerAfterScroll?.BringIntoView();
+                            }
                         }
-                    }
-                    catch (Exception ex)
-                    {
-                        Debug.WriteLine($"反射滚动失败: {ex.Message}");
+                        catch { /* 忽略反射调用时的异常 */ }
                     }
                 }
             }
+        }
+
+        /// <summary>
+        /// 递归遍历 ItemsControl 寻找指定数据绑定的 TreeViewItem 并逐层展开
+        /// </summary>
+        private TreeViewItem? FindAndExpandTreeViewItem(ItemsControl itemsControl, TreeViewNode targetNode)
+        {
+            if (itemsControl == null || targetNode == null) return null;
+
+            // 检查当前 itemsControl 是否已经包含该项
+            var container = itemsControl.ItemContainerGenerator.ContainerFromItem(targetNode) as TreeViewItem;
+            if (container != null) return container;
+
+            // 还没找到，遍历子项
+            for (int i = 0; i < itemsControl.Items.Count; i++)
+            {
+                var childContainer = itemsControl.ItemContainerGenerator.ContainerFromIndex(i) as TreeViewItem;
+                if (childContainer == null)
+                {
+                    // 虚拟化未生成的话，先 UpdateLayout 生成看看
+                    itemsControl.UpdateLayout();
+                    childContainer = itemsControl.ItemContainerGenerator.ContainerFromIndex(i) as TreeViewItem;
+                }
+
+                if (childContainer != null)
+                {
+                    // 检查此子容器内部是否可能包含目标项 (即该节点在它的 Children 列表里)
+                    if (childContainer.DataContext is TreeViewNode parentNode && ContainsNode(parentNode, targetNode))
+                    {
+                        // 发现目标节点在这个分支下，展开它
+                        if (!childContainer.IsExpanded)
+                        {
+                            childContainer.IsExpanded = true;
+                            childContainer.UpdateLayout(); // 展开后强制布局以生成内部节点
+                        }
+
+                        // 递归查找
+                        var result = FindAndExpandTreeViewItem(childContainer, targetNode);
+                        if (result != null) return result;
+                    }
+                }
+            }
+
+            return null;
+        }
+
+        private bool ContainsNode(TreeViewNode parentNode, TreeViewNode targetNode)
+        {
+            if (parentNode == null || parentNode.Children == null) return false;
+            foreach (var child in parentNode.Children)
+            {
+                if (child == targetNode || ContainsNode(child, targetNode)) return true;
+            }
+            return false;
         }
 
         private void SyncTreeViewSelection(TreeViewNode targetNode)
@@ -8453,12 +8603,19 @@ namespace moshushou
                 ClearAllTreeViewSelections();
                 targetNode.IsSelected = true;
 
-                // 2. UI层：确保目标节点可见
+                // 2. UI层：确保目标节点可见，放在空闲时执行避免渲染树冲突
                 Application.Current.Dispatcher.InvokeAsync(() =>
                 {
-                    StoreTreeView.UpdateLayout();
-                    ScrollToNode(targetNode); // ✅ 修复：使用自定义滚动
-                }, System.Windows.Threading.DispatcherPriority.Background);
+                    try
+                    {
+                        StoreTreeView.UpdateLayout();
+                        ScrollToNode(targetNode); 
+                    }
+                    catch (Exception iex)
+                    {
+                        Debug.WriteLine($"UI 更新失败: {iex.Message}");
+                    }
+                }, System.Windows.Threading.DispatcherPriority.ContextIdle);
             }
             catch (Exception ex)
             {
