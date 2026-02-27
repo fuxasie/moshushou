@@ -53,6 +53,7 @@ namespace moshushou
         private int _childNodeCopyInProgress = 0;
         private int _selectionCopyGuard = 0;
         private int _ctrlSpaceHotkeyInProgress = 0;
+        private int _suppressSelectionOsdCount = 0;
         private bool _ctrlSpaceFallbackActive = false;
 
         // ✅ 低级键盘钩子：追踪物理 Ctrl 键状态（不受 SendInput 注入事件影响）
@@ -64,6 +65,9 @@ namespace moshushou
         private string _exportDirectory;
         private int _currentSelectedIndex = -1;
         private List<TreeViewNode> _flatNodeList = new List<TreeViewNode>();
+        // 子节点 -> 父节点的快速查找字典，在 RebuildFlatNodeList 时同步构建，O(1) 取父节点
+        private Dictionary<TreeViewNode, TreeViewNode> _childParentMap = new Dictionary<TreeViewNode, TreeViewNode>();
+
         private TreeViewNode _currentSelectedNode = null;
         private List<string> _currentFilter = new List<string>();
         // ✅ 新增：保存进入筛选前的选中项（用于清空筛选时恢复）
@@ -169,6 +173,8 @@ namespace moshushou
         private TreeViewNode _failureNode;
         private DebugLogWindow? _debugLogWindow;
         private BusInfoManagerWindow? _busInfoManagerWindow;
+        // 杂项设置窗口（非模态单例，保证 OsdWindow 可同时交互）
+        private SettingsWindow? _settingsWindow;
         // ✅ 新增：自动化运行标志
         private bool _isAutoRunning = false;
 
@@ -411,6 +417,7 @@ namespace moshushou
         private void MainWindow_Closing(object sender, System.ComponentModel.CancelEventArgs e)
         {
             Dispose();
+            Application.Current.Shutdown();
         }
 
         public void Dispose()
@@ -693,11 +700,22 @@ namespace moshushou
 
         private void SettingsButton_Click(object sender, RoutedEventArgs e)
         {
-            var settingsWindow = new SettingsWindow(_searchConfig)
+            // 单例保护：若窗口已打开则激活，防止重复创建
+            if (_settingsWindow != null && _settingsWindow.IsLoaded)
+            {
+                if (_settingsWindow.WindowState == WindowState.Minimized)
+                    _settingsWindow.WindowState = WindowState.Normal;
+                _settingsWindow.Activate();
+                return;
+            }
+
+            // 使用非模态 Show()，允许用户在设置窗口打开时继续操作 OsdWindow
+            _settingsWindow = new SettingsWindow(_searchConfig, this)
             {
                 Owner = this
             };
-            settingsWindow.ShowDialog();
+            _settingsWindow.Closed += (_, __) => _settingsWindow = null;
+            _settingsWindow.Show();
         }
 
         private void OpenDebugLogWindowButton_Click(object sender, RoutedEventArgs e)
@@ -3444,13 +3462,26 @@ namespace moshushou
                                        rootNode.Children != null &&
                                        rootNode.Children.Count > 0;
 
+                string seqPrefix = "";
+                int index = _flatNodeList.IndexOf(rootNode);
+                if (index >= 0)
+                {
+                    seqPrefix = $"[{index + 1}] ";
+                }
+
                 if (isSegmentedRoot)
                 {
+                    OsdWindow.ShowMessage(rootNode.StoreName, seqPrefix, rootNode.GroupName);
                     await HandleCtrlSpaceSegmentedAsync(rootNode, _currentSelectedNode, autoSend);
                     return;
                 }
 
+                if (!ReferenceEquals(_currentSelectedNode, rootNode))
+                {
+                    SuppressNextSelectionOsd();
+                }
                 SelectNodeWithoutCopy(rootNode);
+                OsdWindow.ShowMessage(rootNode.StoreName, seqPrefix, rootNode.GroupName);
 
                 bool success = rootNode.Strategy == SendStrategy.FileExcel
                     ? await PasteExcelForCtrlSpaceAsync(rootNode.StoreName, autoSend)
@@ -3553,6 +3584,29 @@ namespace moshushou
             {
                 StatusTextBlock.Text = $"⚠️ 第 {currentIndex + 1}/{totalSegments} 段无可粘贴内容";
                 return;
+            }
+
+            // ===== 更新悬浮窗：显示当前段号和该段最后一条运单号 =====
+            {
+                int listIdx = _flatNodeList.IndexOf(rootNode);
+                string listSeq = listIdx >= 0 ? $"[{listIdx + 1}] " : string.Empty;
+
+                // 提取当前段最后一条有效运单号（兼容 Tab 分割多列格式）
+                string lastTrackingNo = string.Empty;
+                if (!string.IsNullOrWhiteSpace(payload))
+                {
+                    var lines = payload.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+                    if (lines.Length > 0)
+                    {
+                        string lastLine = lines[lines.Length - 1];
+                        // 多列格式取第一列
+                        int tabIdx = lastLine.IndexOf('\t');
+                        lastTrackingNo = tabIdx > 0 ? lastLine.Substring(0, tabIdx).Trim() : lastLine.Trim();
+                    }
+                }
+
+                string segInfo = $"{listSeq}第 {currentIndex + 1}/{totalSegments} 段";
+                OsdWindow.ShowMessage(rootNode.StoreName, segInfo, rootNode.GroupName, lastTrackingNo);
             }
 
             bool success = await PasteTextPayloadForCtrlSpaceAsync(
@@ -3900,6 +3954,10 @@ namespace moshushou
                 return;
             }
 
+            if (!ReferenceEquals(_currentSelectedNode, nextNode))
+            {
+                SuppressNextSelectionOsd();
+            }
             SelectNodeWithoutCopy(nextNode);
             if (!TryGetPreferredSearchCopyText(nextNode, out string copyText, out string copyType))
             {
@@ -4864,8 +4922,8 @@ namespace moshushou
         private void RebuildFlatNodeList()
         {
             _flatNodeList.Clear();
-            // ❌ 原代码: if (StoreTreeView.ItemsSource is List<TreeViewNode> nodes)
-            // ✅ 修复: 改用 IEnumerable 或 IList 来兼容 ObservableCollection
+            _childParentMap.Clear();
+            // ✔️ 修复: 改用 IEnumerable 兼容 ObservableCollection
             if (StoreTreeView.ItemsSource is IEnumerable<TreeViewNode> nodes)
             {
                 foreach (var node in nodes)
@@ -4873,6 +4931,14 @@ namespace moshushou
                     if (!string.IsNullOrEmpty(node.StoreName))
                     {
                         _flatNodeList.Add(node);
+                        // 同步建立子节点 -> 父节点映射
+                        if (node.Children != null)
+                        {
+                            foreach (var child in node.Children)
+                            {
+                                _childParentMap[child] = node;
+                            }
+                        }
                     }
                 }
             }
@@ -6336,6 +6402,29 @@ namespace moshushou
                     else
                     {
                         // ✅ 自动识别模式（稳健版）
+                        // 优先级1：文件名关键字匹配（仲裁/赔付/监控/遗失）→ 问题件格式（运单号=第1列，商家名=第3列）
+                        string fileNameOnly = Path.GetFileNameWithoutExtension(filePath);
+                        bool matchedByFileName =
+                            fileNameOnly.Contains("仲裁") ||
+                            fileNameOnly.Contains("赔付") ||
+                            fileNameOnly.Contains("监控") ||
+                            fileNameOnly.Contains("遗失");
+
+                        if (matchedByFileName)
+                        {
+                            manualTrackingColumn = Math.Min(1, Math.Max(1, colCount));
+                            manualStoreColumn    = Math.Min(3, Math.Max(1, colCount));
+                            manualColumnCount    = colCount;
+                            _isIssueMode         = true;
+                            _isCustomMessageMode = false;
+                            useManualTableParse  = manualColumnCount >= 2;
+                            if (!useManualTableParse) _isIssueMode = false;
+                            System.Diagnostics.Debug.WriteLine(
+                                $"[模式识别] 文件名命中关键字（{fileNameOnly}）：自动切换为【问题件格式】，运单列=1，店铺列=3");
+                        }
+                        else
+                        {
+                        // 优先级2：列数/表头内容检测
                         // - 问题件：5列且有问题件表头特征，或第5列存在真实数据
                         // - 自定义话术：至少4列且第3/4列存在真实数据
                         // - 其它：未发货模式
@@ -6392,6 +6481,7 @@ namespace moshushou
                             _activeTailMessage = _searchConfig?.FixedMessage ?? string.Empty;
                             System.Diagnostics.Debug.WriteLine("[模式识别] 未匹配问题件/自定义结构，使用【未发货模式】");
                         }
+                        } // end else（列数/表头检测分支）
                     }
 
                     string resolvedModeName = _isIssueMode ? "Issue" : (_isCustomMessageMode ? "CustomMessage" : "Normal");
@@ -6795,8 +6885,23 @@ namespace moshushou
                         // 2列模式 >100条：保持 Excel 文件发送
                         try
                         {
-                            string filePath = CreateExcelFile(storeName, trackingNumbers, _exportDirectory);
-                            lock (_dataLock) { _exportedFilePaths[storeName] = filePath; }
+                            string filePath = null;
+                            bool needGenerate = true;
+                            lock (_dataLock)
+                            {
+                                if (_exportedFilePaths.TryGetValue(storeName, out string cachedPath) && File.Exists(cachedPath))
+                                {
+                                    filePath = cachedPath;
+                                    needGenerate = false;
+                                }
+                            }
+
+                            if (needGenerate)
+                            {
+                                filePath = CreateExcelFile(storeName, trackingNumbers, _exportDirectory);
+                                lock (_dataLock) { _exportedFilePaths[storeName] = filePath; }
+                            }
+
                             parentNode.Children.Add(new TreeViewNode 
                             { 
                                 Text = "(单击复制名称，拖拽可导出文件)", 
@@ -6936,16 +7041,19 @@ namespace moshushou
             string fileName = $"{safeFileName}{suffix}{countSuffix}.xlsx";
 
             string filePath = Path.Combine(outputDir, fileName);
-            // 避免同名文件冲突时覆盖
+            // 若文件已存在，直接删除旧文件（实现覆盖更新），防止产生 (2) 等重复副本
             if (File.Exists(filePath))
             {
-                string baseName = Path.GetFileNameWithoutExtension(fileName);
-                int seq = 2;
-                while (File.Exists(filePath))
+                try
                 {
-                    fileName = $"{baseName} ({seq}).xlsx";
-                    filePath = Path.Combine(outputDir, fileName);
-                    seq++;
+                    File.Delete(filePath);
+                }
+                catch (IOException ioEx)
+                {
+                    // 若旧文件被占用，则可能需要加后缀，或者直接抛出异常提示用户关掉旧文件
+                    // 在这里为了尽量保证不报错退出，还是保留一个兜底的回退（(新时间戳)）或者直接原样异常抛出
+                    // 用户希望的是不要生成 (2)，可以尝试改用时间戳，或只允许覆盖，此处选择直接抛异常让用户在UI上得知占用。
+                    throw new InvalidOperationException($"无法覆盖旧文件，可能该文件正在被其他程序（如 Excel）打开，请先关闭该文件：{fileName}", ioEx);
                 }
             }
 
@@ -7455,6 +7563,33 @@ namespace moshushou
             return oneLine.Substring(0, maxLength) + "...";
         }
 
+        private void SuppressNextSelectionOsd(int count = 1)
+        {
+            if (count <= 0)
+            {
+                return;
+            }
+
+            Interlocked.Add(ref _suppressSelectionOsdCount, count);
+        }
+
+        private bool TryConsumeSuppressedSelectionOsd()
+        {
+            while (true)
+            {
+                int current = Volatile.Read(ref _suppressSelectionOsdCount);
+                if (current <= 0)
+                {
+                    return false;
+                }
+
+                if (Interlocked.CompareExchange(ref _suppressSelectionOsdCount, current - 1, current) == current)
+                {
+                    return true;
+                }
+            }
+        }
+
         /// <summary>
         /// ✅ 修复：选中项改变时重置粘贴状态
         /// </summary>
@@ -7464,18 +7599,60 @@ namespace moshushou
             {
                 _currentSelectedNode = node;
                 ResetSearchState();
+                bool suppressOsdForThisSelection = TryConsumeSuppressedSelectionOsd();
 
                 if (node.StoreName != "FAIL_SEPARATOR")
                 {
-                    if (_searchConfig.EnableOsdWindow)
+                    if (_searchConfig.EnableOsdWindow && !suppressOsdForThisSelection)
                     {
-                        string seqPrefix = "";
-                        int index = _flatNodeList.IndexOf(node);
-                        if (index >= 0)
+                        string seqPrefix = string.Empty;
+                        string lastTracking = string.Empty;
+                        string displayStoreName = node.StoreName;
+                        string groupName = node.GroupName;
+
+                        // O(1) 直接查表找父节点
+                        _childParentMap.TryGetValue(node, out TreeViewNode parentNode);
+
+                        if (parentNode != null)
                         {
-                            seqPrefix = $"[{index + 1}] ";
+                            // 当前是子节点（分段），取父节点的商家名和群名
+                            displayStoreName = parentNode.StoreName;
+                            groupName = parentNode.GroupName;
+
+                            int listIdx = _flatNodeList.IndexOf(parentNode);
+                            int childIdx = parentNode.Children.IndexOf(node);
+                            int totalSeg = parentNode.Children.Count;
+
+                            if (childIdx >= 0 && totalSeg > 0)
+                            {
+                                string listPart = listIdx >= 0 ? $"[{listIdx + 1}] " : string.Empty;
+                                seqPrefix = $"{listPart}第 {childIdx + 1}/{totalSeg} 段";
+
+                                // 提取该分段末条运单号
+                                string rawData = node.RawData ?? string.Empty;
+                                if (!string.IsNullOrWhiteSpace(rawData))
+                                {
+                                    var segLines = rawData.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+                                    if (segLines.Length > 0)
+                                    {
+                                        string lastLine = segLines[segLines.Length - 1];
+                                        int tabIdx = lastLine.IndexOf('\t');
+                                        lastTracking = tabIdx > 0 ? lastLine.Substring(0, tabIdx).Trim() : lastLine.Trim();
+                                    }
+                                }
+                            }
                         }
-                        OsdWindow.ShowMessage(node.StoreName, seqPrefix);
+                        else
+                        {
+                            // 主节点：只显示列表序号
+                            int midx = _flatNodeList.IndexOf(node);
+                            if (midx >= 0)
+                            {
+                                seqPrefix = $"[{midx + 1}] ";
+                            }
+                        }
+
+                        OsdWindow.ShowMessage(displayStoreName, seqPrefix, groupName, lastTracking);
                     }
                 }
 

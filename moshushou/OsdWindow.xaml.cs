@@ -17,6 +17,7 @@ namespace moshushou
         private DispatcherTimer _timer;
         private bool _isEditMode = false;
         private int _bgOpacityPercent = 60; // 背景透明度百分比（0=全透明，100=不透明）
+        private bool _showGroupName = true; // 悬浮窗是否显示群名（全局生效）
         private const string ConfigFilePath = "osd_config.json";
 
         // Win32 常量用于点击穿透
@@ -132,7 +133,57 @@ namespace moshushou
             this.Top = screenHeight - this.ActualHeight - 200; // 悬浮在屏幕偏下方
         }
 
-        public static void ShowMessage(string message, string sequenceInfo = "")
+        private void ShowContent(string storeName, string sequenceInfo = "", string groupName = "", string lastTracking = "")
+        {
+            string safeStoreName = (storeName ?? string.Empty).Trim();
+            string safeGroupName = (groupName ?? string.Empty).Trim();
+            string safeSequence = (sequenceInfo ?? string.Empty).Trim();
+            string safeLastTracking = (lastTracking ?? string.Empty).Trim();
+            bool hasGroupName = !string.IsNullOrWhiteSpace(safeGroupName);
+            bool hasLastTracking = !string.IsNullOrWhiteSpace(safeLastTracking);
+
+            // 第一行：序号/分段信息（金色）
+            SequenceRun.Text = string.IsNullOrWhiteSpace(safeSequence) ? string.Empty : safeSequence;
+            // StoreBlock（合并了序号和商家名）始终显示
+
+            // 第二行：商家名（白色大字）
+            StoreRun.Text = safeStoreName;
+
+            // 第三行：群名（蓝色，可选）
+            if (_showGroupName && hasGroupName)
+            {
+                GroupRun.Text = safeGroupName;
+                GroupBlock.Visibility = Visibility.Visible;
+            }
+            else
+            {
+                GroupRun.Text = string.Empty;
+                GroupBlock.Visibility = Visibility.Collapsed;
+            }
+
+            // 第四行：末条单号（橙色，可选）
+            if (hasLastTracking)
+            {
+                LastTrackingRun.Text = safeLastTracking;
+                LastTrackingBlock.Visibility = Visibility.Visible;
+            }
+            else
+            {
+                LastTrackingRun.Text = string.Empty;
+                LastTrackingBlock.Visibility = Visibility.Collapsed;
+            }
+
+            Opacity = 1;
+            Show();
+
+            if (!_isEditMode)
+            {
+                _timer.Stop();
+                _timer.Start();
+            }
+        }
+
+        public static void ShowMessage(string storeName, string sequenceInfo = "", string groupName = "", string lastTracking = "")
         {
             // 使用 InvokeAsync 避免在 VirtualizingStackPanel 布局过程中同步重入导致 InvalidOperationException
             Application.Current.Dispatcher.InvokeAsync(() =>
@@ -140,24 +191,33 @@ namespace moshushou
                 try
                 {
                     EnsureInstance();
-
-                    _instance.SequenceRun.Text = sequenceInfo;
-                    _instance.MessageRun.Text = message;
-                    
-                    _instance.Opacity = 1; // 确保可见
-                    _instance.Show();
-
-                    if (!_instance._isEditMode)
-                    {
-                        _instance._timer.Stop();
-                        _instance._timer.Start();
-                    }
+                    _instance.ShowContent(storeName, sequenceInfo, groupName, lastTracking);
                 }
                 catch (Exception ex)
                 {
                     System.Diagnostics.Debug.WriteLine($"OSD 显示异常: {ex.Message}");
                 }
             });
+        }
+
+        /// <summary>
+        /// 粘贴时显示提示（与普通切换提示共用同一显示样式）。
+        /// 自动尝试从 storeName 提取形如 "[1/6] " 的序号前缀
+        /// </summary>
+        public static void ShowPasteInfo(string storeName, string groupName = "")
+        {
+            string safeStoreName = storeName ?? string.Empty;
+            string seqInfo = string.Empty;
+
+            // 简单判断并提取形如 "[1/6] " 的前缀（如果有的话）
+            if (safeStoreName.StartsWith("[") && safeStoreName.Contains("] "))
+            {
+                int endIdx = safeStoreName.IndexOf("] ") + 2;
+                seqInfo = safeStoreName.Substring(0, endIdx);
+                safeStoreName = safeStoreName.Substring(endIdx);
+            }
+
+            ShowMessage(safeStoreName, seqInfo, groupName);
         }
 
         public static void ToggleEditMode()
@@ -190,6 +250,8 @@ namespace moshushou
                 ResizeThumb.Visibility = Visibility.Visible;
                 // 同步 Slider 到当前透明度值
                 OpacitySlider.Value = _bgOpacityPercent;
+                // 同步开关到当前值
+                ShowPasteInfoCheckBox.IsChecked = _showGroupName;
                 SetWindowExTransparent(false); // 取消穿透，允许响应鼠标操作
             }
             else
@@ -214,6 +276,14 @@ namespace moshushou
             {
                 OpacityValueText.Text = $"{percent}%";
             }
+        }
+
+        /// <summary>
+        /// “显示群名（统一生效）”开关变化
+        /// </summary>
+        private void ShowPasteInfoCheckBox_Changed(object sender, RoutedEventArgs e)
+        {
+            _showGroupName = ShowPasteInfoCheckBox.IsChecked == true;
         }
 
         /// <summary>
@@ -251,7 +321,16 @@ namespace moshushou
         {
             try
             {
-                var config = new { Left = this.Left, Top = this.Top, Width = this.Width, Height = this.Height, BgOpacity = _bgOpacityPercent };
+                var config = new
+                {
+                    Left = this.Left,
+                    Top = this.Top,
+                    Width = this.Width,
+                    Height = this.Height,
+                    BgOpacity = _bgOpacityPercent,
+                    ShowGroupName = _showGroupName,
+                    ShowPasteInfo = _showGroupName
+                };
                 string json = JsonSerializer.Serialize(config);
                 File.WriteAllText(ConfigFilePath, json);
             }
@@ -274,6 +353,14 @@ namespace moshushou
                     if (config.TryGetProperty("BgOpacity", out var opacity))
                     {
                         _bgOpacityPercent = Math.Clamp(opacity.GetInt32(), 0, 100);
+                    }
+                    if (config.TryGetProperty("ShowGroupName", out var showGroupName))
+                    {
+                        _showGroupName = showGroupName.GetBoolean();
+                    }
+                    else if (config.TryGetProperty("ShowPasteInfo", out var showPaste))
+                    {
+                        _showGroupName = showPaste.GetBoolean();
                     }
                 }
             }

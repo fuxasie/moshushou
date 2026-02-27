@@ -40,13 +40,6 @@
                             Width="80"
                             Margin="0,0,8,0"
                             Click="CopyAllButton_Click"/>
-                    <Button x:Name="ChangeParseButton"
-                            Content="解析设置"
-                            Style="{StaticResource ModernButton}"
-                            Background="#8B5CF6"
-                            Width="80"
-                            Margin="0,0,8,0"
-                            Click="ChangeParseButton_Click"/>
                     <Button x:Name="ClearHistoryButton"
                             Content="清空历史"
                             Style="{StaticResource ModernButton}"

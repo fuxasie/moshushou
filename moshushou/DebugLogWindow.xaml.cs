@@ -173,44 +173,5 @@ namespace moshushou
                    line.Contains("[点击历史]", StringComparison.Ordinal);
         }
 
-        private async void ChangeParseButton_Click(object sender, RoutedEventArgs e)
-        {
-            if (Owner is not MainWindow mainWindow)
-            {
-                MessageBox.Show(this, "未找到主窗口，无法应用解析设置。", "提示", MessageBoxButton.OK, MessageBoxImage.Information);
-                return;
-            }
-
-            MainWindow.ParseOverrideDebugContext? context = mainWindow.GetCurrentFileParseContext();
-            if (context == null)
-            {
-                MessageBox.Show(this, "请先在主窗口加载 Excel 文件，再设置解析方式。", "提示", MessageBoxButton.OK, MessageBoxImage.Information);
-                return;
-            }
-
-            var dialog = new ParseModeConfigWindow(context)
-            {
-                Owner = this
-            };
-
-            if (dialog.ShowDialog() != true || dialog.ParseOverride == null)
-            {
-                return;
-            }
-
-            ChangeParseButton.IsEnabled = false;
-            try
-            {
-                bool applied = await mainWindow.ApplyCurrentFileParseOverrideAsync(dialog.ParseOverride);
-                if (applied)
-                {
-                    RefreshSnapshot();
-                }
-            }
-            finally
-            {
-                ChangeParseButton.IsEnabled = true;
-            }
-        }
     }
 }
