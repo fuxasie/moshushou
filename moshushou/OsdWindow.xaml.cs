@@ -16,6 +16,7 @@ namespace moshushou
         private static OsdWindow _instance;
         private DispatcherTimer _timer;
         private bool _isEditMode = false;
+        private int _bgOpacityPercent = 60; // 背景透明度百分比（0=全透明，100=不透明）
         private const string ConfigFilePath = "osd_config.json";
 
         // Win32 常量用于点击穿透
@@ -56,6 +57,7 @@ namespace moshushou
             // 监听右键按下，关闭编辑模式
             this.MouseRightButtonDown += OsdWindow_MouseRightButtonDown;
             LoadConfig();
+            ApplyBgOpacity(_bgOpacityPercent);
         }
 
         private void OsdWindow_MouseRightButtonDown(object sender, MouseButtonEventArgs e)
@@ -132,23 +134,29 @@ namespace moshushou
 
         public static void ShowMessage(string message, string sequenceInfo = "")
         {
-            Application.Current.Dispatcher.Invoke(() =>
+            // 使用 InvokeAsync 避免在 VirtualizingStackPanel 布局过程中同步重入导致 InvalidOperationException
+            Application.Current.Dispatcher.InvokeAsync(() =>
             {
-                EnsureInstance();
-
-                _instance.SequenceRun.Text = sequenceInfo;
-                _instance.MessageRun.Text = message;
-                
-                _instance.Opacity = 1; // 确保可见
-                _instance.Show();
-
-                if (!_instance._isEditMode)
+                try
                 {
-                    _instance._timer.Stop();
-                    _instance._timer.Start();
-                }
+                    EnsureInstance();
 
-                _instance.UpdateLayout();
+                    _instance.SequenceRun.Text = sequenceInfo;
+                    _instance.MessageRun.Text = message;
+                    
+                    _instance.Opacity = 1; // 确保可见
+                    _instance.Show();
+
+                    if (!_instance._isEditMode)
+                    {
+                        _instance._timer.Stop();
+                        _instance._timer.Start();
+                    }
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine($"OSD 显示异常: {ex.Message}");
+                }
             });
         }
 
@@ -180,6 +188,8 @@ namespace moshushou
                 this.Show();
                 EditOverlay.Visibility = Visibility.Visible;
                 ResizeThumb.Visibility = Visibility.Visible;
+                // 同步 Slider 到当前透明度值
+                OpacitySlider.Value = _bgOpacityPercent;
                 SetWindowExTransparent(false); // 取消穿透，允许响应鼠标操作
             }
             else
@@ -190,6 +200,31 @@ namespace moshushou
                 SaveConfig();
                 this.Hide();
             }
+        }
+
+        /// <summary>
+        /// Slider 值改变时实时更新背景透明度
+        /// </summary>
+        private void OpacitySlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
+        {
+            int percent = (int)Math.Round(e.NewValue);
+            _bgOpacityPercent = percent;
+            ApplyBgOpacity(percent);
+            if (OpacityValueText != null)
+            {
+                OpacityValueText.Text = $"{percent}%";
+            }
+        }
+
+        /// <summary>
+        /// 将百分比值应用到 BgBorder 的背景色 Alpha 通道
+        /// </summary>
+        private void ApplyBgOpacity(int percent)
+        {
+            if (BgBorder == null) return;
+            byte alpha = (byte)(percent * 255 / 100);
+            BgBorder.Background = new System.Windows.Media.SolidColorBrush(
+                System.Windows.Media.Color.FromArgb(alpha, 0, 0, 0));
         }
 
         private void EditOverlay_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
@@ -216,7 +251,7 @@ namespace moshushou
         {
             try
             {
-                var config = new { Left = this.Left, Top = this.Top, Width = this.Width, Height = this.Height };
+                var config = new { Left = this.Left, Top = this.Top, Width = this.Width, Height = this.Height, BgOpacity = _bgOpacityPercent };
                 string json = JsonSerializer.Serialize(config);
                 File.WriteAllText(ConfigFilePath, json);
             }
@@ -236,6 +271,10 @@ namespace moshushou
                     if (config.TryGetProperty("Top", out var top)) this.Top = top.GetDouble();
                     if (config.TryGetProperty("Width", out var width)) this.Width = width.GetDouble();
                     if (config.TryGetProperty("Height", out var height)) this.Height = height.GetDouble();
+                    if (config.TryGetProperty("BgOpacity", out var opacity))
+                    {
+                        _bgOpacityPercent = Math.Clamp(opacity.GetInt32(), 0, 100);
+                    }
                 }
             }
             catch { }

@@ -54,6 +54,11 @@ namespace moshushou
         private int _selectionCopyGuard = 0;
         private int _ctrlSpaceHotkeyInProgress = 0;
         private bool _ctrlSpaceFallbackActive = false;
+
+        // ✅ 低级键盘钩子：追踪物理 Ctrl 键状态（不受 SendInput 注入事件影响）
+        private volatile bool _physicalCtrlPressed = false;
+        private IntPtr _keyboardHookHandle = IntPtr.Zero;
+        private LowLevelKeyboardProc _keyboardHookDelegate;
         private readonly object _dataLock = new object();
         private readonly Dictionary<string, int> _ctrlSpaceSegmentCursor = new Dictionary<string, int>(StringComparer.Ordinal);
         private string _exportDirectory;
@@ -259,7 +264,38 @@ namespace moshushou
         [DllImport("user32.dll")]
         private static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
 
+        // ✅ 低级键盘钩子 P/Invoke
+        private delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
 
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern IntPtr SetWindowsHookEx(int idHook, LowLevelKeyboardProc lpfn, IntPtr hMod, uint dwThreadId);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool UnhookWindowsHookEx(IntPtr hhk);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Auto)]
+        private static extern IntPtr GetModuleHandle(string lpModuleName);
+
+        private const int WH_KEYBOARD_LL = 13;
+        private const int WM_KEYDOWN = 0x0100;
+        private const int WM_KEYUP = 0x0101;
+        private const int WM_SYSKEYDOWN = 0x0104;
+        private const int WM_SYSKEYUP = 0x0105;
+        private const uint LLKHF_INJECTED = 0x00000010;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct KBDLLHOOKSTRUCT
+        {
+            public uint vkCode;
+            public uint scanCode;
+            public uint flags;
+            public uint time;
+            public IntPtr dwExtraInfo;
+        }
 
         // 虚拟键码
         private const uint VK_UP = 0x26;
@@ -368,6 +404,7 @@ namespace moshushou
             _windowHandle = new WindowInteropHelper(this).Handle;
             _source = HwndSource.FromHwnd(_windowHandle);
             _source.AddHook(HwndHook);
+            InstallKeyboardHook();
             UpdatePollingModeButtonState();
         }
 
@@ -379,6 +416,7 @@ namespace moshushou
         public void Dispose()
         {
             UnregisterGlobalHotkeys();
+            UninstallKeyboardHook();
             if (_source != null)
             {
                 _source.RemoveHook(HwndHook);
@@ -386,6 +424,81 @@ namespace moshushou
                 _source = null;
             }
         }
+
+        #region 低级键盘钩子 - 追踪物理 Ctrl 状态
+
+        /// <summary>
+        /// 安装低级键盘钩子，用于追踪物理 Ctrl 键的按下/释放状态。
+        /// 通过 LLKHF_INJECTED 标志排除 SendInput 注入的事件，
+        /// 解决 GetAsyncKeyState 被 SendInput 污染的问题。
+        /// </summary>
+        private void InstallKeyboardHook()
+        {
+            if (_keyboardHookHandle != IntPtr.Zero) return;
+
+            _keyboardHookDelegate = KeyboardHookCallback;
+            using (var curProcess = Process.GetCurrentProcess())
+            using (var curModule = curProcess.MainModule)
+            {
+                _keyboardHookHandle = SetWindowsHookEx(
+                    WH_KEYBOARD_LL,
+                    _keyboardHookDelegate,
+                    GetModuleHandle(curModule.ModuleName),
+                    0);
+            }
+
+            if (_keyboardHookHandle == IntPtr.Zero)
+            {
+                Debug.WriteLine("[KeyboardHook] 安装失败");
+            }
+            else
+            {
+                Debug.WriteLine("[KeyboardHook] 安装成功");
+            }
+        }
+
+        private void UninstallKeyboardHook()
+        {
+            if (_keyboardHookHandle != IntPtr.Zero)
+            {
+                UnhookWindowsHookEx(_keyboardHookHandle);
+                _keyboardHookHandle = IntPtr.Zero;
+                Debug.WriteLine("[KeyboardHook] 已卸载");
+            }
+        }
+
+        /// <summary>
+        /// 低级键盘钩子回调：仅追踪物理 Ctrl 键状态，忽略 SendInput 注入的事件。
+        /// </summary>
+        private IntPtr KeyboardHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
+        {
+            if (nCode >= 0)
+            {
+                var kbs = Marshal.PtrToStructure<KBDLLHOOKSTRUCT>(lParam);
+                bool isInjected = (kbs.flags & LLKHF_INJECTED) != 0;
+
+                // 仅关注物理按键事件（排除 SendInput 注入的事件）
+                if (!isInjected &&
+                    (kbs.vkCode == (uint)VK_CONTROL_KEY ||
+                     kbs.vkCode == (uint)VK_LCONTROL_KEY ||
+                     kbs.vkCode == (uint)VK_RCONTROL_KEY))
+                {
+                    int msg = wParam.ToInt32();
+                    if (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN)
+                    {
+                        _physicalCtrlPressed = true;
+                    }
+                    else if (msg == WM_KEYUP || msg == WM_SYSKEYUP)
+                    {
+                        _physicalCtrlPressed = false;
+                    }
+                }
+            }
+
+            return CallNextHookEx(_keyboardHookHandle, nCode, wParam, lParam);
+        }
+
+        #endregion
  
         private void SelectionCopyDebounceTimer_Tick(object sender, EventArgs e)
         {
@@ -3247,71 +3360,137 @@ namespace moshushou
             }
         }
 
+        /// <summary>
+        /// 在快捷键处理完成后，如果用户仍然物理按住 Ctrl 键，
+        /// 则重新注入 Ctrl 键按下状态，确保后续 Ctrl+W/S 等快捷键能连贯响应。
+        /// 使用低级键盘钩子追踪的物理状态（不受 SendInput 注入影响）。
+        /// </summary>
+        private void RestoreCtrlKeyIfPhysicallyHeld()
+        {
+            bool physicalState = _physicalCtrlPressed;
+            bool asyncState = IsControlKeyPressed();
+            Debug.WriteLine($"[RestoreCtrl] 物理状态={physicalState}, GetAsyncKeyState={asyncState}");
+
+            if (physicalState)
+            {
+                try
+                {
+                    _inputSimulator.Keyboard.KeyDown(VirtualKeyCode.CONTROL);
+                    Debug.WriteLine("[RestoreCtrl] ✅ 已恢复 Ctrl 注入");
+
+                    // 启动异步清理：用户松开物理 Ctrl 后自动发送配套 KeyUp，防止 Ctrl 卡住
+                    _ = Task.Run(async () =>
+                    {
+                        for (int i = 0; i < 200; i++) // 最多等 10 秒
+                        {
+                            await Task.Delay(50);
+                            if (!_physicalCtrlPressed)
+                            {
+                                try
+                                {
+                                    _inputSimulator.Keyboard.KeyUp(VirtualKeyCode.CONTROL);
+                                    Debug.WriteLine("[RestoreCtrl] 🧹 用户已松开，自动清理注入的 Ctrl");
+                                }
+                                catch { }
+                                return;
+                            }
+                        }
+                        // 超时兜底：强制释放
+                        try
+                        {
+                            _inputSimulator.Keyboard.KeyUp(VirtualKeyCode.CONTROL);
+                            Debug.WriteLine("[RestoreCtrl] ⏰ 超时兜底释放 Ctrl");
+                        }
+                        catch { }
+                    });
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"[RestoreCtrl] ❌ 恢复失败: {ex.Message}");
+                }
+            }
+            else
+            {
+                Debug.WriteLine("[RestoreCtrl] 用户已松开 Ctrl，不恢复");
+            }
+        }
+
         private async Task HandleCtrlSpaceHotkeyAsync()
         {
             await EnsureCtrlReleasedBeforeHotkeySendAsync();
 
-            if (_currentSelectedNode == null)
+            try
             {
-                StatusTextBlock.Text = "⚠️ 请先选择一个商家或子项";
-                return;
+                if (_currentSelectedNode == null)
+                {
+                    StatusTextBlock.Text = "⚠️ 请先选择一个商家或子项";
+                    return;
+                }
+
+                if (!TryResolveRootNode(_currentSelectedNode, out TreeViewNode rootNode))
+                {
+                    StatusTextBlock.Text = "⚠️ 未能定位当前所属主列表项";
+                    return;
+                }
+
+                if (string.IsNullOrWhiteSpace(rootNode.StoreName) || rootNode.StoreName == "FAIL_SEPARATOR")
+                {
+                    StatusTextBlock.Text = "⚠️ 当前项不可执行 Ctrl+Space";
+                    return;
+                }
+
+                bool autoSend = AutoSendCheckBox.IsChecked == true;
+                bool isSegmentedRoot = rootNode.Strategy == SendStrategy.TextSegmented &&
+                                       rootNode.Children != null &&
+                                       rootNode.Children.Count > 0;
+
+                if (isSegmentedRoot)
+                {
+                    await HandleCtrlSpaceSegmentedAsync(rootNode, _currentSelectedNode, autoSend);
+                    return;
+                }
+
+                SelectNodeWithoutCopy(rootNode);
+
+                bool success = rootNode.Strategy == SendStrategy.FileExcel
+                    ? await PasteExcelForCtrlSpaceAsync(rootNode.StoreName, autoSend)
+                    : await PasteStoreFullTextForCtrlSpaceAsync(rootNode.StoreName, autoSend);
+
+                if (!success)
+                {
+                    string action = autoSend ? "Ctrl+Space发送" : "Ctrl+Space粘贴";
+                    RecordStoreSendHistory(rootNode.StoreName, action, false, "快捷键执行失败");
+                    return;
+                }
+
+                if (autoSend)
+                {
+                    MarkStoreAsSent(rootNode.StoreName, "Ctrl+Space发送", "快捷键发送成功");
+                }
+                else
+                {
+                    ClearStoreSentMark(rootNode.StoreName, refreshHeader: true);
+                    RecordStoreSendHistory(rootNode.StoreName, "Ctrl+Space粘贴", true, "快捷键粘贴成功");
+                }
+
+                _ctrlSpaceSegmentCursor[rootNode.StoreName] = 0;
+                
+                if (_searchConfig.SkipNextOnCtrlSpace)
+                {
+                    StatusTextBlock.Text += " (勾选了不跳转，停留在当前项)";
+                }
+                else
+                {
+                    // 等待目标窗口（企业微信等）处理完 Ctrl+V 粘贴操作并从剪贴板读取内容后，
+                    // 再用下一项的商家名覆盖剪贴板，避免粘贴内容被提前覆盖
+                    await Task.Delay(200);
+                    await AdvanceToNextMainNodeAndCopyStoreNameAsync(rootNode);
+                }
             }
-
-            if (!TryResolveRootNode(_currentSelectedNode, out TreeViewNode rootNode))
+            finally
             {
-                StatusTextBlock.Text = "⚠️ 未能定位当前所属主列表项";
-                return;
-            }
-
-            if (string.IsNullOrWhiteSpace(rootNode.StoreName) || rootNode.StoreName == "FAIL_SEPARATOR")
-            {
-                StatusTextBlock.Text = "⚠️ 当前项不可执行 Ctrl+Space";
-                return;
-            }
-
-            bool autoSend = AutoSendCheckBox.IsChecked == true;
-            bool isSegmentedRoot = rootNode.Strategy == SendStrategy.TextSegmented &&
-                                   rootNode.Children != null &&
-                                   rootNode.Children.Count > 0;
-
-            if (isSegmentedRoot)
-            {
-                await HandleCtrlSpaceSegmentedAsync(rootNode, _currentSelectedNode, autoSend);
-                return;
-            }
-
-            SelectNodeWithoutCopy(rootNode);
-
-            bool success = rootNode.Strategy == SendStrategy.FileExcel
-                ? await PasteExcelForCtrlSpaceAsync(rootNode.StoreName, autoSend)
-                : await PasteStoreFullTextForCtrlSpaceAsync(rootNode.StoreName, autoSend);
-
-            if (!success)
-            {
-                string action = autoSend ? "Ctrl+Space发送" : "Ctrl+Space粘贴";
-                RecordStoreSendHistory(rootNode.StoreName, action, false, "快捷键执行失败");
-                return;
-            }
-
-            if (autoSend)
-            {
-                MarkStoreAsSent(rootNode.StoreName, "Ctrl+Space发送", "快捷键发送成功");
-            }
-            else
-            {
-                ClearStoreSentMark(rootNode.StoreName, refreshHeader: true);
-                RecordStoreSendHistory(rootNode.StoreName, "Ctrl+Space粘贴", true, "快捷键粘贴成功");
-            }
-
-            _ctrlSpaceSegmentCursor[rootNode.StoreName] = 0;
-            
-            if (_searchConfig.SkipNextOnCtrlSpace)
-            {
-                StatusTextBlock.Text += " (勾选了不跳转，停留在当前项)";
-            }
-            else
-            {
-                await AdvanceToNextMainNodeAndCopyStoreNameAsync(rootNode);
+                // 粘贴流程结束后，恢复 Ctrl 键状态，确保用户可以连贯操作 Ctrl+W/S
+                RestoreCtrlKeyIfPhysicallyHeld();
             }
         }
 
@@ -3761,22 +3940,38 @@ namespace moshushou
                 if (_flatNodeList.Contains(indexAnchor))
                 {
                     _currentSelectedIndex = _flatNodeList.IndexOf(indexAnchor);
-                    ScrollToNode(indexAnchor);
+                    try
+                    {
+                        ScrollToNode(indexAnchor);
+                    }
+                    catch (InvalidOperationException)
+                    {
+                        // 容器正在生成中，忽略滚动操作
+                        Debug.WriteLine("[SelectNodeWithoutCopy] ScrollToNode 被跳过：容器正在生成中");
+                    }
                 }
 
-                StoreTreeView.UpdateLayout();
-
-                TreeViewItem? container = null;
-                if (rootToExpand != null)
+                try
                 {
-                    container = GetTreeViewItemForNode(rootToExpand, targetNode);
-                }
-                else if (_flatNodeList.Contains(targetNode))
-                {
-                    container = StoreTreeView.ItemContainerGenerator.ContainerFromItem(targetNode) as TreeViewItem;
-                }
+                    StoreTreeView.UpdateLayout();
 
-                container?.Focus();
+                    TreeViewItem? container = null;
+                    if (rootToExpand != null)
+                    {
+                        container = GetTreeViewItemForNode(rootToExpand, targetNode);
+                    }
+                    else if (_flatNodeList.Contains(targetNode))
+                    {
+                        container = StoreTreeView.ItemContainerGenerator.ContainerFromItem(targetNode) as TreeViewItem;
+                    }
+
+                    container?.Focus();
+                }
+                catch (InvalidOperationException)
+                {
+                    // 容器正在生成中，忽略焦点操作
+                    Debug.WriteLine("[SelectNodeWithoutCopy] UpdateLayout/Focus 被跳过：容器正在生成中");
+                }
             }
             finally
             {
@@ -8546,38 +8741,46 @@ namespace moshushou
         {
             if (itemsControl == null || targetNode == null) return null;
 
-            // 检查当前 itemsControl 是否已经包含该项
-            var container = itemsControl.ItemContainerGenerator.ContainerFromItem(targetNode) as TreeViewItem;
-            if (container != null) return container;
-
-            // 还没找到，遍历子项
-            for (int i = 0; i < itemsControl.Items.Count; i++)
+            try
             {
-                var childContainer = itemsControl.ItemContainerGenerator.ContainerFromIndex(i) as TreeViewItem;
-                if (childContainer == null)
-                {
-                    // 虚拟化未生成的话，先 UpdateLayout 生成看看
-                    itemsControl.UpdateLayout();
-                    childContainer = itemsControl.ItemContainerGenerator.ContainerFromIndex(i) as TreeViewItem;
-                }
+                // 检查当前 itemsControl 是否已经包含该项
+                var container = itemsControl.ItemContainerGenerator.ContainerFromItem(targetNode) as TreeViewItem;
+                if (container != null) return container;
 
-                if (childContainer != null)
+                // 还没找到，遍历子项
+                for (int i = 0; i < itemsControl.Items.Count; i++)
                 {
-                    // 检查此子容器内部是否可能包含目标项 (即该节点在它的 Children 列表里)
-                    if (childContainer.DataContext is TreeViewNode parentNode && ContainsNode(parentNode, targetNode))
+                    var childContainer = itemsControl.ItemContainerGenerator.ContainerFromIndex(i) as TreeViewItem;
+                    if (childContainer == null)
                     {
-                        // 发现目标节点在这个分支下，展开它
-                        if (!childContainer.IsExpanded)
-                        {
-                            childContainer.IsExpanded = true;
-                            childContainer.UpdateLayout(); // 展开后强制布局以生成内部节点
-                        }
+                        // 虚拟化未生成的话，先 UpdateLayout 生成看看
+                        itemsControl.UpdateLayout();
+                        childContainer = itemsControl.ItemContainerGenerator.ContainerFromIndex(i) as TreeViewItem;
+                    }
 
-                        // 递归查找
-                        var result = FindAndExpandTreeViewItem(childContainer, targetNode);
-                        if (result != null) return result;
+                    if (childContainer != null)
+                    {
+                        // 检查此子容器内部是否可能包含目标项 (即该节点在它的 Children 列表里)
+                        if (childContainer.DataContext is TreeViewNode parentNode && ContainsNode(parentNode, targetNode))
+                        {
+                            // 发现目标节点在这个分支下，展开它
+                            if (!childContainer.IsExpanded)
+                            {
+                                childContainer.IsExpanded = true;
+                                childContainer.UpdateLayout(); // 展开后强制布局以生成内部节点
+                            }
+
+                            // 递归查找
+                            var result = FindAndExpandTreeViewItem(childContainer, targetNode);
+                            if (result != null) return result;
+                        }
                     }
                 }
+            }
+            catch (InvalidOperationException)
+            {
+                // 容器正在生成中（"无法在正在进行内容生成时调用 StartAt"），安全忽略
+                Debug.WriteLine("[FindAndExpandTreeViewItem] 被跳过：容器正在生成中");
             }
 
             return null;
