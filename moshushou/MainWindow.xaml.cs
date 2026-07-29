@@ -1,4 +1,4 @@
-﻿using Microsoft.Win32;
+using Microsoft.Win32;
 using OfficeOpenXml;
 using System;
 using System.Collections.ObjectModel; 
@@ -55,6 +55,7 @@ namespace moshushou
         private int _ctrlSpaceHotkeyInProgress = 0;
         private int _suppressSelectionOsdCount = 0;
         private bool _ctrlSpaceFallbackActive = false;
+        private int _selectionVersion = 0;
 
         // ✅ 低级键盘钩子：追踪物理 Ctrl 键状态（不受 SendInput 注入事件影响）
         private volatile bool _physicalCtrlPressed = false;
@@ -100,6 +101,11 @@ namespace moshushou
         // ✅ 记录已发送成功的商家，用于在主列表显示打钩状态
         private readonly object _sentStoreLock = new object();
         private HashSet<string> _sentStores = new HashSet<string>(StringComparer.Ordinal);
+        private readonly object _sendAttemptJournalLock = new object();
+        private readonly Dictionary<string, SendAttemptState> _sendAttemptJournal =
+            new Dictionary<string, SendAttemptState>(StringComparer.Ordinal);
+        private int _lastSendOutcome = (int)SendAttemptOutcome.ConfirmedFailure;
+        private Guid _autoRunId = Guid.Empty;
         // 发送历史记录去重：避免短时间内同一店铺的重复“选中”记录刷屏
         private string _lastSelectionHistoryStoreName = string.Empty;
         private DateTime _lastSelectionHistoryTime = DateTime.MinValue;
@@ -120,6 +126,7 @@ namespace moshushou
         // ✅ 新增：定义取消令牌源
         private CancellationTokenSource _searchCts;
         private CancellationTokenSource? _autoRunCts;
+        private Task? _autoRunTask;
 
         // 微信/企业微信切换状态（false=先微信，true=先企业微信）
         private bool _isWeworkTurn = false;
@@ -250,6 +257,31 @@ namespace moshushou
         [StructLayout(LayoutKind.Sequential)]
         public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
 
+        [StructLayout(LayoutKind.Sequential)]
+        public struct GUITHREADINFO
+        {
+            public int cbSize;
+            public int flags;
+            public IntPtr hwndActive;
+            public IntPtr hwndFocus;
+            public IntPtr hwndCapture;
+            public IntPtr hwndMenuOwner;
+            public IntPtr hwndMoveSize;
+            public IntPtr hwndCaret;
+            public RECT rcCaret;
+        }
+
+        [DllImport("user32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetGUIThreadInfo(uint idThread, ref GUITHREADINFO lpgui);
+
+        [DllImport("oleacc.dll")]
+        private static extern int AccessibleObjectFromWindow(
+            IntPtr hwnd,
+            uint dwObjectID,
+            ref Guid riid,
+            [MarshalAs(UnmanagedType.Interface)] out object ppvObject
+        );
 
         [DllImport("user32.dll")]
         [return: MarshalAs(UnmanagedType.Bool)]
@@ -392,11 +424,10 @@ namespace moshushou
             _saveDebounceTimer.Tick += (s, e) =>
             {
                 _saveDebounceTimer.Stop();
-                // 在后台线程执行保存操作，避免阻塞 UI
-                Task.Run(() => 
-                { 
-                    try { _searchConfig?.Save(); } catch { }
-                });
+                if (_searchConfig?.Save() == false)
+                {
+                    DebugLogManager.Log("状态保存", "防抖状态保存失败。");
+                }
             };
 
             StoreTreeView.SelectedItemChanged += StoreTreeView_SelectedItemChanged;
@@ -416,12 +447,20 @@ namespace moshushou
 
         private void MainWindow_Closing(object sender, System.ComponentModel.CancelEventArgs e)
         {
+            _autoRunCts?.Cancel();
+            _searchCts?.Cancel();
+            _selectionSaveDebounceTimer?.Stop();
+            _saveDebounceTimer?.Stop();
+            string selectedStore = _currentSelectedNode?.StoreName ?? string.Empty;
+            SaveFileState(selectedStore, saveImmediately: true);
             Dispose();
             Application.Current.Shutdown();
         }
 
         public void Dispose()
         {
+            _autoRunCts?.Cancel();
+            _searchCts?.Cancel();
             UnregisterGlobalHotkeys();
             UninstallKeyboardHook();
             if (_source != null)
@@ -1395,6 +1434,13 @@ namespace moshushou
                 int id = wParam.ToInt32();
                 bool shouldHandle = false;
 
+                if (_isAutoRunning && id != HOTKEY_F2 && id != HOTKEY_ENTER)
+                {
+                    StatusTextBlock.Text = "⌛ 自动发送运行中，仅允许 F2 或 Ctrl+Enter 停止。";
+                    handled = true;
+                    return IntPtr.Zero;
+                }
+
                 if (id == HOTKEY_UP || id == HOTKEY_W)
                 {
                     // 向上导航 
@@ -1551,15 +1597,19 @@ namespace moshushou
             _autoRunCts = new CancellationTokenSource();
             var autoCts = _autoRunCts;
 
+            _autoRunId = Guid.NewGuid();
+            SetLastSendOutcome(SendAttemptOutcome.ConfirmedFailure);
             _isAutoRunning = true;
+            StoreTreeView.IsHitTestVisible = false;
             StatusTextBlock.Text = startedFromSelectedSegment
                 ? selectedSegmentStartMessage
                 : restartedSegmentedFromBeginning
                     ? $"🚀 [F1] 自动化发送模式已启动！已重置 '{restartedStoreName}' 的分段成功进度，将从第1段重发。(按 F2 停止)"
                     : "🚀 [F1] 自动化发送模式已启动！将从当前选中项继续。(按 F2 停止)";
 
-            // 启动后台循环任务
-            Task.Run(() => AutoProcessLoop(autoCts));
+            // 保存并观察任务，避免后台异常无人处理后界面永久停留在“运行中”。
+            _autoRunTask = Task.Run(() => AutoProcessLoop(autoCts));
+            _ = ObserveAutoRunTaskAsync(_autoRunTask, autoCts);
         }
 
         private bool TryApplyAutoSegmentStartFromSelectedChild(TreeViewNode rootNode, TreeViewNode selectedChildNode, out string statusMessage)
@@ -1630,7 +1680,46 @@ namespace moshushou
         {
             _isAutoRunning = false;
             _autoRunCts?.Cancel();
+            StoreTreeView.IsHitTestVisible = true;
             StatusTextBlock.Text = "🛑 [F2] 自动化发送已停止。";
+        }
+
+        private async Task ObserveAutoRunTaskAsync(Task task, CancellationTokenSource autoCts)
+        {
+            try
+            {
+                await task;
+            }
+            catch (OperationCanceledException)
+            {
+                // 用户停止属于正常结束。
+            }
+            catch (Exception ex)
+            {
+                DebugLogManager.Log("自动化", $"后台循环异常终止: {ex}");
+                await Application.Current.Dispatcher.InvokeAsync(() =>
+                {
+                    _isAutoRunning = false;
+                    StatusTextBlock.Text = $"🛑 自动化异常终止: {ex.Message}";
+                });
+            }
+            finally
+            {
+                await Application.Current.Dispatcher.InvokeAsync(() =>
+                {
+                    if (ReferenceEquals(_autoRunTask, task))
+                    {
+                        if (ReferenceEquals(_autoRunCts, autoCts))
+                        {
+                            _autoRunCts = null;
+                        }
+                        _autoRunTask = null;
+                        _isAutoRunning = false;
+                        _autoRunId = Guid.Empty;
+                        StoreTreeView.IsHitTestVisible = true;
+                    }
+                });
+            }
         }
 
         private void StopManualSearchFlow()
@@ -1720,8 +1809,20 @@ namespace moshushou
                         return;
                     }
 
-                    // D. F1 自动化不按“整店铺✅”跳过。
-                    //    分段店铺是否跳过由分段断点状态决定（仅跳过已发送的段）。
+                    // D. 已确认成功或待人工确认的店铺禁止自动重发。
+                    if (IsStoreMarkedSent(_currentSelectedNode.StoreName) ||
+                        _manualReviewStores.Contains(_currentSelectedNode.StoreName))
+                    {
+                        string reason = IsStoreMarkedSent(_currentSelectedNode.StoreName)
+                            ? "已确认发送成功"
+                            : "发送结果待人工确认";
+                        StatusTextBlock.Text = $"⏭️ {_currentSelectedNode.StoreName} {reason}，自动跳过。";
+                        if (!TryNavigateToNextNodeForAuto())
+                        {
+                            shouldStop = true;
+                        }
+                        return;
+                    }
 
                     // E. 检查是否有群名
                     if (string.IsNullOrWhiteSpace(_currentSelectedNode.GroupName))
@@ -1756,10 +1857,22 @@ namespace moshushou
                 }
 
                 // 2. 核心处理
-                // ✅ [修复] 调用带点击逻辑的版本（与 Ctrl+Enter 手动模式一致）
+                TreeViewNode attemptNode = _currentSelectedNode;
+                SetLastSendOutcome(SendAttemptOutcome.ConfirmedFailure);
                 bool success = await SearchCurrentItemAsync(true, token);
 
                 if (!_isAutoRunning || token.IsCancellationRequested) break;
+                if (!ReferenceEquals(_currentSelectedNode, attemptNode))
+                {
+                    _isAutoRunning = false;
+                    await Application.Current.Dispatcher.InvokeAsync(() =>
+                    {
+                        _manualReviewStores.Add(attemptNode.StoreName);
+                        SaveFileState(attemptNode.StoreName, saveImmediately: true);
+                        StatusTextBlock.Text = "🛑 自动发送期间选中项发生变化，已停止并转人工确认。";
+                    });
+                    break;
+                }
 
                 var autoLoopUiTask = await Application.Current.Dispatcher.InvokeAsync(async () =>
                 {
@@ -1770,7 +1883,7 @@ namespace moshushou
 
                     if (success)
                     {
-                        string? successStoreName = _currentSelectedNode?.StoreName;
+                        string? successStoreName = attemptNode.StoreName;
                         ClearInlineRetryState(successStoreName);
                         consecutiveFailures = 0;
                         if (TryNavigateToNextNodeForAuto())
@@ -1786,10 +1899,28 @@ namespace moshushou
                     else
                     {
                         bool reachedPasteStage = Volatile.Read(ref _lastFailureReachedPasteStage) == 1;
-                        if (_currentSelectedNode != null && !string.IsNullOrWhiteSpace(_currentSelectedNode.StoreName))
+                        if (!string.IsNullOrWhiteSpace(attemptNode.StoreName))
                         {
                             string failureStageLabel = reachedPasteStage ? "发送阶段失败" : "搜索/进群阶段失败";
-                            RecordStoreSendHistory(_currentSelectedNode.StoreName, "自动化发送", false, failureStageLabel);
+                            RecordStoreSendHistory(attemptNode.StoreName, "自动化发送", false, failureStageLabel);
+                        }
+
+                        if (GetLastSendOutcome() == SendAttemptOutcome.Ambiguous)
+                        {
+                            shouldRunSecurityCheckAfterFailure = false;
+                            _manualReviewStores.Add(attemptNode.StoreName);
+                            ClearStoreSentMark(attemptNode.StoreName);
+                            ClearInlineRetryState(attemptNode.StoreName);
+                            SaveFileState(attemptNode.StoreName, saveImmediately: true);
+                            RefreshStoreNodeHeader(attemptNode);
+                            StatusTextBlock.Text =
+                                $"⚠️ {attemptNode.StoreName} 可能已经发送，已转人工确认且不会自动重试。";
+                            if (!TryNavigateToNextNodeForAuto())
+                            {
+                                _isAutoRunning = false;
+                                StatusTextBlock.Text += " 自动列表已结束。";
+                            }
+                            return;
                         }
                         bool shouldVerifyLayout = true;
                         bool isLayoutValid = true;
@@ -1801,7 +1932,7 @@ namespace moshushou
                         {
                             // 任何失败在进入重试处理前都必须做布局验证。
                             // 规则：布局正常 -> 允许移动到重试区；布局异常 -> 立即停止自动化。
-                            TreeViewNode activeNode = _currentSelectedNode;
+                            TreeViewNode activeNode = attemptNode;
                             bool? preferredAppIsWework = null;
                             if (activeNode != null)
                             {
@@ -1948,7 +2079,7 @@ namespace moshushou
                             _lastLayoutVerifiedHwnd = matchedHwnd;
                             _lastLayoutVerifiedIsWework = matchedAppIsWework;
 
-                            var node = _currentSelectedNode;
+                            var node = attemptNode;
                             if (node != null)
                             {
                                 bool isRetryAreaStore = _failedStores.Contains(node.StoreName);
@@ -2494,6 +2625,10 @@ namespace moshushou
                     HasGroupName = hasValidGroupName,
                     IsWework = hasValidGroupName ? "企业微信".Equals(source, StringComparison.OrdinalIgnoreCase) : _isWeworkTurn
                 };
+                SendAttemptContext sendContext = CreateSendAttemptContext(
+                    snapshot.StoreName,
+                    snapshot.GroupName ?? string.Empty,
+                    snapshot.IsWework);
 
                 string appName = snapshot.IsWework ? "企业微信" : "微信";
                 Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = $"🔍 正在 [{appName}] 搜索: {snapshot.SearchText}...");
@@ -2504,11 +2639,11 @@ namespace moshushou
                     switch (strategy)
                     {
                         case SendStrategy.FileExcel:
-                            return await PasteExcelFileAsync(snapshot.StoreName, snapshot.IsWework, token);
+                            return await PasteExcelFileAsync(snapshot.StoreName, snapshot.IsWework, token, sendContext);
                         case SendStrategy.TextSegmented:
-                            return await PasteStoreInfoInSegmentsAsync(snapshot.StoreName, snapshot.IsWework, token, isAutoMode);
+                            return await PasteStoreInfoInSegmentsAsync(snapshot.StoreName, snapshot.IsWework, token, isAutoMode, sendContext);
                         default:
-                            return await PasteFullStoreInfoAsync(snapshot.StoreName, snapshot.IsWework, token);
+                            return await PasteFullStoreInfoAsync(snapshot.StoreName, snapshot.IsWework, token, sendContext);
                     }
                 };
 
@@ -2534,7 +2669,7 @@ namespace moshushou
                     IntPtr checkHwnd = GetForegroundWindow();
                     string titleText = await _screenshotHelper.GetWeChatWindowTitleTextAsync(checkHwnd, snapshot.IsWework);
 
-                    if (_screenshotHelper.IsFuzzyMatch(snapshot.SearchText, titleText))
+                    if (SendReliabilityPolicy.IsStrictIdentityMatch(snapshot.SearchText, titleText))
                     {
                         Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = $"⚡ [极速] 验证通过，直接发送。");
                         return await performPasteAsync();
@@ -2663,7 +2798,6 @@ namespace moshushou
                 // 复用 clickPos, 无需再次查找
                 
                 bool enteredSuccess = false;
-                string cleanTarget = snapshot.SearchText.Replace(" ", "").ToLowerInvariant();
 
                     if (clickPos.HasValue)
                     {
@@ -2855,7 +2989,8 @@ namespace moshushou
                         }
                     }
                     
-                    if (!string.IsNullOrEmpty(rawTitle) && _screenshotHelper.IsFuzzyMatch(snapshot.SearchText, rawTitle))
+                    if (!string.IsNullOrEmpty(rawTitle) &&
+                        SendReliabilityPolicy.IsStrictIdentityMatch(snapshot.SearchText, rawTitle))
                     {
                         enteredSuccess = true;
                         Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = $"✅ [OCR] 成功进入: {rawTitle}");
@@ -2950,11 +3085,11 @@ namespace moshushou
                             rawTitle = await _screenshotHelper.GetWeChatWindowTitleTextAsync(chatHwnd, snapshot.IsWework);
                         }
 
-                        string cleanTitle = System.Text.RegularExpressions.Regex.Replace(rawTitle ?? "", @"\(\d+.*?\)|（\d+.*?）|\(外部\)|（外部）|\s+", "").ToLowerInvariant();
-                        
                         bool isMatch = false;
-                        if (_screenshotHelper.IsFuzzyMatch(snapshot.SearchText, rawTitle)) isMatch = true;
-                        else if (cleanTitle.Contains(cleanTarget) || (cleanTarget.Contains(cleanTitle) && cleanTitle.Length > 2)) isMatch = true;
+                        if (SendReliabilityPolicy.IsStrictIdentityMatch(snapshot.SearchText, rawTitle))
+                        {
+                            isMatch = true;
+                        }
 
                         if (isMatch)
                         {
@@ -3439,6 +3574,26 @@ namespace moshushou
 
             try
             {
+                // Ctrl+Space 是用户主动操作的手动发送入口；与 F1 自动化不同，
+                // 不应因群名尚未建立而阻止用户在当前聊天窗口中发送。
+                bool autoSend = AutoSendCheckBox.IsChecked == true;
+                if (_searchConfig.CheckFocusOnCtrlSpace)
+                {
+                    // 稍作延迟等待系统热键触发带来的瞬间焦点漂移平息
+                    await Task.Delay(20);
+                    if (!IsInputFocusedOnForegroundWindow(out string reason))
+                    {
+                        if (!autoSend)
+                        {
+                            StatusTextBlock.Text = $"⚠️ 已拦截 Ctrl+Space 粘贴：{reason}";
+                            return;
+                        }
+
+                        // 手动发送由操作者确认当前聊天窗口，焦点探测只提示，不再硬拦截。
+                        StatusTextBlock.Text = $"⚠️ 未能确认输入光标：{reason}；按 Ctrl+Space 手动发送继续执行。";
+                    }
+                }
+
                 if (_currentSelectedNode == null)
                 {
                     StatusTextBlock.Text = "⚠️ 请先选择一个商家或子项";
@@ -3457,7 +3612,6 @@ namespace moshushou
                     return;
                 }
 
-                bool autoSend = AutoSendCheckBox.IsChecked == true;
                 bool isSegmentedRoot = rootNode.Strategy == SendStrategy.TextSegmented &&
                                        rootNode.Children != null &&
                                        rootNode.Children.Count > 0;
@@ -3490,13 +3644,27 @@ namespace moshushou
                 if (!success)
                 {
                     string action = autoSend ? "Ctrl+Space发送" : "Ctrl+Space粘贴";
-                    RecordStoreSendHistory(rootNode.StoreName, action, false, "快捷键执行失败");
+                    bool ambiguous = autoSend && GetLastSendOutcome() == SendAttemptOutcome.Ambiguous;
+                    if (ambiguous)
+                    {
+                        _manualReviewStores.Add(rootNode.StoreName);
+                        SaveFileState(rootNode.StoreName, saveImmediately: true);
+                        RefreshStoreNodeHeader(rootNode);
+                    }
+                    RecordStoreSendHistory(
+                        rootNode.StoreName,
+                        action,
+                        false,
+                        ambiguous ? "发送结果待人工确认" : "快捷键执行失败");
                     return;
                 }
 
                 if (autoSend)
                 {
-                    MarkStoreAsSent(rootNode.StoreName, "Ctrl+Space发送", "快捷键发送成功");
+                    MarkStoreAsSent(
+                        rootNode.StoreName,
+                        "Ctrl+Space手动发送",
+                        "用户手动触发发送（未执行自动群名/上屏拦截）");
                 }
                 else
                 {
@@ -3514,7 +3682,9 @@ namespace moshushou
                 {
                     // 等待目标窗口（企业微信等）处理完 Ctrl+V 粘贴操作并从剪贴板读取内容后，
                     // 再用下一项的商家名覆盖剪贴板，避免粘贴内容被提前覆盖
-                    await Task.Delay(200);
+                    // 手动粘贴（不自动发送）时，不需要等待消息上屏，可缩短延迟
+                    int nextDelayMs = autoSend ? 200 : 50;
+                    await Task.Delay(nextDelayMs);
                     await AdvanceToNextMainNodeAndCopyStoreNameAsync(rootNode);
                 }
             }
@@ -3524,6 +3694,160 @@ namespace moshushou
                 RestoreCtrlKeyIfPhysicallyHeld();
             }
         }
+
+        private bool IsInputFocusedOnForegroundWindow(out string reason)
+        {
+            reason = string.Empty;
+            try
+            {
+                IntPtr fgHwnd = GetForegroundWindow();
+                if (fgHwnd == IntPtr.Zero)
+                {
+                    reason = "未检测到前台窗口";
+                    return false;
+                }
+
+                // 获取前台窗口所属进程信息
+                GetWindowThreadProcessId(fgHwnd, out uint fgPid);
+                if (fgPid == 0)
+                {
+                    reason = "前台窗口PID为0";
+                    return false;
+                }
+
+                string fgProcessName = string.Empty;
+                try
+                {
+                    using (var proc = System.Diagnostics.Process.GetProcessById((int)fgPid))
+                    {
+                        fgProcessName = proc?.ProcessName ?? string.Empty;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"[CheckFocus] 获取前台进程名失败: {ex.Message}");
+                }
+
+                // 获取系统 Caret 状态
+                uint threadId = GetWindowThreadProcessId(fgHwnd, out _);
+                var gui = new GUITHREADINFO();
+                gui.cbSize = Marshal.SizeOf(gui);
+                bool guiSuccess = GetGUIThreadInfo(threadId, ref gui);
+
+                // 核心判定 1：对于微信和企业微信，采用绝对可靠的 Win32 Caret 物理光标验证
+                bool isWeChatOrWeCom = fgProcessName.Equals("WXWork", StringComparison.OrdinalIgnoreCase) ||
+                                       fgProcessName.Equals("WeChat", StringComparison.OrdinalIgnoreCase) ||
+                                       fgProcessName.Equals("Weixin", StringComparison.OrdinalIgnoreCase);
+
+                if (isWeChatOrWeCom)
+                {
+                    if (!guiSuccess)
+                    {
+                        reason = "获取 Win32 Caret 信息失败";
+                        return false;
+                    }
+
+                    int caretWidth = gui.rcCaret.Right - gui.rcCaret.Left;
+                    int caretHeight = gui.rcCaret.Bottom - gui.rcCaret.Top;
+
+                    // 判断光标是否活动 (根据捕获到的数据：聚焦时宽高为 1x19, Flags=0x1, hwndCaret!=0；未聚焦时全为 0)
+                    bool hasActiveCaret = gui.hwndCaret != IntPtr.Zero &&
+                                          (gui.flags & 0x00000001) != 0 &&
+                                          caretWidth > 0 &&
+                                          caretHeight > 0;
+
+                    if (hasActiveCaret)
+                    {
+                        Debug.WriteLine($"[CheckFocus] 微信/企业微信光标校验通过: 宽高={caretWidth}x{caretHeight}, Flags=0x{gui.flags:X}");
+                        return true;
+                    }
+                    else
+                    {
+                        Debug.WriteLine($"[CheckFocus] 微信/企业微信光标校验失败: Caret={caretWidth}x{caretHeight}, Flags=0x{gui.flags:X}, hwndCaret=0x{gui.hwndCaret.ToString("X")}");
+                        reason = "输入框未聚焦（可能未成功粘贴，不跳转下一项）";
+                        return false;
+                    }
+                }
+
+                // 核心判定 2：非微信/企业微信的其他前台程序，采用 UIA 和 Win32 结合的通用判定
+                int normalCaretWidth = guiSuccess ? (gui.rcCaret.Right - gui.rcCaret.Left) : 0;
+                int normalCaretHeight = guiSuccess ? (gui.rcCaret.Bottom - gui.rcCaret.Top) : 0;
+
+                // 优先物理 Caret 验证
+                bool hasNormalActiveCaret = guiSuccess &&
+                                            gui.hwndCaret != IntPtr.Zero &&
+                                            (gui.flags & 0x00000001) != 0 &&
+                                            normalCaretWidth > 0 &&
+                                            normalCaretHeight > 0;
+
+                if (hasNormalActiveCaret)
+                {
+                    Debug.WriteLine("[CheckFocus] 通用 Caret 校验通过");
+                    return true;
+                }
+
+                // 备用 UIA 验证
+                var focused = System.Windows.Automation.AutomationElement.FocusedElement;
+                if (focused != null)
+                {
+                    var ctrlType = focused.Current.ControlType;
+                    string className = focused.Current.ClassName ?? string.Empty;
+                    string name = focused.Current.Name ?? string.Empty;
+
+                    // 顺向放行：确认为输入框
+                    if (ctrlType == System.Windows.Automation.ControlType.Edit ||
+                        ctrlType == System.Windows.Automation.ControlType.Document ||
+                        className.Contains("Edit", System.StringComparison.OrdinalIgnoreCase) ||
+                        className.Contains("Rich", System.StringComparison.OrdinalIgnoreCase))
+                    {
+                        Debug.WriteLine("[CheckFocus] 通用 UIA 放行：Edit/Document/Rich 校验通过");
+                        return true;
+                    }
+
+                    // 自定义输入框 ComboBox
+                    if (ctrlType == System.Windows.Automation.ControlType.ComboBox)
+                    {
+                        if (className.Contains("Edit", System.StringComparison.OrdinalIgnoreCase) ||
+                            className.Contains("Rich", System.StringComparison.OrdinalIgnoreCase))
+                        {
+                            Debug.WriteLine("[CheckFocus] 通用 ComboBox 校验通过");
+                            return true;
+                        }
+                    }
+
+                    // 逆向拦截：明确不支持输入的常规 UI 区域（注意：此处故意排除了 ControlType.Window，以完美兼容“宝盒lite”等自绘输入框）
+                    if (ctrlType == System.Windows.Automation.ControlType.List ||
+                        ctrlType == System.Windows.Automation.ControlType.ListItem ||
+                        ctrlType == System.Windows.Automation.ControlType.Tree ||
+                        ctrlType == System.Windows.Automation.ControlType.TreeItem ||
+                        ctrlType == System.Windows.Automation.ControlType.Button ||
+                        ctrlType == System.Windows.Automation.ControlType.MenuBar ||
+                        ctrlType == System.Windows.Automation.ControlType.Menu ||
+                        ctrlType == System.Windows.Automation.ControlType.MenuItem ||
+                        ctrlType == System.Windows.Automation.ControlType.ScrollBar ||
+                        ctrlType == System.Windows.Automation.ControlType.Header ||
+                        ctrlType == System.Windows.Automation.ControlType.Tab ||
+                        ctrlType == System.Windows.Automation.ControlType.TabItem ||
+                        ctrlType == System.Windows.Automation.ControlType.Image ||
+                        ctrlType == System.Windows.Automation.ControlType.ToolBar)
+                    {
+                        Debug.WriteLine($"[CheckFocus] 焦点在非输入区: 前台={fgProcessName}, Type={ctrlType.ProgrammaticName.Replace("ControlType.", "")}, Class={className}, Name='{name}'");
+                        reason = "焦点在非输入区（可能未成功粘贴，不跳转下一项）";
+                        return false;
+                    }
+                }
+
+                // 模糊匹配兜底规则：对于无法确定的复杂自绘顶层窗口、Pane 容器或者 UIA 临时故障的第三方客户端，默认予以放行，防止误伤正常功能
+                Debug.WriteLine("[CheckFocus] 通用程序模糊兜底放行");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                reason = $"异常: {ex.Message}";
+                return true;
+            }
+        }
+
 
         private async Task HandleCtrlSpaceSegmentedAsync(TreeViewNode rootNode, TreeViewNode selectedNode, bool autoSend)
         {
@@ -3618,7 +3942,20 @@ namespace moshushou
             if (!success)
             {
                 string action = autoSend ? "Ctrl+Space发送" : "Ctrl+Space粘贴";
-                RecordStoreSendHistory(rootNode.StoreName, action, false, $"第 {currentIndex + 1}/{totalSegments} 段执行失败");
+                bool ambiguous = autoSend && GetLastSendOutcome() == SendAttemptOutcome.Ambiguous;
+                if (ambiguous)
+                {
+                    _manualReviewStores.Add(rootNode.StoreName);
+                    SaveFileState(rootNode.StoreName, saveImmediately: true);
+                    RefreshStoreNodeHeader(rootNode);
+                }
+                RecordStoreSendHistory(
+                    rootNode.StoreName,
+                    action,
+                    false,
+                    ambiguous
+                        ? $"第 {currentIndex + 1}/{totalSegments} 段发送结果待人工确认"
+                        : $"第 {currentIndex + 1}/{totalSegments} 段执行失败");
                 return;
             }
 
@@ -3764,20 +4101,24 @@ namespace moshushou
                 return false;
             }
 
-            await Task.Delay(8);
-            SimulatePaste();
-
             if (autoSend)
             {
-                // 按用户要求：快捷键发送仅使用 Enter 单键，不再 Alt+S 双保险
-                const int enterDelayMs = 8;
-                await Task.Delay(enterDelayMs);
-                SimulateEnter();
-                DebugLogManager.Log("CtrlSpace", $"文件发送延迟: {enterDelayMs}ms, 文件={Path.GetFileName(filePath)}");
-                StatusTextBlock.Text = $"✅ [Ctrl+Space] 已发送文件: {storeName}";
+                if (!await TriggerManualCtrlSpaceSendAsync(filePath, isFile: true))
+                {
+                    return false;
+                }
+                await CaptureGroupNameAfterManualCtrlSpaceSendAsync(storeName);
+                DebugLogManager.Log("CtrlSpace", $"文件已由用户手动触发发送, 文件={Path.GetFileName(filePath)}");
+                StatusTextBlock.Text = $"✅ [Ctrl+Space] 已手动触发文件发送: {storeName}";
             }
             else
             {
+                await Task.Delay(30);
+                if (!SimulatePaste())
+                {
+                    StatusTextBlock.Text = "❌ Ctrl+V 注入失败";
+                    return false;
+                }
                 StatusTextBlock.Text = $"📋 [Ctrl+Space] 已粘贴文件: {storeName}";
             }
 
@@ -3795,27 +4136,124 @@ namespace moshushou
                 return false;
             }
 
-            await Task.Delay(8);
-            SimulatePaste();
-
             string suffix = string.IsNullOrWhiteSpace(segmentTag) ? string.Empty : $" ({segmentTag})";
             if (autoSend)
             {
-                // 按用户要求：快捷键发送仅使用 Enter 单键，不再 Alt+S 双保险
-                const int enterDelayMs = 8;
-                await Task.Delay(enterDelayMs);
-                SimulateEnter();
-                DebugLogManager.Log("CtrlSpace", $"文本发送延迟: {enterDelayMs}ms, 长度={payload.Length}");
-                StatusTextBlock.Text = $"✅ [Ctrl+Space] 已发送: {storeName}{suffix}";
+                if (!await TriggerManualCtrlSpaceSendAsync(payload, isFile: false))
+                {
+                    return false;
+                }
+                await CaptureGroupNameAfterManualCtrlSpaceSendAsync(storeName);
+                DebugLogManager.Log("CtrlSpace", $"文本已由用户手动触发发送, 长度={payload.Length}");
+                StatusTextBlock.Text = $"✅ [Ctrl+Space] 已手动触发发送: {storeName}{suffix}";
             }
             else
             {
+                await Task.Delay(30);
+                if (!SimulatePaste())
+                {
+                    StatusTextBlock.Text = "❌ Ctrl+V 注入失败";
+                    return false;
+                }
                 StatusTextBlock.Text = $"📋 [Ctrl+Space] 已粘贴: {storeName}{suffix}";
             }
 
             _currentItemPasted = true;
             _lastPastedStoreName = storeName;
             return true;
+        }
+
+        private async Task<bool> TriggerManualCtrlSpaceSendAsync(string payload, bool isFile)
+        {
+            SetLastSendOutcome(SendAttemptOutcome.ConfirmedFailure);
+            IntPtr hwnd = GetForegroundWindow();
+
+            if (!SimulatePaste())
+            {
+                StatusTextBlock.Text = "❌ Ctrl+Space 手动发送失败：Ctrl+V 注入失败";
+                return false;
+            }
+
+            try
+            {
+                await Task.Delay(isFile ? 300 : 100);
+            }
+            catch (OperationCanceledException)
+            {
+                return false;
+            }
+
+            if (isFile && hwnd != IntPtr.Zero)
+            {
+                for (int attempt = 0; attempt < 5; attempt++)
+                {
+                    System.Drawing.Point? originalFilePoint = await _screenshotHelper
+                        .FindPopupTextPositionAsync(hwnd, "使用原文件");
+                    if (originalFilePoint.HasValue)
+                    {
+                        await MouseHelper.HumanLikeClickAsync(
+                            originalFilePoint.Value.X,
+                            originalFilePoint.Value.Y,
+                            90);
+                        SetLastSendOutcome(SendAttemptOutcome.Success);
+                        return true;
+                    }
+
+                    await Task.Delay(120);
+                }
+            }
+
+            if (!SimulateAltS())
+            {
+                StatusTextBlock.Text = "❌ Ctrl+Space 手动发送失败：Alt+S 注入失败";
+                return false;
+            }
+
+            // 手动模式不校验应用类型、群名、输入框 OCR 或消息上屏 OCR；由操作者决定当前前台窗口。
+            SetLastSendOutcome(SendAttemptOutcome.Success);
+            return true;
+        }
+
+        private async Task CaptureGroupNameAfterManualCtrlSpaceSendAsync(string storeName)
+        {
+            TreeViewNode? node = _currentSelectedNode;
+            if (node != null && TryResolveRootNode(node, out TreeViewNode rootNode))
+            {
+                node = rootNode;
+            }
+
+            if (!string.IsNullOrWhiteSpace(node?.GroupName))
+            {
+                return;
+            }
+
+            IntPtr hwnd = GetForegroundWindow();
+            if (hwnd == IntPtr.Zero)
+            {
+                return;
+            }
+
+            try
+            {
+                await Task.Delay(120);
+                if (GetForegroundWindow() != hwnd)
+                {
+                    return;
+                }
+
+                string groupName = await _screenshotHelper.GetWeChatWindowTitleTextAsync(hwnd, isWework: false);
+                if (string.IsNullOrWhiteSpace(groupName) || groupName.Length < 2)
+                {
+                    return;
+                }
+
+                UpdateBusInfo(storeName, groupName, "Ctrl+Space手动确认");
+                DebugLogManager.Log("CtrlSpace", $"手动发送后已保存群名: 商家={storeName}, 群名={groupName}");
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[CtrlSpace] 手动发送后识别群名失败: {ex.Message}");
+            }
         }
 
         private bool IsForegroundWeWorkWindow()
@@ -4349,265 +4787,312 @@ namespace moshushou
         // 原因：存在两个同名方法导致调用混乱
         // 现在所有调用统一使用 SearchCurrentItemAsync(bool isAutoMode, CancellationToken token) 版本
         // 该版本位于第 922 行，包含完整的 OCR 定位 + 鼠标点击逻辑
-        private async Task<bool> PasteAndVerifySendAsync(string contentToSend, bool isFile, CancellationToken token = default)
+        private async Task<bool> PasteAndVerifySendAsync(
+            string contentToSend,
+            bool isFile,
+            CancellationToken token = default,
+            SendAttemptContext? attemptContext = null,
+            int segmentNumber = 0)
         {
-            Action<string> Log = (msg) => System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [SendVerify] {msg}");
+            Action<string> Log = message =>
+                Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [SendVerify] {message}");
 
-            if (token.IsCancellationRequested)
+            SetLastSendOutcome(SendAttemptOutcome.ConfirmedFailure);
+            bool sendTriggered = false;
+            bool pasteConfirmed = false;
+            SendAttemptContext context = (attemptContext ??
+                CreateCurrentSendAttemptContext(_currentSelectedNode?.StoreName ?? string.Empty, segmentNumber))
+                .ForPayload(contentToSend, isFile, segmentNumber);
+
+            async Task<bool> ConfirmedFailureAsync(string detail)
             {
+                if (isFile && pasteConfirmed)
+                {
+                    string manualDetail =
+                        $"文件已粘贴但尚未确认发送，禁止自动重试: {detail}";
+                    SetLastSendOutcome(SendAttemptOutcome.Ambiguous);
+                    await RecordSendAttemptStateAsync(
+                        context,
+                        SendAttemptStatuses.Ambiguous,
+                        manualDetail,
+                        saveImmediately: true);
+                    Log($"⚠️ {manualDetail}");
+                    Application.Current.Dispatcher.Invoke(() =>
+                        StatusTextBlock.Text = $"⚠️ {manualDetail}");
+                    return false;
+                }
+
+                SetLastSendOutcome(SendAttemptOutcome.ConfirmedFailure);
+                await RecordSendAttemptStateAsync(
+                    context,
+                    SendAttemptStatuses.ConfirmedFailure,
+                    detail,
+                    saveImmediately: true);
+                Log($"❌ {detail}");
+                Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = $"❌ {detail}");
                 return false;
             }
 
-            // ✅ Fix: 如果是发送文本，必须在此处更新剪贴板，否则会重复粘贴上一次的文件
-            if (!isFile && !string.IsNullOrEmpty(contentToSend))
+            async Task<bool> AmbiguousAsync(string detail)
             {
-                bool copied = await SetClipboardWithRetryAsync(contentToSend);
-                if (!copied)
-                {
-                    Log("❌ [SendVerify] 设置剪贴板失败");
-                    return false;
-                }
-
-                try { await Task.Delay(100, token); } catch (OperationCanceledException) { return false; }
-            }
-
-            IntPtr targetHwnd = GetForegroundWindow();
-
-            if (!RobustActivateWindow(targetHwnd))
-            {
-                Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = "❌ 窗口无法激活，发送中止");
+                SetLastSendOutcome(SendAttemptOutcome.Ambiguous);
+                await RecordSendAttemptStateAsync(
+                    context,
+                    SendAttemptStatuses.Ambiguous,
+                    detail,
+                    saveImmediately: true);
+                Log($"⚠️ {detail}");
+                DebugLogManager.Log("发送待确认", $"商家={context.StoreName}, {detail}");
+                Application.Current.Dispatcher.Invoke(() =>
+                    StatusTextBlock.Text = $"⚠️ 发送结果待人工确认: {detail}");
                 return false;
             }
 
-
-            // 获取窗口坐标
-            if (!GetWindowRect(targetHwnd, out RECT rect)) return false;
-
-            bool isWework = false;
-            string expectedGroupName = string.Empty;
-            await Application.Current.Dispatcher.InvokeAsync(() =>
+            try
             {
-                if (_currentSelectedNode != null)
+                if (token.IsCancellationRequested)
                 {
-                    isWework = "企业微信".Equals(_currentSelectedNode.Source);
-                    expectedGroupName = _currentSelectedNode.GroupName?.Trim() ?? string.Empty;
-                }
-            });
-
-            // ------------------------------------------------------------
-            // 🚀 [安全加固] 在极速模式发送前，强制校验当前窗口标题是否匹配群名
-            // ------------------------------------------------------------
-            if (!string.IsNullOrWhiteSpace(expectedGroupName))
-            {
-                // [强制] 每次都校验，移除之前的跳过优化
-                Log($"🔍 [SendVerify] 正在校验群名: 预期='{expectedGroupName}'");
-                 
-                string currentTitle = await _screenshotHelper.GetWeChatWindowTitleTextAsync(targetHwnd, isWework);
-                 
-                bool isMatch = _screenshotHelper.IsFuzzyMatch(expectedGroupName, currentTitle);
-                if (!isMatch && !string.IsNullOrEmpty(currentTitle) && 
-                    (currentTitle.Contains(expectedGroupName, StringComparison.OrdinalIgnoreCase) ||
-                     expectedGroupName.Contains(currentTitle, StringComparison.OrdinalIgnoreCase)))
-                {
-                    isMatch = true;
+                    return await ConfirmedFailureAsync("发送前已取消");
                 }
 
-                if (!isMatch)
+                if (string.IsNullOrWhiteSpace(context.ExpectedGroupName))
                 {
-                    string msg = $"⚠️ [SendVerify] 校验失败: 预期'{expectedGroupName}' vs 实际'{currentTitle}'，本次发送终止";
-                    Log(msg);
-                    DebugLogManager.Log("SendVerify", msg);
-                    Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = msg);
-                    // 关键修复：禁止在发送函数内递归触发 SearchCurrentItemAsync，避免分段发送重入嵌套。
-                    return false;
-                }
-                else
-                {
-                    Log($"✅ [SendVerify] 窗口校验通过: {currentTitle}");
-                }
-            }
-
-            int clickX = 0, clickY = 0;
-            // ✅ Fix: 使用 YOLO 获取精准点击坐标，而不是硬编码
-            var inputRes = await _screenshotHelper.GetInputBoxClickCoordinatesAsync(targetHwnd, isWework);
-            if (inputRes.success)
-            {
-                clickX = inputRes.x;
-                clickY = inputRes.y;
-                Log($"[SendVerify] YOLO 锁定输入框坐标: ({clickX}, {clickY})");
-            }
-            else
-            {
-                // 兜底策略：如果检测失败，回退到原有估算坐标
-                clickX = rect.Left + (isWework ? 380 : 310);
-                clickY = rect.Bottom - 70;
-                Log($"⚠️ [SendVerify] YOLO 失败，使用硬编码坐标: ({clickX}, {clickY})");
-            }
-
-            // === 动作 A: 激活输入框并粘贴 ===
-            await MouseHelper.HumanLikeClickAsync(clickX, clickY, 90);
-            try { await Task.Delay(35, token); } catch (OperationCanceledException) { return false; }
-
-            // 自动发送文本前先清空输入框，避免残留内容叠加
-            if (_isAutoRunning && !isFile)
-            {
-                bool cleared = await ClearInputBoxBeforeAutoSendAsync(token);
-                if (!cleared)
-                {
-                    Log("⚠️ [SendVerify] 清空输入框未完全确认，继续发送流程");
-                }
-            }
-
-            // 2. 粘贴
-            SimulatePaste();
-
-            Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = "⏳ 粘贴中... (等待渲染)");
-
-            // 再次检查窗口（防止粘贴期间窗口关了）
-            if (!CheckWindowReady(targetHwnd, "验证粘贴")) return false;
-
-            // --- 提取关键词用于验证 ---
-            string keyword;
-            if (isFile) keyword = Path.GetFileName(contentToSend);
-            else
-            {
-                if (contentToSend.Contains("未发货预警")) keyword = "未发货预警";
-                else if (contentToSend.Contains("考核处罚")) keyword = "考核处罚";
-                else keyword = contentToSend.Length > 8 ? contentToSend.Substring(0, 8) : contentToSend;
-            }
-
-            // 3. 【优化】移除发送前的 OCR 粘贴检测
-            // 用户反馈该步骤拖慢速度且识别不准，直接跳过，依靠后续的“发送后验证”来确认
-            Log("⚡ [极速] 已跳过粘贴内容检查(窗口已验证)，准备发送...");
-            try { await Task.Delay(100, token); } catch (OperationCanceledException) { return false; } // 留给 UI 极短渲染时间
-
-            // === 动作 B: 执行发送 (双保险) ===
-
-            // 再次点击输入框
-            await MouseHelper.HumanLikeClickAsync(clickX, clickY, 80);
-            try { await Task.Delay(35, token); } catch (OperationCanceledException) { return false; }
-
-            bool skipEnter = false;
-            // ✅ 新增：如果是企业微信发送文件，尝试处理“转为在线表格”弹窗
-            // ✅ 新增：如果是企业微信发送文件，尝试处理“转为在线表格”弹窗
-            if (isFile && isWework)
-            {
-                Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = "🔎 检测企业微信弹窗(OCR)...");
-                
-                // OCR 查找 "使用原文件"
-                // OCR 查找 "使用原文件"
-                System.Drawing.Point? clickPoint = null;
-                for (int k = 0; k < 5; k++)
-                {
-                    if (token.IsCancellationRequested) return false;
-
-                    clickPoint = await _screenshotHelper.FindPopupTextPositionAsync(targetHwnd, "使用原文件");
-                    if (clickPoint != null) break;
-                    try { await Task.Delay(300, token); } catch (OperationCanceledException) { return false; }
+                    return await ConfirmedFailureAsync("缺少目标群名，自动发送已拦截");
                 }
 
-                if (clickPoint != null)
+                if (Volatile.Read(ref _selectionVersion) != context.SelectionVersion)
                 {
-                    int cx = (int)clickPoint.Value.X;
-                    int cy = (int)clickPoint.Value.Y;
-                    Log($"⚡ OCR 定位到 '使用原文件' ({cx}, {cy})，执行点击...");
-
-                    await MouseHelper.HumanLikeClickAsync(cx, cy, 90);
-
-                    Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = "⚡ 已点击'使用原文件' (自动发送)");
-                    skipEnter = true; 
-                }
-                else
-                {
-                    Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = "⚠️ 未检测到弹窗，使用常规发送");
-                }
-            }
-
-            if (!skipEnter)
-            {
-                // 方案 1: Alt + S
-                SimulateAltS();
-                Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = "✉️ 发送指令 (Alt+S)...");
-                try { await Task.Delay(300, token); } catch (OperationCanceledException) { return false; }
-
-                // 方案 2: Enter (补刀)
-                SimulateEnter();
-                Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text += " + (Enter补刀)...");
-            }
-            else
-            {
-                try { await Task.Delay(400, token); } catch (OperationCanceledException) { return false; } // 弹窗点击后缓冲
-            }
-
-            // ============================================================
-            // 🌟 YOLO 精准验证 (3屏快速截取 + 模糊匹配)
-            // ============================================================
-            const int MAX_VERIFY_ROUNDS = 3; // 最多验证3轮（每轮3屏 = 最多9次截取）
-
-            for (int round = 0; round < MAX_VERIFY_ROUNDS; round++)
-            {
-                try { await Task.Delay(200, token); } catch (OperationCanceledException) { return false; } // 等待 UI 渲染
-                if (token.IsCancellationRequested) return false;
-
-                // 检查窗口焦点：焦点丢失视为发送失败，要求严格验证
-                IntPtr currentForeground = GetForegroundWindow();
-                if (currentForeground != targetHwnd)
-                {
-                    Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = "❌ 验证期间窗口失焦，发送失败。");
-                    return false;
+                    return await ConfirmedFailureAsync("发送前选中项发生变化");
                 }
 
-                // 调用 YOLO 精准验证（内部快速截取3屏）
-                var verifyResult = await _screenshotHelper.VerifySendWithYoloAsync(targetHwnd, isWework, keyword, token);
-                if (token.IsCancellationRequested || string.Equals(verifyResult.verifyMethod, "已取消", StringComparison.Ordinal))
+                if (!isFile)
                 {
-                    return false;
-                }
-
-                if (verifyResult.success)
-                {
-                    if (!string.IsNullOrWhiteSpace(expectedGroupName))
+                    if (string.IsNullOrEmpty(contentToSend) ||
+                        !await SetClipboardWithRetryAsync(contentToSend))
                     {
-                        string finalTitle = await _screenshotHelper.GetWeChatWindowTitleTextAsync(targetHwnd, isWework);
-                        bool titleMatched = _screenshotHelper.IsFuzzyMatch(expectedGroupName, finalTitle);
-                        if (!titleMatched && !string.IsNullOrWhiteSpace(finalTitle))
-                        {
-                            titleMatched = finalTitle.Contains(expectedGroupName, StringComparison.OrdinalIgnoreCase)
-                                           || expectedGroupName.Contains(finalTitle, StringComparison.OrdinalIgnoreCase);
-                        }
+                        return await ConfirmedFailureAsync("剪贴板写入失败");
+                    }
+                    await Task.Delay(100, token);
+                }
+                else if (!File.Exists(contentToSend))
+                {
+                    return await ConfirmedFailureAsync("待发送文件不存在");
+                }
 
-                        if (!titleMatched)
-                        {
-                            string mismatchMsg = $"❌ [SendVerify] 发送后群标题校验失败: 预期='{expectedGroupName}', 实际='{finalTitle}'，标记失败并重试搜索";
-                            Log(mismatchMsg);
-                            DebugLogManager.Log("SendVerify", mismatchMsg);
-                            Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = mismatchMsg);
-                            return false;
-                        }
+                IntPtr targetHwnd = GetForegroundWindow();
+                if (!IsTargetChatWindow(targetHwnd, out string processName) ||
+                    !IsProcessNameForApp(processName, context.IsWework))
+                {
+                    return await ConfirmedFailureAsync("前台窗口不是目标微信/企业微信");
+                }
 
-                        string postOkMsg = $"✅ [SendVerify] 发送后群标题二次校验通过: {finalTitle}";
-                        Log(postOkMsg);
-                        DebugLogManager.Log("SendVerify", postOkMsg);
+                if (!RobustActivateWindow(targetHwnd) || !GetWindowRect(targetHwnd, out _))
+                {
+                    return await ConfirmedFailureAsync("目标窗口无法激活");
+                }
+
+                string currentTitle = await _screenshotHelper.GetWeChatWindowTitleTextAsync(
+                    targetHwnd,
+                    context.IsWework);
+                if (!SendReliabilityPolicy.IsStrictIdentityMatch(context.ExpectedGroupName, currentTitle))
+                {
+                    return await ConfirmedFailureAsync(
+                        $"目标群校验失败: 预期='{context.ExpectedGroupName}', 实际='{currentTitle}'");
+                }
+
+                bool preparedSaved = await RecordSendAttemptStateAsync(
+                    context,
+                    SendAttemptStatuses.Prepared,
+                    "目标群已确认，准备粘贴",
+                    saveImmediately: true);
+                if (!preparedSaved)
+                {
+                    return await ConfirmedFailureAsync("无法持久化发送准备状态，自动发送已中止");
+                }
+
+                var inputResult = await _screenshotHelper.GetInputBoxClickCoordinatesAsync(
+                    targetHwnd,
+                    context.IsWework,
+                    allowFallback: false);
+                if (!inputResult.success)
+                {
+                    return await ConfirmedFailureAsync("未能精确识别聊天输入框");
+                }
+
+                string? baselineChatInfoFingerprint =
+                    _screenshotHelper.CaptureLatestChatInfoFingerprint(targetHwnd);
+                if (string.IsNullOrWhiteSpace(baselineChatInfoFingerprint))
+                {
+                    return await ConfirmedFailureAsync("未能建立发送前消息区快照");
+                }
+
+                await MouseHelper.HumanLikeClickAsync(inputResult.x, inputResult.y, 90);
+                await Task.Delay(60, token);
+
+                if (!await ClearInputBoxBeforeAutoSendAsync(token))
+                {
+                    return await ConfirmedFailureAsync("输入框清理失败");
+                }
+
+                if (!SimulatePaste())
+                {
+                    return await ConfirmedFailureAsync("Ctrl+V 注入失败");
+                }
+
+                Application.Current.Dispatcher.Invoke(() =>
+                    StatusTextBlock.Text = "⏳ 正在确认粘贴内容...");
+                if (!CheckWindowReady(targetHwnd, "验证粘贴"))
+                {
+                    return await ConfirmedFailureAsync("粘贴后窗口状态异常");
+                }
+
+                string keyword = SendReliabilityPolicy.BuildVerificationKeyword(contentToSend, isFile);
+                bool popupWillSendFile = false;
+                System.Drawing.Point? originalFilePoint = null;
+
+                if (isFile && context.IsWework)
+                {
+                    for (int attempt = 0; attempt < 5 && !token.IsCancellationRequested; attempt++)
+                    {
+                        originalFilePoint = await _screenshotHelper.FindPopupTextPositionAsync(
+                            targetHwnd,
+                            "使用原文件");
+                        if (originalFilePoint.HasValue)
+                        {
+                            popupWillSendFile = true;
+                            break;
+                        }
+                        await Task.Delay(250, token);
+                    }
+                }
+
+                if (!popupWillSendFile)
+                {
+                    var pasteVerify = await _screenshotHelper.VerifyPasteWithYoloAsync(
+                        targetHwnd,
+                        context.IsWework,
+                        keyword,
+                        token);
+                    if (!pasteVerify.success)
+                    {
+                        return await ConfirmedFailureAsync(
+                            $"未确认内容进入输入框: {pasteVerify.verifyMethod}");
+                    }
+                }
+                pasteConfirmed = true;
+
+                token.ThrowIfCancellationRequested();
+                if (Volatile.Read(ref _selectionVersion) != context.SelectionVersion)
+                {
+                    return await ConfirmedFailureAsync("粘贴后选中项发生变化，发送已拦截");
+                }
+
+                string titleBeforeSend = await _screenshotHelper.GetWeChatWindowTitleTextAsync(
+                    targetHwnd,
+                    context.IsWework);
+                if (!SendReliabilityPolicy.IsStrictIdentityMatch(context.ExpectedGroupName, titleBeforeSend))
+                {
+                    return await ConfirmedFailureAsync("发送前最终群名校验失败");
+                }
+                if (GetForegroundWindow() != targetHwnd ||
+                    !IsTargetChatWindow(targetHwnd, out string finalProcessName) ||
+                    !IsProcessNameForApp(finalProcessName, context.IsWework))
+                {
+                    return await ConfirmedFailureAsync("发送前最终前台窗口校验失败");
+                }
+                token.ThrowIfCancellationRequested();
+
+                bool triggerCheckpointSaved = await RecordSendAttemptStateAsync(
+                    context,
+                    SendAttemptStatuses.Triggered,
+                    "即将触发发送指令",
+                    saveImmediately: true);
+                if (!triggerCheckpointSaved)
+                {
+                    return await ConfirmedFailureAsync("无法持久化发送触发点，自动发送已中止");
+                }
+                sendTriggered = true;
+                token.ThrowIfCancellationRequested();
+
+                if (popupWillSendFile && originalFilePoint.HasValue)
+                {
+                    await MouseHelper.HumanLikeClickAsync(
+                        originalFilePoint.Value.X,
+                        originalFilePoint.Value.Y,
+                        90);
+                }
+                else
+                {
+                    if (!SimulateAltS())
+                    {
+                        return await AmbiguousAsync("发送快捷键注入异常");
+                    }
+                }
+
+                Application.Current.Dispatcher.Invoke(() =>
+                    StatusTextBlock.Text = "✉️ 已触发发送，正在确认最新消息...");
+
+                const int maxVerifyRounds = 3;
+                string lastVerifyMethod = "未开始验证";
+                for (int round = 0; round < maxVerifyRounds; round++)
+                {
+                    await Task.Delay(300, token);
+
+                    if (GetForegroundWindow() != targetHwnd)
+                    {
+                        return await AmbiguousAsync("发送后窗口失焦，无法确认结果");
                     }
 
-                    Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = $"✅ [{verifyResult.verifyMethod}] 发送成功。");
+                    var verifyResult = await _screenshotHelper.VerifySendWithYoloAsync(
+                        targetHwnd,
+                        context.IsWework,
+                        keyword,
+                        baselineChatInfoFingerprint,
+                        token);
+                    lastVerifyMethod = verifyResult.verifyMethod;
+                    if (!verifyResult.success)
+                    {
+                        continue;
+                    }
+
+                    string finalTitle = await _screenshotHelper.GetWeChatWindowTitleTextAsync(
+                        targetHwnd,
+                        context.IsWework);
+                    if (!SendReliabilityPolicy.IsStrictIdentityMatch(context.ExpectedGroupName, finalTitle))
+                    {
+                        return await AmbiguousAsync(
+                            $"消息已检测上屏，但发送后群名不匹配: '{finalTitle}'");
+                    }
+
+                    bool deliveredCheckpointSaved = await RecordSendAttemptStateAsync(
+                        context,
+                        SendAttemptStatuses.Delivered,
+                        verifyResult.verifyMethod,
+                        saveImmediately: true);
+                    if (!deliveredCheckpointSaved)
+                    {
+                        return await AmbiguousAsync("消息已确认上屏，但完成状态未能持久化");
+                    }
+                    SetLastSendOutcome(SendAttemptOutcome.Success);
+                    Application.Current.Dispatcher.Invoke(() =>
+                        StatusTextBlock.Text = $"✅ [{verifyResult.verifyMethod}] 发送成功。");
                     return true;
                 }
 
-                // 补刀重试：发送未成功，再次点击输入框 + Enter
-                if (round < MAX_VERIFY_ROUNDS - 1)
-                {
-                    Log($"⚠️ 第{round + 1}轮验证未通过，补刀重试...");
-                    Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = $"⚠️ 第{round + 1}轮未通过，补刀Enter重试...");
-                    await MouseHelper.HumanLikeClickAsync(clickX, clickY, 80);
-                    try { await Task.Delay(35, token); } catch (OperationCanceledException) { return false; }
-                    SimulateEnter();
-                }
+                return await AmbiguousAsync($"已触发发送但未确认最新消息上屏: {lastVerifyMethod}");
             }
-
-            // 所有轮次验证均未通过 → 发送失败
-            Application.Current.Dispatcher.Invoke(() => StatusTextBlock.Text = $"❌ [YOLO验证] 发送失败: 未检测到发送内容。");
-            return false;
+            catch (OperationCanceledException)
+            {
+                return sendTriggered
+                    ? await AmbiguousAsync("发送指令后流程被取消")
+                    : await ConfirmedFailureAsync("发送前流程被取消");
+            }
+            catch (Exception ex)
+            {
+                return sendTriggered
+                    ? await AmbiguousAsync($"发送指令后发生异常: {ex.Message}")
+                    : await ConfirmedFailureAsync($"发送前发生异常: {ex.Message}");
+            }
         }
         private async Task<bool> ClearInputBoxBeforeAutoSendAsync(CancellationToken token = default)
         {
@@ -4638,17 +5123,18 @@ namespace moshushou
             }
         }
 
-        private void SimulateEnter()
+        private bool SimulateEnter()
         {
             try
             {
                 // 模拟按下 Enter 键
                 _inputSimulator.Keyboard.KeyPress(VirtualKeyCode.RETURN);
+                return true;
             }
             catch (Exception ex)
             {
-                // 即使报错也不要崩溃
                 Debug.WriteLine($"模拟 Enter 失败: {ex.Message}");
+                return false;
             }
         }
 
@@ -5036,7 +5522,11 @@ namespace moshushou
 
         // MainWindow.xaml.cs
 
-        private async Task<bool> PasteExcelFileAsync(string storeName, bool isWework, CancellationToken token = default)
+        private async Task<bool> PasteExcelFileAsync(
+            string storeName,
+            bool isWework,
+            CancellationToken token = default,
+            SendAttemptContext? attemptContext = null)
         {
             Action<string> Log = (msg) => System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [粘贴文件] {msg}");
             Log($"开始处理文件: {storeName}, isWework: {isWework}");
@@ -5115,23 +5605,47 @@ namespace moshushou
                 {
                     string sendAction = _isAutoRunning ? "自动化发送" : "自动发送";
                     Log("执行自动发送...");
-                    result = await PasteAndVerifySendAsync(filePath, true, token);
+                    result = await PasteAndVerifySendAsync(filePath, true, token, attemptContext);
                     if (result)
                     {
-                        _currentItemPasted = true;
-                        _lastPastedStoreName = storeName;
-                        MarkStoreAsSent(storeName, sendAction, "文件发送成功");
-                        StatusTextBlock.Text = $"✅ [自动] 已发送文件: {displayStoreName}";
-                        Log("✅ 发送成功");
-
                         // 仅普通未发货模式追加固定话术
                         if (shouldAppendFixedMessage)
                         {
                             try { await Task.Delay(200, token); } catch (OperationCanceledException) { return false; }
                             Log("➕ 追加发送未发货预警...");
                             StatusTextBlock.Text += " + 正在追加预警...";
-                            await PasteAndVerifySendAsync(GetCurrentTailMessage(), false, token);
+                            bool tailSuccess = await PasteAndVerifySendAsync(
+                                GetCurrentTailMessage(),
+                                false,
+                                token,
+                                attemptContext);
+                            if (!tailSuccess)
+                            {
+                                // 文件已确认送达，不能因为追加话术失败而重发整个文件。
+                                SetLastSendOutcome(SendAttemptOutcome.Ambiguous);
+                                SendAttemptContext compoundContext = (attemptContext ??
+                                    CreateCurrentSendAttemptContext(storeName))
+                                    .ForPayload($"{filePath}|TAIL", false);
+                                await RecordSendAttemptStateAsync(
+                                    compoundContext,
+                                    SendAttemptStatuses.Ambiguous,
+                                    "文件已发送，但追加话术未完成",
+                                    saveImmediately: true);
+                                RecordStoreSendHistory(
+                                    storeName,
+                                    sendAction,
+                                    false,
+                                    "文件已发送，但追加话术未完成，需人工确认");
+                                return false;
+                            }
                         }
+                        _currentItemPasted = true;
+                        _lastPastedStoreName = storeName;
+                        MarkStoreAsSent(storeName, sendAction, shouldAppendFixedMessage
+                            ? "文件及追加话术发送成功"
+                            : "文件发送成功");
+                        StatusTextBlock.Text = $"✅ [自动] 已完成文件发送: {displayStoreName}";
+                        Log("✅ 文件发送事务完成");
                         // ✅ [重构] 自定义话术模式不再走文件发送路径，已废弃此分支
                     }
                     else
@@ -5178,7 +5692,11 @@ namespace moshushou
 
         // MainWindow.xaml.cs
 
-        private async Task<bool> PasteFullStoreInfoAsync(string storeName, bool isWework, CancellationToken token = default)
+        private async Task<bool> PasteFullStoreInfoAsync(
+            string storeName,
+            bool isWework,
+            CancellationToken token = default,
+            SendAttemptContext? attemptContext = null)
         {
             Action<string> Log = (msg) => System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [粘贴文本] {msg}");
             Log($"开始处理商家: {storeName}, isWework: {isWework}");
@@ -5280,7 +5798,7 @@ namespace moshushou
                     string sendAction = _isAutoRunning ? "自动化发送" : "自动发送";
                     Log("模式: 自动发送");
                     // 注意：PasteAndVerifySendAsync 内部日志未在此处展示，需确保该函数也正常
-                    result = await PasteAndVerifySendAsync(fullText, false, token);
+                    result = await PasteAndVerifySendAsync(fullText, false, token, attemptContext);
                     if (result)
                     {
                         _currentItemPasted = true;
@@ -5330,7 +5848,12 @@ namespace moshushou
         /// ✅ [重构] 分段发送商家信息（支持中断和断点续传）
         /// 将数据按 SegmentSize 分段，逐段粘贴发送。如果失败或中断，保留未发送的数据。
         /// </summary>
-        private async Task<bool> PasteStoreInfoInSegmentsAsync(string storeName, bool isWework, CancellationToken token = default, bool isAutoMode = false)
+        private async Task<bool> PasteStoreInfoInSegmentsAsync(
+            string storeName,
+            bool isWework,
+            CancellationToken token = default,
+            bool isAutoMode = false,
+            SendAttemptContext? attemptContext = null)
         {
             Action<string> Log = (msg) =>
             {
@@ -5463,7 +5986,7 @@ namespace moshushou
                             : $"📋 正在粘贴第 {segNum}/{totalSegments} 段 ({segmentItems.Count} 条)...");
 
                     bool success = shouldAutoSend
-                        ? await PasteAndVerifySendAsync(segmentContent, false, token)
+                        ? await PasteAndVerifySendAsync(segmentContent, false, token, attemptContext, segNum)
                         : await PasteSegmentWithoutAutoSendAsync(segmentContent, isWework, token);
                     
                     if (!success)
@@ -5734,6 +6257,102 @@ namespace moshushou
             }
         }
 
+        private void SetLastSendOutcome(SendAttemptOutcome outcome)
+        {
+            Interlocked.Exchange(ref _lastSendOutcome, (int)outcome);
+        }
+
+        private SendAttemptOutcome GetLastSendOutcome()
+        {
+            return (SendAttemptOutcome)Volatile.Read(ref _lastSendOutcome);
+        }
+
+        private SendAttemptContext CreateSendAttemptContext(
+            string storeName,
+            string expectedGroupName,
+            bool isWework,
+            int segmentNumber = 0)
+        {
+            Guid runId = _autoRunId == Guid.Empty ? Guid.NewGuid() : _autoRunId;
+            return SendAttemptContext.Create(
+                runId,
+                storeName,
+                expectedGroupName,
+                isWework,
+                Volatile.Read(ref _selectionVersion),
+                segmentNumber);
+        }
+
+        private SendAttemptContext CreateCurrentSendAttemptContext(string storeName, int segmentNumber = 0)
+        {
+            TreeViewNode? node = _currentSelectedNode;
+            if (node != null && TryResolveRootNode(node, out TreeViewNode rootNode) && rootNode != null)
+            {
+                node = rootNode;
+            }
+
+            bool isWework = string.Equals(node?.Source, "企业微信", StringComparison.OrdinalIgnoreCase);
+            return CreateSendAttemptContext(
+                storeName,
+                node?.GroupName?.Trim() ?? string.Empty,
+                isWework,
+                segmentNumber);
+        }
+
+        private async Task<bool> RecordSendAttemptStateAsync(
+            SendAttemptContext context,
+            string status,
+            string detail,
+            bool saveImmediately = true)
+        {
+            var state = new SendAttemptState
+            {
+                AttemptId = context.AttemptId.ToString("N"),
+                RunId = context.RunId.ToString("N"),
+                StoreName = context.StoreName,
+                GroupName = context.ExpectedGroupName,
+                PayloadHash = context.PayloadHash,
+                SegmentNumber = context.SegmentNumber,
+                Status = status,
+                Detail = detail ?? string.Empty,
+                UpdatedAtUtc = DateTime.UtcNow
+            };
+
+            lock (_sendAttemptJournalLock)
+            {
+                _sendAttemptJournal[state.AttemptId] = state;
+
+                // 限制日志体积；优先移除最早的已终结事务。
+                if (_sendAttemptJournal.Count > 1000)
+                {
+                    foreach (string key in _sendAttemptJournal.Values
+                        .Where(item =>
+                            string.Equals(item.Status, SendAttemptStatuses.Delivered, StringComparison.Ordinal) ||
+                            string.Equals(item.Status, SendAttemptStatuses.ConfirmedFailure, StringComparison.Ordinal))
+                        .OrderBy(item => item.UpdatedAtUtc)
+                        .Take(_sendAttemptJournal.Count - 1000)
+                        .Select(item => item.AttemptId)
+                        .ToList())
+                    {
+                        _sendAttemptJournal.Remove(key);
+                    }
+                }
+            }
+
+            if (Application.Current?.Dispatcher == null)
+            {
+                return false;
+            }
+
+            if (Application.Current.Dispatcher.CheckAccess())
+            {
+                return SaveFileState(context.StoreName, saveImmediately);
+            }
+
+            return await Application.Current.Dispatcher.InvokeAsync(
+                () => SaveFileState(context.StoreName, saveImmediately));
+        }
+
         private void EmitRecentStoreHistoryToDebugLog(int take = 30)
         {
             try
@@ -5891,9 +6510,34 @@ namespace moshushou
             {
                 _sentStores.Add(storeName);
             }
+            _failedStores.Remove(storeName);
+            _manualReviewStores.Remove(storeName);
+            lock (_sendAttemptJournalLock)
+            {
+                foreach (string attemptId in _sendAttemptJournal.Values
+                    .Where(attempt =>
+                        string.Equals(attempt.StoreName, storeName, StringComparison.Ordinal) &&
+                        (string.Equals(attempt.Status, SendAttemptStatuses.Triggered, StringComparison.Ordinal) ||
+                         string.Equals(attempt.Status, SendAttemptStatuses.Ambiguous, StringComparison.Ordinal)))
+                    .Select(attempt => attempt.AttemptId)
+                    .ToList())
+                {
+                    _sendAttemptJournal.Remove(attemptId);
+                }
+            }
 
             RecordStoreSendHistory(storeName, action, true, detail);
             RefreshStoreNodeHeader(storeName);
+
+            if (Application.Current?.Dispatcher?.CheckAccess() == true)
+            {
+                SaveFileState(storeName, saveImmediately: true);
+            }
+            else if (Application.Current?.Dispatcher != null)
+            {
+                Application.Current.Dispatcher.Invoke(
+                    () => SaveFileState(storeName, saveImmediately: true));
+            }
         }
 
         private void ClearStoreSentMark(string storeName, bool refreshHeader = false)
@@ -6177,27 +6821,31 @@ namespace moshushou
 
 
 
-        private void SimulatePaste()
+        private bool SimulatePaste()
         {
             try
             {
                 _inputSimulator.Keyboard.ModifiedKeyStroke(VirtualKeyCode.CONTROL, VirtualKeyCode.VK_V);
+                return true;
             }
             catch (Exception ex)
             {
                 StatusTextBlock.Text = $"模拟粘贴失败: {ex.Message}";
+                return false;
             }
         }
 
-        private void SimulateAltS()
+        private bool SimulateAltS()
         {
             try
             {
                 _inputSimulator.Keyboard.ModifiedKeyStroke(VirtualKeyCode.MENU, VirtualKeyCode.VK_S);
+                return true;
             }
             catch (Exception ex)
             {
                 StatusTextBlock.Text = $"模拟发送失败: {ex.Message}";
+                return false;
             }
         }
 
@@ -6281,6 +6929,7 @@ namespace moshushou
             _manualReviewStores.Clear();
             lock (_segmentFailureLock) { _segmentFailureInfos.Clear(); }
             lock (_sentStoreLock) { _sentStores.Clear(); }
+            lock (_sendAttemptJournalLock) { _sendAttemptJournal.Clear(); }
             
             // ✅ [Fix] 重置模式标志，确保每次加载文件时从干净状态开始
             _isIssueMode = false;
@@ -6537,6 +7186,8 @@ namespace moshushou
                             FailedStores = new List<string>(),
                             ManualReviewStores = new List<string>(),
                             SegmentFailures = new List<SegmentFailureState>(),
+                            SentStores = new List<string>(),
+                            SendAttempts = new List<SendAttemptState>(),
                             DeletedStores = new List<string>(),
                             IsIssueMode = _isIssueMode,
                             IsCustomMessageMode = _isCustomMessageMode
@@ -6567,6 +7218,54 @@ namespace moshushou
                             foreach (var s in stateToRestore.FailedStores) _failedStores.Add(s);
                         if (stateToRestore.ManualReviewStores != null)
                             foreach (var s in stateToRestore.ManualReviewStores) _manualReviewStores.Add(s);
+                        if (stateToRestore.SentStores != null)
+                        {
+                            lock (_sentStoreLock)
+                            {
+                                foreach (var s in stateToRestore.SentStores.Where(s => !string.IsNullOrWhiteSpace(s)))
+                                {
+                                    _sentStores.Add(s);
+                                }
+                            }
+                        }
+                        if (stateToRestore.SendAttempts != null)
+                        {
+                            lock (_sendAttemptJournalLock)
+                            {
+                                foreach (var attempt in stateToRestore.SendAttempts.Where(item =>
+                                    item != null && !string.IsNullOrWhiteSpace(item.AttemptId)))
+                                {
+                                    _sendAttemptJournal[attempt.AttemptId] = attempt;
+
+                                    // 触发后退出、结果不明，或已上屏但尚未提交店铺/分段进度时，都不能自动重发。
+                                    bool segmentAlreadyCommitted =
+                                        attempt.SegmentNumber > 0 &&
+                                        stateToRestore.SegmentFailures?.Any(segment =>
+                                            string.Equals(
+                                                segment.StoreName,
+                                                attempt.StoreName,
+                                                StringComparison.Ordinal) &&
+                                            segment.SentSegments >= attempt.SegmentNumber) == true;
+                                    bool requiresManualReview =
+                                        string.Equals(attempt.Status, SendAttemptStatuses.Triggered, StringComparison.Ordinal) ||
+                                        string.Equals(attempt.Status, SendAttemptStatuses.Ambiguous, StringComparison.Ordinal) ||
+                                        (string.Equals(attempt.Status, SendAttemptStatuses.Delivered, StringComparison.Ordinal) &&
+                                         !segmentAlreadyCommitted);
+                                    if (requiresManualReview)
+                                    {
+                                        bool isAlreadyConfirmedSent;
+                                        lock (_sentStoreLock)
+                                        {
+                                            isAlreadyConfirmedSent = _sentStores.Contains(attempt.StoreName);
+                                        }
+                                        if (!isAlreadyConfirmedSent)
+                                        {
+                                            _manualReviewStores.Add(attempt.StoreName);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         if (stateToRestore.SegmentFailures != null)
                         {
                             lock (_segmentFailureLock)
@@ -6711,9 +7410,9 @@ namespace moshushou
         /// ✅ 保存当前文件的完整状态（选中项、重试区、需人工、已删除）
         /// 根据当前模式保存到对应的 FileState（未发货/问题件/自定义话术）
         /// </summary>
-        private void SaveFileState(string selectedStoreName = null)
+        private bool SaveFileState(string selectedStoreName = null, bool saveImmediately = false)
         {
-            if (_searchConfig == null) return;
+            if (_searchConfig == null) return false;
             
             // ✅ 根据当前模式选择正确的状态对象
             FileState state;
@@ -6732,7 +7431,7 @@ namespace moshushou
                 _searchConfig.LastFileState ??= new FileState();
                 state = _searchConfig.LastFileState;
             }
-            if (state == null) return;
+            if (state == null) return false;
             
             // 更新选中项（如果提供）
             if (!string.IsNullOrEmpty(selectedStoreName))
@@ -6745,6 +7444,16 @@ namespace moshushou
             state.IsCustomMessageMode = _isCustomMessageMode;
             state.FailedStores = _failedStores.ToList();
             state.ManualReviewStores = _manualReviewStores.ToList();
+            lock (_sentStoreLock)
+            {
+                state.SentStores = _sentStores.ToList();
+            }
+            lock (_sendAttemptJournalLock)
+            {
+                state.SendAttempts = _sendAttemptJournal.Values
+                    .OrderBy(item => item.UpdatedAtUtc)
+                    .ToList();
+            }
             lock (_segmentFailureLock)
             {
                 state.SegmentFailures = _segmentFailureInfos
@@ -6764,9 +7473,20 @@ namespace moshushou
             // 向后兼容：同步旧字段
             _searchConfig.LastSelectedStoreName = state.LastSelectedStoreName;
             
-            // ✅ [优化] 防抖保存：延迟 1秒 执行写入，避免连续点击卡顿
             _saveDebounceTimer?.Stop();
+            if (saveImmediately)
+            {
+                bool saved = _searchConfig.Save();
+                if (!saved)
+                {
+                    DebugLogManager.Log("状态保存", "状态文件写入失败，已保留内存状态。");
+                }
+                return saved;
+            }
+
+            // 普通选择变更继续使用防抖；发送事务边界使用同步原子保存。
             _saveDebounceTimer?.Start();
+            return true;
         }
 
 
@@ -7264,6 +7984,17 @@ namespace moshushou
                     {
                         _sentStores.Remove(storeName);
                     }
+                    lock (_sendAttemptJournalLock)
+                    {
+                        foreach (string attemptId in _sendAttemptJournal.Values
+                            .Where(attempt =>
+                                string.Equals(attempt.StoreName, storeName, StringComparison.Ordinal))
+                            .Select(attempt => attempt.AttemptId)
+                            .ToList())
+                        {
+                            _sendAttemptJournal.Remove(attemptId);
+                        }
+                    }
                 }
 
                 // ✅ 保存删除后的状态
@@ -7597,6 +8328,7 @@ namespace moshushou
         {
             if (e.NewValue is TreeViewNode node && !string.IsNullOrEmpty(node.StoreName))
             {
+                Interlocked.Increment(ref _selectionVersion);
                 _currentSelectedNode = node;
                 ResetSearchState();
                 bool suppressOsdForThisSelection = TryConsumeSuppressedSelectionOsd();

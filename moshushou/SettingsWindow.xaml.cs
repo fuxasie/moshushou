@@ -35,8 +35,12 @@ namespace moshushou
             InitializeComponent();
 
             // 初始化基础控件
+            EnablePpOcrV6CheckBox.IsChecked = _config.EnablePpOcrV6;
+            EnableLegacyOcrFallbackCheckBox.IsChecked = _config.EnableLegacyOcrFallback;
+            EnableLegacyOcrFallbackCheckBox.IsEnabled = _config.EnablePpOcrV6;
             EnableOsdCheckBox.IsChecked = _config.EnableOsdWindow;
             SkipNextOnCtrlSpaceCheckBox.IsChecked = _config.SkipNextOnCtrlSpace;
+            CheckFocusOnCtrlSpaceCheckBox.IsChecked = _config.CheckFocusOnCtrlSpace;
 
             // 初始化解析模式下拉
             ModeComboBox.ItemsSource = _parseModeOptions;
@@ -118,6 +122,19 @@ namespace moshushou
 
         // ====== OSD 事件 ======
 
+        private void EnablePpOcrV6CheckBox_Changed(object sender, RoutedEventArgs e)
+        {
+            _config.EnablePpOcrV6 = EnablePpOcrV6CheckBox.IsChecked == true;
+            EnableLegacyOcrFallbackCheckBox.IsEnabled = _config.EnablePpOcrV6;
+            _config.Save();
+        }
+
+        private void EnableLegacyOcrFallbackCheckBox_Changed(object sender, RoutedEventArgs e)
+        {
+            _config.EnableLegacyOcrFallback = EnableLegacyOcrFallbackCheckBox.IsChecked == true;
+            _config.Save();
+        }
+
         private void EnableOsdCheckBox_Checked(object sender, RoutedEventArgs e)
         {
             _config.EnableOsdWindow = true;
@@ -146,6 +163,18 @@ namespace moshushou
         private void SkipNextOnCtrlSpaceCheckBox_Unchecked(object sender, RoutedEventArgs e)
         {
             _config.SkipNextOnCtrlSpace = false;
+            _config.Save();
+        }
+
+        private void CheckFocusOnCtrlSpaceCheckBox_Checked(object sender, RoutedEventArgs e)
+        {
+            _config.CheckFocusOnCtrlSpace = true;
+            _config.Save();
+        }
+
+        private void CheckFocusOnCtrlSpaceCheckBox_Unchecked(object sender, RoutedEventArgs e)
+        {
+            _config.CheckFocusOnCtrlSpace = false;
             _config.Save();
         }
 

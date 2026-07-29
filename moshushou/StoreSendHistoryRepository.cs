@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Text;
@@ -23,6 +24,10 @@ namespace moshushou
         private const int MaxEntries = 5000;
         private static readonly object SyncRoot = new object();
         private static readonly string HistoryPath = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "moshushou",
+            "store_send_history.json");
+        private static readonly string LegacyHistoryPath = Path.Combine(
             AppDomain.CurrentDomain.BaseDirectory,
             "store_send_history.json");
 
@@ -106,18 +111,24 @@ namespace moshushou
 
             try
             {
-                if (File.Exists(HistoryPath))
+                string sourcePath = File.Exists(HistoryPath) ? HistoryPath : LegacyHistoryPath;
+                if (File.Exists(sourcePath))
                 {
-                    string json = File.ReadAllText(HistoryPath, Encoding.UTF8);
+                    string json = File.ReadAllText(sourcePath, Encoding.UTF8);
                     _entries = JsonSerializer.Deserialize<List<StoreSendHistoryEntry>>(json) ?? new List<StoreSendHistoryEntry>();
+                    if (!string.Equals(sourcePath, HistoryPath, StringComparison.OrdinalIgnoreCase))
+                    {
+                        SaveUnsafe();
+                    }
                 }
                 else
                 {
                     _entries = new List<StoreSendHistoryEntry>();
                 }
             }
-            catch
+            catch (Exception ex)
             {
+                Debug.WriteLine($"[发送历史] 加载失败: {ex.Message}");
                 _entries = new List<StoreSendHistoryEntry>();
             }
 
@@ -145,10 +156,14 @@ namespace moshushou
                 };
 
                 string json = JsonSerializer.Serialize(_entries, options);
-                File.WriteAllText(HistoryPath, json, Encoding.UTF8);
+                AtomicFileStore.WriteAllText(
+                    HistoryPath,
+                    json,
+                    new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
             }
-            catch
+            catch (Exception ex)
             {
+                Debug.WriteLine($"[发送历史] 保存失败: {ex.Message}");
             }
         }
     }

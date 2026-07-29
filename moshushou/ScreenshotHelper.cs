@@ -4,6 +4,7 @@ using System.Drawing;
 using System.Drawing.Imaging;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -11,6 +12,7 @@ using System.Threading.Tasks;
 // using System.Windows; // 移除以避免 Point/Size 歧义
 using WeChatOcr; // 确保已通过 NuGet 安装 WeChatOcr.Lite
 
+using moshushou.Ocr;
 using moshushou.Yolo;
 
 namespace moshushou
@@ -49,6 +51,8 @@ namespace moshushou
         private readonly Action<string> _logAction;
         private readonly SearchConfig _config;
         private readonly YoloWindowDetector _yoloDetector;
+        private readonly object _ppOcrV6Lock = new();
+        private PpOcrV6Engine? _ppOcrV6Engine;
         private static long _ocrRequestSeq = 0;
         private static int _ocrActiveCount = 0;
 
@@ -65,6 +69,32 @@ namespace moshushou
             catch (Exception ex)
             {
                 _logAction?.Invoke($"⚠️ YOLO 模型加载失败: {ex.Message}");
+            }
+
+            if (_config.EnablePpOcrV6)
+            {
+                _ = WarmUpPpOcrV6Async();
+            }
+        }
+
+        private async Task WarmUpPpOcrV6Async()
+        {
+            var stopwatch = Stopwatch.StartNew();
+            try
+            {
+                PpOcrV6Engine engine = GetPpOcrV6Engine();
+                await engine.WarmUpAsync();
+                LogOcrDebug(
+                    $"ENGINE_READY Engine={PpOcrV6Engine.DisplayName}, " +
+                    $"Cost={stopwatch.ElapsedMilliseconds}ms, Models={engine.ModelDirectory}");
+            }
+            catch (Exception ex)
+            {
+                LogOcrDebug(
+                    $"ENGINE_INIT_FAIL Engine={PpOcrV6Engine.DisplayName}, " +
+                    $"Cost={stopwatch.ElapsedMilliseconds}ms, Error={ex.Message}, " +
+                    $"Fallback={_config.EnableLegacyOcrFallback}",
+                    mirrorToUi: true);
             }
         }
 
@@ -396,7 +426,10 @@ namespace moshushou
         }
 
         // ✅ [新增] 专门计算输入框点击坐标的方法 (增强：YOLO 辅助)
-        public async Task<(bool success, int x, int y)> GetInputBoxClickCoordinatesAsync(IntPtr hwnd, bool isWework)
+        public async Task<(bool success, int x, int y)> GetInputBoxClickCoordinatesAsync(
+            IntPtr hwnd,
+            bool isWework,
+            bool allowFallback = true)
         {
             if (hwnd == IntPtr.Zero || !GetWindowRect(hwnd, out RECT rect)) return (false, 0, 0);
 
@@ -468,7 +501,13 @@ namespace moshushou
                 _logAction?.Invoke($"⚠️ YOLO 输入框检测失败，使用兜底逻辑: {ex.Message}");
             }
 
-            // 📐 坐标计算兜底逻辑 (如果 YOLO 失败)
+            if (!allowFallback)
+            {
+                _logAction?.Invoke("🛑 自动发送要求精确识别输入框，YOLO 未命中时禁止使用固定坐标。");
+                return (false, 0, 0);
+            }
+
+            // 📐 坐标计算兜底逻辑（仅手动操作允许）
             int x = rect.Left + (isWework ? 350 : 310);
             int y = rect.Bottom - (isWework ? 80 : 70);
 
@@ -593,6 +632,173 @@ namespace moshushou
                 }
             }
             return false;
+        }
+
+        public async Task<(bool success, string verifyMethod, string? chatBoxText)> VerifyPasteWithYoloAsync(
+            IntPtr hwnd,
+            bool isWework,
+            string keyword,
+            CancellationToken token = default)
+        {
+            if (hwnd == IntPtr.Zero || _yoloDetector == null || string.IsNullOrWhiteSpace(keyword))
+            {
+                return (false, "粘贴验证条件不足", null);
+            }
+
+            const int frameCount = 6;
+            const int frameIntervalMs = 180;
+            string? lastText = null;
+
+            for (int frame = 0; frame < frameCount; frame++)
+            {
+                if (token.IsCancellationRequested)
+                {
+                    return (false, "已取消", lastText);
+                }
+
+                if (frame > 0)
+                {
+                    try
+                    {
+                        await Task.Delay(frameIntervalMs, token);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        return (false, "已取消", lastText);
+                    }
+                }
+
+                try
+                {
+                    if (!GetWindowRect(hwnd, out RECT rect))
+                    {
+                        continue;
+                    }
+
+                    int width = rect.Right - rect.Left;
+                    int height = rect.Bottom - rect.Top;
+                    if (width <= 0 || height <= 0)
+                    {
+                        continue;
+                    }
+
+                    using var bitmap = new Bitmap(width, height, PixelFormat.Format32bppArgb);
+                    using (var graphics = Graphics.FromImage(bitmap))
+                    {
+                        graphics.CopyFromScreen(rect.Left, rect.Top, 0, 0, new Size(width, height), CopyPixelOperation.SourceCopy);
+                    }
+
+                    var chatBox = _yoloDetector
+                        .Detect(bitmap)
+                        .Where(result => result.LabelName == YoloWindowDetector.Label_ChatBox)
+                        .OrderByDescending(result => result.Confidence)
+                        .FirstOrDefault();
+                    if (chatBox == null)
+                    {
+                        continue;
+                    }
+
+                    Rectangle cropRect = Rectangle.Intersect(
+                        new Rectangle(0, 0, width, height),
+                        chatBox.BBox);
+                    if (cropRect.Width <= 0 || cropRect.Height <= 0)
+                    {
+                        continue;
+                    }
+
+                    using var crop = bitmap.Clone(cropRect, bitmap.PixelFormat);
+                    lastText = await PerformOcrAsync(crop, $"PasteVerify/F{frame + 1}/ChatBox", token);
+                    if (token.IsCancellationRequested ||
+                        string.Equals(lastText, "OCR识别取消", StringComparison.Ordinal))
+                    {
+                        return (false, "已取消", lastText);
+                    }
+
+                    if (SendReliabilityPolicy.IsStrictContentMatch(keyword, lastText))
+                    {
+                        return (true, $"YOLO粘贴验证(第{frame + 1}屏)", lastText);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine($"[PasteVerify] 第{frame + 1}屏失败: {ex.Message}");
+                }
+            }
+
+            return (false, "未确认内容已进入输入框", lastText);
+        }
+
+        public string? CaptureLatestChatInfoFingerprint(IntPtr hwnd)
+        {
+            if (hwnd == IntPtr.Zero || _yoloDetector == null || !GetWindowRect(hwnd, out RECT rect))
+            {
+                return null;
+            }
+
+            try
+            {
+                int width = rect.Right - rect.Left;
+                int height = rect.Bottom - rect.Top;
+                if (width <= 0 || height <= 0)
+                {
+                    return null;
+                }
+
+                using var bitmap = new Bitmap(width, height, PixelFormat.Format32bppArgb);
+                using (var graphics = Graphics.FromImage(bitmap))
+                {
+                    graphics.CopyFromScreen(
+                        rect.Left,
+                        rect.Top,
+                        0,
+                        0,
+                        new Size(width, height),
+                        CopyPixelOperation.SourceCopy);
+                }
+
+                var results = _yoloDetector.Detect(bitmap);
+                if (results == null)
+                {
+                    return null;
+                }
+
+                var chatInfo = results
+                    .Where(result => result.LabelName == YoloWindowDetector.Label_ChatInfo)
+                    .OrderByDescending(result => result.Confidence)
+                    .FirstOrDefault();
+                if (chatInfo == null)
+                {
+                    return null;
+                }
+
+                int cropHeight = Math.Max(chatInfo.BBox.Height / 3, 50);
+                Rectangle cropRect = Rectangle.Intersect(
+                    new Rectangle(0, 0, width, height),
+                    new Rectangle(
+                        chatInfo.BBox.X,
+                        chatInfo.BBox.Y + chatInfo.BBox.Height - cropHeight,
+                        chatInfo.BBox.Width,
+                        cropHeight));
+                if (cropRect.Width <= 0 || cropRect.Height <= 0)
+                {
+                    return null;
+                }
+
+                using var crop = bitmap.Clone(cropRect, bitmap.PixelFormat);
+                return ComputeBitmapFingerprint(crop);
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"[SendVerify] 发送前消息区快照失败: {ex.Message}");
+                return null;
+            }
+        }
+
+        private static string ComputeBitmapFingerprint(Bitmap bitmap)
+        {
+            using var stream = new MemoryStream();
+            bitmap.Save(stream, ImageFormat.Png);
+            return Convert.ToHexString(SHA256.HashData(stream.ToArray()));
         }
 
 
@@ -800,8 +1006,12 @@ namespace moshushou
         /// chatInfoText: 聊天信息区 OCR 文本（最后一屏）
         /// chatBoxText: 聊天框 OCR 文本（最后一屏）
         /// </returns>
-        public async Task<(bool success, string verifyMethod, string chatInfoText, string chatBoxText)> VerifySendWithYoloAsync(
-            IntPtr hwnd, bool isWework, string keyword, CancellationToken token = default)
+        public async Task<(bool success, string verifyMethod, string? chatInfoText, string? chatBoxText)> VerifySendWithYoloAsync(
+            IntPtr hwnd,
+            bool isWework,
+            string keyword,
+            string baselineChatInfoFingerprint,
+            CancellationToken token = default)
         {
             Action<string> Log = (msg) => System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [YoloVerify] {msg}");
 
@@ -817,12 +1027,21 @@ namespace moshushou
                 return (false, "YOLO未初始化", null, null);
             }
 
-            // 快速连续截取 3 屏，几乎无间隔，防止消息被刷屏上去识别不到
-            const int FRAME_COUNT = 3;
-            const int FRAME_INTERVAL_MS = 30; // 极短间隔，保证速度
+            if (string.IsNullOrWhiteSpace(baselineChatInfoFingerprint))
+            {
+                Log("❌ 缺少发送前消息区快照，无法排除旧消息误命中");
+                return (false, "缺少发送前消息区快照", null, null);
+            }
 
-            string lastChatInfoText = null;
-            string lastChatBoxText = null;
+            const int FRAME_COUNT = 4;
+            const int FRAME_INTERVAL_MS = 120;
+
+            string? lastChatInfoText = null;
+            string? lastChatBoxText = null;
+            bool inputAppearedCleared = false;
+            bool inputDefinitelyCleared = false;
+            bool deliveredContentObserved = false;
+            int deliveredFrame = 0;
 
             for (int frame = 0; frame < FRAME_COUNT; frame++)
             {
@@ -858,6 +1077,10 @@ namespace moshushou
                         var detectSw = Stopwatch.StartNew();
                         var results = _yoloDetector.Detect(bitmap);
                         Log($"🧪 第{frame + 1}屏 YOLO完成: 耗时={detectSw.ElapsedMilliseconds}ms, 目标数={results?.Count ?? 0}, 窗口={w}x{h}");
+                        if (results == null)
+                        {
+                            continue;
+                        }
 
                         var chatInfo = results
                             .Where(r => r.LabelName == YoloWindowDetector.Label_ChatInfo)
@@ -908,11 +1131,23 @@ namespace moshushou
                                         Log($"⚠️ 第{frame + 1}屏 ChatInfo OCR 超时(8000ms)");
                                     }
 
-                                    // 模糊匹配：对比我们发送的关键词
-                                    if (!string.IsNullOrEmpty(lastChatInfoText) && IsFuzzyMatch(keyword, lastChatInfoText))
+                                    string currentFingerprint = ComputeBitmapFingerprint(chatInfoCrop);
+                                    bool messageRegionChanged = !string.Equals(
+                                        baselineChatInfoFingerprint,
+                                        currentFingerprint,
+                                        StringComparison.Ordinal);
+                                    bool contentMatched = SendReliabilityPolicy.IsStrictContentMatch(
+                                        keyword,
+                                        lastChatInfoText);
+                                    if (contentMatched && messageRegionChanged)
                                     {
-                                        Log($"✅ 第{frame + 1}屏: ChatInfo 上屏验证成功 (模糊匹配命中)");
-                                        return (true, $"YOLO上屏验证(第{frame + 1}屏)", lastChatInfoText, lastChatBoxText);
+                                        deliveredContentObserved = true;
+                                        deliveredFrame = frame + 1;
+                                        Log($"ℹ️ 第{frame + 1}屏: ChatInfo 已变化且最新区域命中发送内容，继续确认输入框已清空");
+                                    }
+                                    else if (contentMatched)
+                                    {
+                                        Log($"ℹ️ 第{frame + 1}屏: 命中内容但消息区未变化，可能是历史消息，继续等待");
                                     }
                                 }
                             }
@@ -950,20 +1185,37 @@ namespace moshushou
                                         Log($"⚠️ 第{frame + 1}屏 ChatBox OCR 超时(8000ms)");
                                     }
 
-                                    // 如果 ChatBox 中不再包含我们的关键词，说明已经清空发送了
-                                    if (!string.IsNullOrEmpty(lastChatBoxText) && !IsFuzzyMatch(keyword, lastChatBoxText))
+                                    bool inputStillContainsKeyword =
+                                        SendReliabilityPolicy.IsStrictContentMatch(keyword, lastChatBoxText);
+                                    bool hasDefiniteClearSignal =
+                                        SendReliabilityPolicy.IsInputBoxClearSignal(keyword, lastChatBoxText);
+
+                                    // 输入框清空只能作为辅助信号，不能单独证明消息已经发送。
+                                    if (hasDefiniteClearSignal)
                                     {
-                                        Log($"✅ 第{frame + 1}屏: ChatBox 清空验证成功 (输入框不含关键词)");
-                                        return (true, $"YOLO清空验证(第{frame + 1}屏)", lastChatInfoText, lastChatBoxText);
+                                        inputAppearedCleared = true;
+                                        inputDefinitelyCleared = true;
+                                        Log($"ℹ️ 第{frame + 1}屏: 输入框只剩空白或发送按钮，确认已清空");
                                     }
-                                    // ChatBox OCR 为空文本也算清空
-                                    if (string.IsNullOrWhiteSpace(lastChatBoxText) || lastChatBoxText == "未识别到文字")
+                                    else if (!string.IsNullOrEmpty(lastChatBoxText) &&
+                                             !inputStillContainsKeyword)
                                     {
-                                        Log($"✅ 第{frame + 1}屏: ChatBox 为空，清空验证成功");
-                                        return (true, $"YOLO清空验证(第{frame + 1}屏)", lastChatInfoText, lastChatBoxText);
+                                        inputAppearedCleared = true;
+                                        Log($"ℹ️ 第{frame + 1}屏: 输入框不含关键词，继续等待最新消息上屏确认");
                                     }
                                 }
                             }
+                        }
+
+                        if (deliveredContentObserved && inputDefinitelyCleared)
+                        {
+                            int verifiedFrame = Math.Max(deliveredFrame, frame + 1);
+                            Log($"✅ 第{verifiedFrame}屏: 消息区变化、内容命中且输入框已清空");
+                            return (
+                                true,
+                                $"YOLO上屏+清空验证(第{verifiedFrame}屏)",
+                                lastChatInfoText,
+                                lastChatBoxText);
                         }
 
                         Log($"⏳ 第{frame + 1}屏: 未验证成功，继续下一屏... 本屏总耗时={frameSw.ElapsedMilliseconds}ms");
@@ -976,8 +1228,11 @@ namespace moshushou
             }
 
             // 3 屏全部未匹配到我们发送的文本 → 验证失败
-            Log($"❌ 3屏均未检测到发送的关键词 '{keyword}'");
-            return (false, "3屏均未匹配", lastChatInfoText, lastChatBoxText);
+            string method = inputAppearedCleared
+                ? "输入框已清空但未确认最新消息"
+                : "未确认最新消息";
+            Log($"❌ 未检测到本次发送关键词 '{keyword}'，结果={method}");
+            return (false, method, lastChatInfoText, lastChatBoxText);
         }
 
 
@@ -1214,7 +1469,74 @@ namespace moshushou
 
 
 
-        private async Task<string> PerformOcrAsync(Bitmap bitmap, string traceTag = null, CancellationToken token = default)
+        private async Task<string> PerformOcrAsync(Bitmap? bitmap, string? traceTag = null, CancellationToken token = default)
+        {
+            string tag = string.IsNullOrWhiteSpace(traceTag) ? "Generic" : traceTag.Trim();
+            if (bitmap == null)
+            {
+                LogOcrDebug($"ENGINE_FAIL Tag={tag}, Bitmap=null", mirrorToUi: true);
+                return "未识别到文字";
+            }
+
+            if (_config.EnablePpOcrV6)
+            {
+                var ppSw = Stopwatch.StartNew();
+                try
+                {
+                    PpOcrV6Engine engine = GetPpOcrV6Engine();
+                    LogOcrDebug(
+                        $"ENGINE_START Engine={PpOcrV6Engine.DisplayName}, Tag={tag}, Size={bitmap?.Width ?? 0}x{bitmap?.Height ?? 0}");
+
+                    string ppText = await engine.RecognizeAsync(bitmap, token);
+                    if (!string.IsNullOrWhiteSpace(ppText))
+                    {
+                        LogOcrDebug(
+                            $"ENGINE_DONE Engine={PpOcrV6Engine.DisplayName}, Tag={tag}, " +
+                            $"Cost={ppSw.ElapsedMilliseconds}ms, TextLen={ppText.Length}");
+                        return ppText.Trim();
+                    }
+
+                    LogOcrDebug(
+                        $"ENGINE_EMPTY Engine={PpOcrV6Engine.DisplayName}, Tag={tag}, " +
+                        $"Cost={ppSw.ElapsedMilliseconds}ms, Fallback={_config.EnableLegacyOcrFallback}");
+                    if (!_config.EnableLegacyOcrFallback)
+                    {
+                        return "未识别到文字";
+                    }
+                }
+                catch (OperationCanceledException) when (token.IsCancellationRequested)
+                {
+                    LogOcrDebug(
+                        $"ENGINE_CANCELED Engine={PpOcrV6Engine.DisplayName}, Tag={tag}, " +
+                        $"Cost={ppSw.ElapsedMilliseconds}ms");
+                    return "OCR识别取消";
+                }
+                catch (Exception ex)
+                {
+                    LogOcrDebug(
+                        $"ENGINE_FAIL Engine={PpOcrV6Engine.DisplayName}, Tag={tag}, " +
+                        $"Cost={ppSw.ElapsedMilliseconds}ms, Error={ex.Message}, " +
+                        $"Fallback={_config.EnableLegacyOcrFallback}",
+                        mirrorToUi: true);
+                    if (!_config.EnableLegacyOcrFallback)
+                    {
+                        return "未识别到文字";
+                    }
+                }
+            }
+
+            return await PerformLegacyOcrAsync(bitmap, tag, token);
+        }
+
+        private PpOcrV6Engine GetPpOcrV6Engine()
+        {
+            lock (_ppOcrV6Lock)
+            {
+                return _ppOcrV6Engine ??= new PpOcrV6Engine();
+            }
+        }
+
+        private async Task<string> PerformLegacyOcrAsync(Bitmap bitmap, string? traceTag = null, CancellationToken token = default)
         {
             long requestId = Interlocked.Increment(ref _ocrRequestSeq);
             string tag = string.IsNullOrWhiteSpace(traceTag) ? "Generic" : traceTag.Trim();
@@ -1762,6 +2084,108 @@ namespace moshushou
             }
         }
 
+        private async Task<Point?> FindTextCenterAsync(
+            Bitmap bitmap,
+            string keyword,
+            int timeoutMs,
+            string traceTag)
+        {
+            if (_config.EnablePpOcrV6)
+            {
+                var ppSw = Stopwatch.StartNew();
+                try
+                {
+                    IReadOnlyList<PpOcrTextLine> lines = await GetPpOcrV6Engine()
+                        .RecognizeDetailedAsync(bitmap);
+                    PpOcrTextLine? match = lines.FirstOrDefault(line =>
+                        !string.IsNullOrWhiteSpace(line.Text) &&
+                        IsFuzzyMatch(keyword, line.Text));
+                    if (match != null)
+                    {
+                        LogOcrDebug(
+                            $"POSITION_DONE Engine={PpOcrV6Engine.DisplayName}, Tag={traceTag}, " +
+                            $"Cost={ppSw.ElapsedMilliseconds}ms, Text='{match.Text}'");
+                        return new Point(
+                            match.Bounds.Left + match.Bounds.Width / 2,
+                            match.Bounds.Top + match.Bounds.Height / 2);
+                    }
+
+                    LogOcrDebug(
+                        $"POSITION_EMPTY Engine={PpOcrV6Engine.DisplayName}, Tag={traceTag}, " +
+                        $"Cost={ppSw.ElapsedMilliseconds}ms, Fallback={_config.EnableLegacyOcrFallback}");
+                    if (!_config.EnableLegacyOcrFallback)
+                    {
+                        return null;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    LogOcrDebug(
+                        $"POSITION_FAIL Engine={PpOcrV6Engine.DisplayName}, Tag={traceTag}, " +
+                        $"Cost={ppSw.ElapsedMilliseconds}ms, Error={ex.Message}, " +
+                        $"Fallback={_config.EnableLegacyOcrFallback}");
+                    if (!_config.EnableLegacyOcrFallback)
+                    {
+                        return null;
+                    }
+                }
+            }
+
+            return await FindTextCenterWithLegacyOcrAsync(bitmap, keyword, timeoutMs);
+        }
+
+        private async Task<Point?> FindTextCenterWithLegacyOcrAsync(
+            Bitmap bitmap,
+            string keyword,
+            int timeoutMs)
+        {
+            var tcs = new TaskCompletionSource<Point?>(TaskCreationOptions.RunContinuationsAsynchronously);
+            byte[] bytes = ImageToBytes(bitmap);
+            var ocr = new ImageOcr();
+
+            ocr.Run(bytes, (path, result) =>
+            {
+                try
+                {
+                    if (result?.OcrResult?.SingleResult != null)
+                    {
+                        foreach (var item in result.OcrResult.SingleResult)
+                        {
+                            if (!string.IsNullOrEmpty(item.SingleStrUtf8) &&
+                                IsFuzzyMatch(keyword, item.SingleStrUtf8))
+                            {
+                                tcs.TrySetResult(new Point(
+                                    (int)((item.Left + item.Right) / 2.0f),
+                                    (int)((item.Top + item.Bottom) / 2.0f)));
+                                return;
+                            }
+                        }
+                    }
+                    tcs.TrySetResult(null);
+                }
+                catch (Exception ex)
+                {
+                    tcs.TrySetException(ex);
+                }
+                finally
+                {
+                    try
+                    {
+                        if (!string.IsNullOrWhiteSpace(path) && File.Exists(path))
+                        {
+                            File.Delete(path);
+                        }
+                    }
+                    catch
+                    {
+                    }
+                }
+            });
+
+            Task completed = await Task.WhenAny(tcs.Task, Task.Delay(timeoutMs));
+            return completed == tcs.Task ? await tcs.Task : null;
+        }
+
         /// <summary>
         /// ✅ [新增] 在指定区域查找关键词的坐标 (用于定位 "群聊" 等动态位置)
         /// </summary>
@@ -1804,51 +2228,19 @@ namespace moshushou
                     // OCR
                     using (var scaled = ScaleImage(bitmap, 2)) // 2倍放大通常够了
                     {
-                         string ocrText = await PerformOcrAsync(scaled, $"FindKeyword/{keyword}");
-                         // TODO: 这里 PerformOcrAsync 返回的是拼接字符串，我们需要坐标信息
-                         // 因此 PerformOcrAsync 需要修改，或者我们需要直接调用 ImageOcr 返回详细结果
-                         // 为了不破坏现有结构，直接在这里实例化 ImageOcr
-                         
-                         var tcs = new TaskCompletionSource<Point?>(TaskCreationOptions.RunContinuationsAsynchronously);
-                         var bytes = ImageToBytes(scaled);
-                         var ocr = new ImageOcr();
-                         
-                         ocr.Run(bytes, (path, result) => 
-                         {
-                             try 
-                             {
-                                 if (result?.OcrResult?.SingleResult != null)
-                                 {
-                                     foreach(var item in result.OcrResult.SingleResult)
-                                     {
-                                         if (!string.IsNullOrEmpty(item.SingleStrUtf8) && 
-                                             IsFuzzyMatch(keyword, item.SingleStrUtf8))
-                                         {
-                                             // 找到目标！
-                                             // 坐标转换回屏幕坐标 (注意 Scale 2.0)
-                                             float centerX = (item.Left + item.Right) / 2.0f / 2.0f;
-                                             float centerY = (item.Top + item.Bottom) / 2.0f / 2.0f;
-                                             
-                                             int finalX = screenX + (int)centerX;
-                                             int finalY = screenY + (int)centerY;
-                                             
-                                             tcs.TrySetResult(new Point(finalX, finalY));
-                                             return;
-                                         }
-                                     }
-                                 }
-                                 tcs.TrySetResult(null);
-                             }
-                             catch(Exception ex) { tcs.TrySetException(ex); }
-                             finally 
-                             {
-                                 try { if (File.Exists(path)) File.Delete(path); } catch { }
-                             }
-                         });
-                         
-                         await Task.WhenAny(tcs.Task, Task.Delay(5000));
-                         if (tcs.Task.IsCompleted) return await tcs.Task;
-                         return null;
+                        Point? center = await FindTextCenterAsync(
+                            scaled,
+                            keyword,
+                            5000,
+                            $"FindKeyword/{keyword}");
+                        if (!center.HasValue)
+                        {
+                            return null;
+                        }
+
+                        return new Point(
+                            screenX + center.Value.X / 2,
+                            screenY + center.Value.Y / 2);
                     }
                 }
             }
@@ -1914,50 +2306,19 @@ namespace moshushou
                         using (var crop = bitmap.Clone(rectVal, bitmap.PixelFormat))
                         using (var scaled = ScaleImage(crop, 2)) // 2倍放大 OCR
                         {
-                            var tcs = new TaskCompletionSource<Point?>(TaskCreationOptions.RunContinuationsAsynchronously);
-                            var bytes = ImageToBytes(scaled);
-                            var ocr = new ImageOcr();
-
                             try
                             {
-                                ocr.Run(bytes, (path, result) =>
+                                Point? center = await FindTextCenterAsync(
+                                    scaled,
+                                    keyword,
+                                    3000,
+                                    $"FindPopup/{keyword}");
+                                if (center.HasValue)
                                 {
-                                    try
-                                    {
-                                        if (result?.OcrResult?.SingleResult != null)
-                                        {
-                                            foreach (var item in result.OcrResult.SingleResult)
-                                            {
-                                                if (!string.IsNullOrEmpty(item.SingleStrUtf8) &&
-                                                    IsFuzzyMatch("使用原文件", item.SingleStrUtf8))
-                                                {
-                                                    // 找到文字！
-                                                    // 坐标转换: OCR坐标 -> crop坐标 -> 全图坐标 -> 屏幕坐标
-                                                    float centerX = (item.Left + item.Right) / 2.0f / 2.0f; // /2.0f 因为缩放了2倍
-                                                    float centerY = (item.Top + item.Bottom) / 2.0f / 2.0f;
-
-                                                    int finalX = screenX + rectVal.X + (int)centerX;
-                                                    int finalY = screenY + rectVal.Y + (int)centerY;
-
-                                                    _logAction?.Invoke($"🎯 OCR 精确定位 '使用原文件': ({finalX}, {finalY})");
-                                                    tcs.TrySetResult(new Point(finalX, finalY));
-                                                    return;
-                                                }
-                                            }
-                                        }
-                                        tcs.TrySetResult(null);
-                                    }
-                                    catch (Exception ex) { tcs.TrySetException(ex); }
-                                    finally
-                                    {
-                                        try { if (File.Exists(path)) File.Delete(path); } catch { }
-                                    }
-                                });
-
-                                await Task.WhenAny(tcs.Task, Task.Delay(3000));
-                                if (tcs.Task.IsCompleted && tcs.Task.Result != null)
-                                {
-                                    return tcs.Task.Result;
+                                    int finalX = screenX + rectVal.X + center.Value.X / 2;
+                                    int finalY = screenY + rectVal.Y + center.Value.Y / 2;
+                                    _logAction?.Invoke($"🎯 OCR 精确定位 '{keyword}': ({finalX}, {finalY})");
+                                    return new Point(finalX, finalY);
                                 }
                             }
                             catch (Exception ex)
@@ -2135,7 +2496,53 @@ namespace moshushou
                 using (var bitmap = new Bitmap(width, height, PixelFormat.Format32bppArgb))
                 {
                     using (var g = Graphics.FromImage(bitmap)) { g.CopyFromScreen(screenX, screenY, 0, 0, new Size(width, height), CopyPixelOperation.SourceCopy); }
-                    
+
+                    if (_config.EnablePpOcrV6)
+                    {
+                        try
+                        {
+                            IReadOnlyList<PpOcrTextLine> lines = await GetPpOcrV6Engine()
+                                .RecognizeDetailedAsync(bitmap);
+                            PpOcrTextLine? anchor = lines.FirstOrDefault(line =>
+                                !string.IsNullOrWhiteSpace(line.Text) &&
+                                line.Text.Contains(anchorKeyword, StringComparison.OrdinalIgnoreCase));
+                            if (anchor != null)
+                            {
+                                PpOcrTextLine? target = lines
+                                    .Where(line =>
+                                        !ReferenceEquals(line, anchor) &&
+                                        line.Bounds.Top > anchor.Bounds.Bottom &&
+                                        line.Bounds.Top < anchor.Bounds.Bottom + 150)
+                                    .OrderBy(line => line.Bounds.Top - anchor.Bounds.Bottom)
+                                    .ThenBy(line => line.Bounds.Left)
+                                    .FirstOrDefault();
+                                if (target != null)
+                                {
+                                    int centerX = screenX + target.Bounds.Left + target.Bounds.Width / 2;
+                                    int centerY = screenY + target.Bounds.Top + target.Bounds.Height / 2;
+                                    _logAction?.Invoke(
+                                        $"✅ [FindStructure/PP-OCRv6] Found target below '{anchorKeyword}' -> '{target.Text}'");
+                                    return new System.Drawing.Point(centerX, centerY);
+                                }
+                            }
+
+                            if (!_config.EnableLegacyOcrFallback)
+                            {
+                                return null;
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            LogOcrDebug(
+                                $"POSITION_FAIL Engine={PpOcrV6Engine.DisplayName}, Tag=FindStructure/{anchorKeyword}, " +
+                                $"Error={ex.Message}, Fallback={_config.EnableLegacyOcrFallback}");
+                            if (!_config.EnableLegacyOcrFallback)
+                            {
+                                return null;
+                            }
+                        }
+                    }
+
                     byte[] bytes;
                     using (var ms = new MemoryStream()) { bitmap.Save(ms, ImageFormat.Png); bytes = ms.ToArray(); }
 
@@ -2377,6 +2784,11 @@ namespace moshushou
         public void Dispose()
         {
             _yoloDetector?.Dispose();
+            lock (_ppOcrV6Lock)
+            {
+                _ppOcrV6Engine?.Dispose();
+                _ppOcrV6Engine = null;
+            }
         }
         
 

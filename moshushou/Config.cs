@@ -1,6 +1,8 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
+using System.Text;
 using System.Text.Json;
 
 namespace moshushou
@@ -49,6 +51,19 @@ namespace moshushou
         public string Reason { get; set; } = "发送失败";
     }
 
+    public class SendAttemptState
+    {
+        public string AttemptId { get; set; } = "";
+        public string RunId { get; set; } = "";
+        public string StoreName { get; set; } = "";
+        public string GroupName { get; set; } = "";
+        public string PayloadHash { get; set; } = "";
+        public int SegmentNumber { get; set; }
+        public string Status { get; set; } = SendAttemptStatuses.Prepared;
+        public string Detail { get; set; } = "";
+        public DateTime UpdatedAtUtc { get; set; } = DateTime.UtcNow;
+    }
+
     public class FileState
     {
         public string FilePath { get; set; } = "";              // 文件完整路径
@@ -57,6 +72,8 @@ namespace moshushou
         public List<string> FailedStores { get; set; } = new(); // 自动重试区列表
         public List<string> ManualReviewStores { get; set; } = new(); // 需人工列表
         public List<SegmentFailureState> SegmentFailures { get; set; } = new(); // 分段发送失败进度
+        public List<string> SentStores { get; set; } = new(); // 已确认发送成功的店铺
+        public List<SendAttemptState> SendAttempts { get; set; } = new(); // 可恢复的发送事务日志
         public List<string> DeletedStores { get; set; } = new();     // 已删除的商家列表
         public bool IsIssueMode { get; set; } = false;               // 是否为问题件模式
         public bool IsCustomMessageMode { get; set; } = false;       // 是否为自定义话术模式(4列)
@@ -145,20 +162,43 @@ namespace moshushou
         // ✅ 新增：按 Ctrl+空格 发送后是否禁止自动跳下一项
         public bool SkipNextOnCtrlSpace { get; set; } = false;
 
+        // ✅ 新增：Ctrl+空格 粘贴前是否进行光标聚焦校验
+        public bool CheckFocusOnCtrlSpace { get; set; } = true;
+
+        /// <summary>
+        /// 默认使用本地 PP-OCRv6 medium 检测+识别模型。
+        /// 旧配置文件缺少该字段时，属性初始化值仍为 true。
+        /// </summary>
+        public bool EnablePpOcrV6 { get; set; } = true;
+
+        /// <summary>
+        /// PP-OCRv6 模型缺失、推理异常或未识别到文字时，是否回退微信 OCR。
+        /// </summary>
+        public bool EnableLegacyOcrFallback { get; set; } = true;
+
+
         // ... Load 和 Save 方法保持不变 ...
-        private static readonly string ConfigPath = Path.Combine(
-            AppDomain.CurrentDomain.BaseDirectory, "search_config.json");
+        private readonly object _saveLock = new();
+        private static readonly string UserDataDirectory = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "moshushou");
+        private static readonly string ConfigPath = Path.Combine(UserDataDirectory, "search_config.json");
+        private static readonly string LegacyConfigPath = Path.Combine(
+            AppDomain.CurrentDomain.BaseDirectory,
+            "search_config.json");
+
         public static SearchConfig Load()
         {
             try
             {
-                if (File.Exists(ConfigPath))
+                string sourcePath = File.Exists(ConfigPath) ? ConfigPath : LegacyConfigPath;
+                if (File.Exists(sourcePath))
                 {
-                    string json = File.ReadAllText(ConfigPath);
+                    string json = File.ReadAllText(sourcePath, Encoding.UTF8);
                     var loadedConfig = JsonSerializer.Deserialize<SearchConfig>(json);
                     if (loadedConfig != null)
                     {
-                        bool changed = false;
+                        bool changed = !string.Equals(sourcePath, ConfigPath, StringComparison.OrdinalIgnoreCase);
 
                         // 企业微信文本限制：分段条数上限统一收敛为 30
                         if (loadedConfig.SegmentSize <= 0 || loadedConfig.SegmentSize > 30)
@@ -197,6 +237,10 @@ namespace moshushou
                             changed = true;
                         }
 
+                        NormalizeFileState(loadedConfig.LastFileState);
+                        NormalizeFileState(loadedConfig.LastIssueFileState);
+                        NormalizeFileState(loadedConfig.LastCustomMessageFileState);
+
                         if (changed)
                         {
                             loadedConfig.Save();
@@ -206,25 +250,51 @@ namespace moshushou
                     }
                 }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[Config] 加载失败: {ex.Message}");
+            }
             var config = new SearchConfig();
             config.Save();
             return config;
         }
 
-        public void Save()
+        public bool Save()
         {
-            try
+            lock (_saveLock)
             {
-                var options = new JsonSerializerOptions
+                try
                 {
-                    WriteIndented = true,
-                    Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping // 支持中文直接显示
-                };
-                string json = JsonSerializer.Serialize(this, options);
-                File.WriteAllText(ConfigPath, json);
+                    var options = new JsonSerializerOptions
+                    {
+                        WriteIndented = true,
+                        Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping
+                    };
+                    string json = JsonSerializer.Serialize(this, options);
+                    AtomicFileStore.WriteAllText(ConfigPath, json, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"[Config] 保存失败: {ex.Message}");
+                    return false;
+                }
             }
-            catch { }
+        }
+
+        private static void NormalizeFileState(FileState? state)
+        {
+            if (state == null)
+            {
+                return;
+            }
+
+            state.FailedStores ??= new List<string>();
+            state.ManualReviewStores ??= new List<string>();
+            state.SegmentFailures ??= new List<SegmentFailureState>();
+            state.SentStores ??= new List<string>();
+            state.SendAttempts ??= new List<SendAttemptState>();
+            state.DeletedStores ??= new List<string>();
         }
 
         private static string NormalizePathKey(string path)

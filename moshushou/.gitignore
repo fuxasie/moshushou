@@ -1,0 +1,8 @@
+# Visual Studio / .NET generated output
+**/bin/
+**/obj/
+.vs/
+
+# Local publish and intermediate output
+artifacts/
+publish/

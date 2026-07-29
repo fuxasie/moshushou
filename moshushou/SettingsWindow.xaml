@@ -69,6 +69,31 @@
     <ScrollViewer VerticalScrollBarVisibility="Auto">
         <StackPanel Margin="16,12">
 
+            <!-- ===== OCR 设置 ===== -->
+            <Border Background="White" BorderBrush="#E2E8F0" BorderThickness="1"
+                    CornerRadius="8" Padding="14,12" Margin="0,0,0,10">
+                <Border.Effect>
+                    <DropShadowEffect ShadowDepth="1" BlurRadius="6" Opacity="0.06"/>
+                </Border.Effect>
+                <StackPanel>
+                    <TextBlock Text="OCR 识别引擎" Style="{StaticResource SectionHeader}" Margin="0,0,0,10"/>
+                    <CheckBox x:Name="EnablePpOcrV6CheckBox"
+                              Content="默认启用 PP-OCRv6 medium（本地检测 + 识别）"
+                              ToolTip="使用官方 PP-OCRv6 medium 检测和识别模型，本地运行，不上传截图。"
+                              Checked="EnablePpOcrV6CheckBox_Changed"
+                              Unchecked="EnablePpOcrV6CheckBox_Changed"/>
+                    <CheckBox x:Name="EnableLegacyOcrFallbackCheckBox"
+                              Content="PP-OCRv6 未识别或异常时回退微信 OCR"
+                              ToolTip="建议保持启用，避免模型文件缺失或个别截图识别失败时中断自动发送。"
+                              Checked="EnableLegacyOcrFallbackCheckBox_Changed"
+                              Unchecked="EnableLegacyOcrFallbackCheckBox_Changed"
+                              Margin="0,8,0,0"/>
+                    <TextBlock Text="模型：PaddlePaddle PP-OCRv6_medium_det + PP-OCRv6_medium_rec（官方 ONNX 导出）"
+                               Style="{StaticResource HintText}"
+                               Margin="20,8,0,0"/>
+                </StackPanel>
+            </Border>
+
             <!-- ===== 1. 悬浮窗设置 ===== -->
             <Border Background="White" BorderBrush="#E2E8F0" BorderThickness="1"
                     CornerRadius="8" Padding="14,12" Margin="0,0,0,10">
@@ -104,6 +129,13 @@
                               ToolTip="勾选后，Ctrl+空格 发送/粘贴后不会自动切换到下一个商家"
                               Checked="SkipNextOnCtrlSpaceCheckBox_Checked"
                               Unchecked="SkipNextOnCtrlSpaceCheckBox_Unchecked"/>
+                    <CheckBox x:Name="CheckFocusOnCtrlSpaceCheckBox"
+                              Content="Ctrl+空格 粘贴前进行光标聚焦校验（支持自绘UI）"
+                              ToolTip="勾选后，若目标软件输入框未获聚焦，将拦截 Ctrl+空格 发送，以防误发送"
+                              Checked="CheckFocusOnCtrlSpaceCheckBox_Checked"
+                              Unchecked="CheckFocusOnCtrlSpaceCheckBox_Unchecked"
+                              Margin="0,8,0,0"/>
+
                 </StackPanel>
             </Border>
 
