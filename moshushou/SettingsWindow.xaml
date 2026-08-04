@@ -262,6 +262,33 @@
                     </StackPanel>
                 </ScrollViewer>
             </TabItem>
+
+            <TabItem Header="调试与日志" Style="{StaticResource SettingsTabItem}">
+                <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="12">
+                    <StackPanel>
+                        <Border Background="White" BorderBrush="#E2E8F0" BorderThickness="1"
+                                CornerRadius="8" Padding="14,12" Margin="0,0,0,10">
+                            <StackPanel>
+                                <TextBlock Text="🔍  失败 OCR 调试采集"
+                                           Style="{StaticResource SectionHeader}"
+                                           Margin="0,0,0,8"/>
+                                <CheckBox x:Name="EnableFailedOcrDebugCaptureCheckBox"
+                                          Content="自动发送失败时保存群名 OCR 调试数据"
+                                          Checked="EnableFailedOcrDebugCaptureCheckBox_Checked"
+                                          Unchecked="EnableFailedOcrDebugCaptureCheckBox_Unchecked"
+                                          Margin="0,0,0,8"/>
+                                <TextBlock Text="开启后，每次自动发送失败会保存：群名区域原始截图、预期群名、OCR 原文、清洗结果、应用来源、失败阶段以及是否位于自动重试区。不会保存聊天正文区域。"
+                                           Style="{StaticResource HintText}"
+                                           Margin="0,0,0,10"/>
+                                <Button Content="打开失败 OCR 调试目录"
+                                        Style="{StaticResource SecondaryBtn}"
+                                        HorizontalAlignment="Left"
+                                        Click="OpenFailedOcrDebugDirectoryButton_Click"/>
+                            </StackPanel>
+                        </Border>
+                    </StackPanel>
+                </ScrollViewer>
+            </TabItem>
         </TabControl>
 
         <Button Grid.Row="1"

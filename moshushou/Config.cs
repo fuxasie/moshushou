@@ -156,6 +156,12 @@ namespace moshushou
         // ✅ 新增：按 Ctrl+空格 发送后是否禁止自动跳下一项
         public bool SkipNextOnCtrlSpace { get; set; } = false;
 
+        /// <summary>
+        /// 自动发送失败时，是否保存群名 OCR 小图和结构化调试信息。
+        /// 默认关闭，避免正常使用时持续产生截图文件。
+        /// </summary>
+        public bool EnableFailedOcrDebugCapture { get; set; } = false;
+
         // ... Load 和 Save 方法保持不变 ...
         private static readonly string ConfigPath = Path.Combine(
             AppDomain.CurrentDomain.BaseDirectory, "search_config.json");

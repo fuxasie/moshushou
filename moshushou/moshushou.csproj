@@ -58,7 +58,7 @@
     <PackageReference Include="Microsoft.ML.OnnxRuntime" Version="1.16.0" />
     <PackageReference Include="System.Drawing.Common" Version="9.0.10" />
     <PackageReference Include="System.Reactive.Windows.Forms" Version="6.1.0" NoWarn="NU1701" />
-    <PackageReference Include="WeChatOcr" Version="1.0.4">
+    <PackageReference Include="WeChatOcr" Version="1.0.5">
       <ExcludeAssets>contentFiles</ExcludeAssets>
     </PackageReference>
   </ItemGroup>

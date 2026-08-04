@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
 using System.Linq;
 using System.Windows;
 using System.Windows.Controls;
@@ -38,6 +40,7 @@ namespace moshushou
             // 初始化基础控件
             EnableOsdCheckBox.IsChecked = _config.EnableOsdWindow;
             SkipNextOnCtrlSpaceCheckBox.IsChecked = _config.SkipNextOnCtrlSpace;
+            EnableFailedOcrDebugCaptureCheckBox.IsChecked = _config.EnableFailedOcrDebugCapture;
             AllowInputFallbackCheckBox.IsChecked = _config.AllowSendInputFallback;
             InputBackendComboBox.SelectedIndex = string.Equals(
                 _config.InputBackend,
@@ -156,6 +159,43 @@ namespace moshushou
         {
             _config.SkipNextOnCtrlSpace = false;
             _config.Save();
+        }
+
+        // ====== 调试采集事件 ======
+
+        private void EnableFailedOcrDebugCaptureCheckBox_Checked(object sender, RoutedEventArgs e)
+        {
+            _config.EnableFailedOcrDebugCapture = true;
+            _config.Save();
+        }
+
+        private void EnableFailedOcrDebugCaptureCheckBox_Unchecked(object sender, RoutedEventArgs e)
+        {
+            _config.EnableFailedOcrDebugCapture = false;
+            _config.Save();
+        }
+
+        private void OpenFailedOcrDebugDirectoryButton_Click(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                string directory = _mainWindow.FailedOcrDebugDirectory;
+                Directory.CreateDirectory(directory);
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = directory,
+                    UseShellExecute = true
+                });
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(
+                    this,
+                    $"打开失败 OCR 调试目录失败：{ex.Message}",
+                    "调试目录",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Warning);
+            }
         }
 
         private void CheckVirtualHidButton_Click(object sender, RoutedEventArgs e)

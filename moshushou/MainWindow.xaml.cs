@@ -76,6 +76,8 @@ namespace moshushou
         private bool _isStoreMode = true;
         private readonly ScreenshotHelper _screenshotHelper;
 
+        internal string FailedOcrDebugDirectory => _screenshotHelper.FailedOcrDebugDirectory;
+
 
 
         // 全局快捷键相关
@@ -163,6 +165,25 @@ namespace moshushou
 
         // 商家信息
         private List<BusinessInfo> _businessInfoList = new List<BusinessInfo>();
+        private readonly object _businessInfoLock = new object();
+        private readonly Dictionary<string, BusinessInfo> _businessInfoIndex =
+            new Dictionary<string, BusinessInfo>(StringComparer.OrdinalIgnoreCase);
+        private readonly object _businessInfoStorageLifecycleLock = new object();
+        private readonly SemaphoreSlim _businessInfoSaveGate = new SemaphoreSlim(1, 1);
+        private System.Threading.Timer? _businessInfoSaveTimer;
+        private int _businessInfoSavePending;
+        private volatile bool _businessInfoStorageDisposed;
+        private const int BusinessInfoSaveDebounceMilliseconds = 600;
+        private static readonly JsonSerializerOptions BusinessInfoWriteJsonOptions = new JsonSerializerOptions
+        {
+            Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+            WriteIndented = true
+        };
+        private static readonly JsonSerializerOptions BusinessInfoReadJsonOptions = new JsonSerializerOptions
+        {
+            AllowTrailingCommas = true,
+            ReadCommentHandling = JsonCommentHandling.Skip
+        };
 
 
         
@@ -340,6 +361,11 @@ namespace moshushou
             InitializeComponent();
             DebugLogManager.Initialize();
 
+            _businessInfoSaveTimer = new System.Threading.Timer(
+                _ => SaveBusinessInfoCore(force: false),
+                null,
+                Timeout.Infinite,
+                Timeout.Infinite);
             LoadBusinessInfo();
 
             // 初始化选中防抖：控制文件状态写入频率
@@ -427,6 +453,41 @@ namespace moshushou
 
         public void Dispose()
         {
+            System.Threading.Timer? saveTimer = null;
+            bool disposeBusinessInfoStorage = false;
+            lock (_businessInfoStorageLifecycleLock)
+            {
+                if (!_businessInfoStorageDisposed)
+                {
+                    _businessInfoStorageDisposed = true;
+                    saveTimer = _businessInfoSaveTimer;
+                    _businessInfoSaveTimer = null;
+                    disposeBusinessInfoStorage = true;
+                }
+            }
+
+            if (disposeBusinessInfoStorage)
+            {
+                if (saveTimer != null)
+                {
+                    using var callbackCompleted = new ManualResetEvent(false);
+                    try
+                    {
+                        saveTimer.Change(Timeout.Infinite, Timeout.Infinite);
+                        if (saveTimer.Dispose(callbackCompleted))
+                        {
+                            callbackCompleted.WaitOne();
+                        }
+                    }
+                    catch (ObjectDisposedException)
+                    {
+                    }
+                }
+
+                SaveBusinessInfoCore(force: true);
+                _businessInfoSaveGate.Dispose();
+            }
+
             UnregisterGlobalHotkeys();
             UninstallKeyboardHook();
             try
@@ -781,14 +842,7 @@ namespace moshushou
                 return;
             }
 
-            var sourceItems = _businessInfoList
-                .Select(item => new BusinessInfo
-                {
-                    StoreName = item.StoreName,
-                    GroupName = item.GroupName,
-                    Source = item.Source
-                })
-                .ToList();
+            var sourceItems = GetBusinessInfoSnapshot();
 
             _busInfoManagerWindow = new BusInfoManagerWindow(sourceItems)
             {
@@ -813,14 +867,7 @@ namespace moshushou
             int selectedIndexSnapshot = 0;
             string? selectedStoreSnapshot = GetCurrentSelectedStoreName(out selectedIndexSnapshot);
 
-            _businessInfoList = updatedBusinessInfos
-                .Select(item => new BusinessInfo
-                {
-                    StoreName = item.StoreName,
-                    GroupName = item.GroupName,
-                    Source = item.Source
-                })
-                .ToList();
+            ReplaceBusinessInfoList(updatedBusinessInfos);
 
             SaveBusinessInfo();
             ProcessAndDisplayData();
@@ -833,7 +880,7 @@ namespace moshushou
                 }, System.Windows.Threading.DispatcherPriority.Loaded);
             }
 
-            StatusTextBlock.Text = $"✅ 已更新 businfo 映射，共 {_businessInfoList.Count} 条。";
+            StatusTextBlock.Text = $"✅ 已更新 businfo 映射，共 {GetBusinessInfoCount()} 条。";
         }
 
         private void OnBusInfoManagerClosed(object? sender, EventArgs e)
@@ -882,11 +929,7 @@ namespace moshushou
                 return;
             }
 
-            BusinessInfo? mappedInfo = _businessInfoList.FirstOrDefault(item =>
-                string.Equals(
-                    NormalizeStoreNameForBusinessInfo(item.StoreName),
-                    storeName,
-                    StringComparison.OrdinalIgnoreCase));
+            BusinessInfo? mappedInfo = FindBusinessInfo(storeName);
 
             string groupName = mappedInfo?.GroupName?.Trim() ?? rootNode.GroupName?.Trim() ?? string.Empty;
             string source = mappedInfo?.Source?.Trim() ?? rootNode.Source?.Trim() ?? string.Empty;
@@ -1982,6 +2025,22 @@ namespace moshushou
                                 bool isRetryAreaStore = _failedStores.Contains(node.StoreName);
                                 string retryKey = BuildInlineRetryKey(node.StoreName, isRetryAreaStore);
                                 int usedRetries = inlineRetryUsedMap.TryGetValue(retryKey, out int tmpUsed) ? tmpUsed : 0;
+                                string retryPhase = isRetryAreaStore ? "自动重试区" : "主列表";
+                                string failureStage = reachedPasteStage ? "发送阶段失败" : "搜索/进群阶段失败";
+
+                                if (_searchConfig.EnableFailedOcrDebugCapture &&
+                                    matchedHwnd != IntPtr.Zero &&
+                                    matchedAppIsWework.HasValue)
+                                {
+                                    await _screenshotHelper.CaptureFailedGroupOcrDebugAsync(
+                                        matchedHwnd,
+                                        matchedAppIsWework.Value,
+                                        node.StoreName,
+                                        node.GroupName,
+                                        failureStage,
+                                        retryPhase,
+                                        token);
+                                }
 
                                 if (usedRetries < maxInlineRetriesPerStore)
                                 {
@@ -4204,32 +4263,34 @@ namespace moshushou
                 businessStoreName = storeName?.Trim() ?? string.Empty;
             }
 
-            // 1. 更新内存列表 (_businessInfoList)
-            var info = _businessInfoList.FirstOrDefault(b => b.StoreName == businessStoreName);
-            if (info == null && !string.Equals(storeName, businessStoreName, StringComparison.Ordinal))
+            lock (_businessInfoLock)
             {
-                // 兼容旧数据：历史上可能把 "商家名##话术" 写进了 StoreName
-                info = _businessInfoList.FirstOrDefault(b => b.StoreName == storeName);
-            }
-            if (info == null)
-            {
-                info = new BusinessInfo { StoreName = businessStoreName };
-                _businessInfoList.Add(info);
-            }
-            else
-            {
-                // 迁移为标准键：仅保留真实商家名
-                info.StoreName = businessStoreName;
-            }
+                BusinessInfo? info = FindBusinessInfoLocked(businessStoreName);
+                if (info == null && !string.Equals(storeName, businessStoreName, StringComparison.Ordinal))
+                {
+                    // 兼容旧数据：历史上可能把 "商家名##话术" 写进了 StoreName
+                    info = FindBusinessInfoLocked(storeName);
+                }
+                if (info == null)
+                {
+                    info = new BusinessInfo { StoreName = businessStoreName };
+                    _businessInfoList.Add(info);
+                }
+                else
+                {
+                    // 迁移为标准键：仅保留真实商家名
+                    info.StoreName = businessStoreName;
+                }
 
-            _businessInfoList.RemoveAll(b =>
-                b != info &&
-                (string.Equals(b.StoreName, businessStoreName, StringComparison.Ordinal) ||
-                 string.Equals(b.StoreName, storeName, StringComparison.Ordinal)));
+                _businessInfoList.RemoveAll(b =>
+                    b != info &&
+                    (string.Equals(b.StoreName, businessStoreName, StringComparison.Ordinal) ||
+                     string.Equals(b.StoreName, storeName, StringComparison.Ordinal)));
 
-            // 更新属性
-            info.GroupName = newGroupName;
-            info.Source = source;
+                info.GroupName = newGroupName;
+                info.Source = source;
+                RebuildBusinessInfoIndexLocked();
+            }
 
             // 2. 保存到本地 JSON 文件
             // (调用你原有的 SaveBusinessInfo 方法)
@@ -6809,15 +6870,13 @@ namespace moshushou
         {
             List<KeyValuePair<string, List<string>>> sortedStores;
 
-            var infoMap = _businessInfoList
-                .Select(b => new
-                {
-                    Key = NormalizeStoreNameForBusinessInfo(b.StoreName),
-                    Info = b
-                })
-                .Where(x => !string.IsNullOrWhiteSpace(x.Key))
-                .GroupBy(x => x.Key)
-                .ToDictionary(g => g.Key, g => g.Select(x => x.Info).FirstOrDefault());
+            Dictionary<string, BusinessInfo> infoMap;
+            lock (_businessInfoLock)
+            {
+                infoMap = new Dictionary<string, BusinessInfo>(
+                    _businessInfoIndex,
+                    StringComparer.OrdinalIgnoreCase);
+            }
 
             lock (_dataLock)
             {
@@ -6825,7 +6884,8 @@ namespace moshushou
                     .Select(kvp => 
                     {
                         string realKey = kvp.Key;
-                        var info = infoMap.ContainsKey(realKey) ? infoMap[realKey] : null;
+                        string infoKey = NormalizeStoreNameForBusinessInfo(realKey);
+                        infoMap.TryGetValue(infoKey, out BusinessInfo? info);
                         return new { Kvp = kvp, Info = info };
                     })
                     .OrderByDescending(x => !string.IsNullOrEmpty(x.Info?.GroupName))
@@ -8425,11 +8485,11 @@ namespace moshushou
                 businessStoreName = storeName?.Trim() ?? string.Empty;
             }
 
-            var existingInfo = _businessInfoList.FirstOrDefault(b => b.StoreName == businessStoreName);
+            var existingInfo = FindBusinessInfo(businessStoreName);
             if (existingInfo == null && !string.Equals(storeName, businessStoreName, StringComparison.Ordinal))
             {
                 // 兼容旧数据：历史上可能存了复合键
-                existingInfo = _businessInfoList.FirstOrDefault(b => b.StoreName == storeName);
+                existingInfo = FindBusinessInfo(storeName);
             }
 
             // 使用副本编辑，避免取消时意外污染内存对象
@@ -8449,14 +8509,17 @@ namespace moshushou
             {
                 BusinessInfo updatedInfo = editWindow.Info;
 
-                // ✅ 更新业务信息列表
-                _businessInfoList.RemoveAll(b =>
-                    string.Equals(b.StoreName, updatedInfo.StoreName, StringComparison.Ordinal) ||
-                    string.Equals(b.StoreName, storeName, StringComparison.Ordinal));
-
-                if (!string.IsNullOrEmpty(updatedInfo.GroupName))
+                lock (_businessInfoLock)
                 {
-                    _businessInfoList.Add(updatedInfo);
+                    _businessInfoList.RemoveAll(b =>
+                        string.Equals(b.StoreName, updatedInfo.StoreName, StringComparison.Ordinal) ||
+                        string.Equals(b.StoreName, storeName, StringComparison.Ordinal));
+
+                    if (!string.IsNullOrEmpty(updatedInfo.GroupName))
+                    {
+                        _businessInfoList.Add(updatedInfo);
+                    }
+                    RebuildBusinessInfoIndexLocked();
                 }
 
                 SaveBusinessInfo();
@@ -8483,61 +8546,278 @@ namespace moshushou
 
 
 
+        private List<BusinessInfo> GetBusinessInfoSnapshot()
+        {
+            lock (_businessInfoLock)
+            {
+                return _businessInfoList.Select(CloneBusinessInfo).ToList();
+            }
+        }
+
+        private int GetBusinessInfoCount()
+        {
+            lock (_businessInfoLock)
+            {
+                return _businessInfoList.Count;
+            }
+        }
+
+        private void ReplaceBusinessInfoList(IEnumerable<BusinessInfo>? items)
+        {
+            lock (_businessInfoLock)
+            {
+                _businessInfoList = items?
+                    .Where(item => item != null)
+                    .Select(CloneBusinessInfo)
+                    .ToList() ?? new List<BusinessInfo>();
+                RebuildBusinessInfoIndexLocked();
+            }
+        }
+
+        private BusinessInfo? FindBusinessInfo(string? storeName)
+        {
+            lock (_businessInfoLock)
+            {
+                BusinessInfo? info = FindBusinessInfoLocked(storeName);
+                return info == null ? null : CloneBusinessInfo(info);
+            }
+        }
+
+        private BusinessInfo? FindBusinessInfoLocked(string? storeName)
+        {
+            string key = NormalizeStoreNameForBusinessInfo(storeName ?? string.Empty);
+            if (string.IsNullOrWhiteSpace(key))
+            {
+                return null;
+            }
+
+            return _businessInfoIndex.TryGetValue(key, out BusinessInfo? info)
+                ? info
+                : null;
+        }
+
+        private void RebuildBusinessInfoIndexLocked()
+        {
+            _businessInfoIndex.Clear();
+            foreach (BusinessInfo info in _businessInfoList)
+            {
+                string key = NormalizeStoreNameForBusinessInfo(info.StoreName ?? string.Empty);
+                if (!string.IsNullOrWhiteSpace(key) && !_businessInfoIndex.ContainsKey(key))
+                {
+                    _businessInfoIndex.Add(key, info);
+                }
+            }
+        }
+
+        private static BusinessInfo CloneBusinessInfo(BusinessInfo info)
+        {
+            return new BusinessInfo
+            {
+                StoreName = info.StoreName,
+                GroupName = info.GroupName,
+                Source = info.Source
+            };
+        }
+
         private void SaveBusinessInfo()
         {
+            lock (_businessInfoStorageLifecycleLock)
+            {
+                if (_businessInfoStorageDisposed)
+                {
+                    return;
+                }
+
+                Interlocked.Exchange(ref _businessInfoSavePending, 1);
+                try
+                {
+                    _businessInfoSaveTimer?.Change(
+                        BusinessInfoSaveDebounceMilliseconds,
+                        Timeout.Infinite);
+                }
+                catch (ObjectDisposedException)
+                {
+                }
+            }
+        }
+
+        private void SaveBusinessInfoCore(bool force)
+        {
+            bool shouldSave = Interlocked.Exchange(ref _businessInfoSavePending, 0) != 0;
+            if (!force && !shouldSave)
+            {
+                return;
+            }
+
+            _businessInfoSaveGate.Wait();
+            bool saved = false;
             string busInfoPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "businfo.json");
+            string tempPath = busInfoPath + ".tmp";
+            string backupPath = busInfoPath + ".bak";
             try
             {
-                var options = new JsonSerializerOptions
-                {
-                    Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
-                    WriteIndented = true
-                };
+                List<BusinessInfo> snapshot = GetBusinessInfoSnapshot();
+                string json = JsonSerializer.Serialize(snapshot, BusinessInfoWriteJsonOptions);
+                File.WriteAllText(tempPath, json, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
 
-                string json = JsonSerializer.Serialize(_businessInfoList, options);
-                File.WriteAllText(busInfoPath, json, Encoding.UTF8);
+                if (File.Exists(busInfoPath))
+                {
+                    try
+                    {
+                        File.Replace(tempPath, busInfoPath, backupPath, ignoreMetadataErrors: true);
+                    }
+                    catch (Exception ex) when (ex is IOException or PlatformNotSupportedException)
+                    {
+                        File.Copy(busInfoPath, backupPath, overwrite: true);
+                        File.Move(tempPath, busInfoPath, overwrite: true);
+                    }
+                }
+                else
+                {
+                    File.Move(tempPath, busInfoPath);
+                }
+
+                saved = true;
             }
             catch (Exception ex)
             {
-                StatusTextBlock.Text = $"❌ 保存 businfo.json 失败: {ex.Message}";
+                Interlocked.Exchange(ref _businessInfoSavePending, 1);
+                ReportBusinessInfoStorageError("保存", ex);
+            }
+            finally
+            {
+                try
+                {
+                    if (File.Exists(tempPath))
+                    {
+                        File.Delete(tempPath);
+                    }
+                }
+                catch
+                {
+                }
+                _businessInfoSaveGate.Release();
+            }
+
+            if (saved && Volatile.Read(ref _businessInfoSavePending) != 0 && !_businessInfoStorageDisposed)
+            {
+                try
+                {
+                    _businessInfoSaveTimer?.Change(
+                        BusinessInfoSaveDebounceMilliseconds,
+                        Timeout.Infinite);
+                }
+                catch (ObjectDisposedException)
+                {
+                }
+            }
+        }
+
+        private void ReportBusinessInfoStorageError(string operation, Exception ex)
+        {
+            string message = $"❌ {operation} businfo.json 失败: {ex.Message}";
+            DebugLogManager.Log("BusInfo", message);
+            try
+            {
+                Dispatcher.BeginInvoke(new Action(() => StatusTextBlock.Text = message));
+            }
+            catch
+            {
+            }
+        }
+
+        private static bool TryLoadBusinessInfoFile(
+            string path,
+            out List<BusinessInfo> items,
+            out bool sanitizedControlCharacters,
+            out Exception? error)
+        {
+            items = new List<BusinessInfo>();
+            sanitizedControlCharacters = false;
+            error = null;
+            try
+            {
+                string json = File.ReadAllText(path, Encoding.UTF8);
+                if (string.IsNullOrWhiteSpace(json))
+                {
+                    return true;
+                }
+
+                string sanitizedJson = SanitizeJsonControlCharsInStrings(
+                    json,
+                    out sanitizedControlCharacters);
+                items = JsonSerializer.Deserialize<List<BusinessInfo>>(
+                    sanitizedJson,
+                    BusinessInfoReadJsonOptions) ?? new List<BusinessInfo>();
+                return true;
+            }
+            catch (Exception ex)
+            {
+                error = ex;
+                return false;
             }
         }
 
         private void LoadBusinessInfo()
         {
             string busInfoPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "businfo.json");
-            _businessInfoList.Clear();
+            string backupPath = busInfoPath + ".bak";
+            Exception? loadError = null;
 
             if (File.Exists(busInfoPath))
             {
-                try
+                if (TryLoadBusinessInfoFile(
+                        busInfoPath,
+                        out List<BusinessInfo> items,
+                        out bool sanitizedControlCharacters,
+                        out loadError))
                 {
-                    string json = File.ReadAllText(busInfoPath, Encoding.UTF8);
-                    if (!string.IsNullOrWhiteSpace(json))
+                    ReplaceBusinessInfoList(items);
+                    StatusTextBlock.Text = sanitizedControlCharacters
+                        ? $"✅ 成功加载 {items.Count} 条商家群聊信息（已自动修复不可见控制字符）。"
+                        : $"✅ 成功加载 {items.Count} 条商家群聊信息。";
+                    if (sanitizedControlCharacters)
                     {
-                        string sanitizedJson = SanitizeJsonControlCharsInStrings(json, out bool hasSanitizedControlChars);
-
-                        var deserializeOptions = new JsonSerializerOptions
-                        {
-                            AllowTrailingCommas = true,
-                            ReadCommentHandling = JsonCommentHandling.Skip
-                        };
-
-                        _businessInfoList = JsonSerializer.Deserialize<List<BusinessInfo>>(sanitizedJson, deserializeOptions) ?? new List<BusinessInfo>();
-
-                        if (hasSanitizedControlChars)
-                        {
-                            StatusTextBlock.Text = $"✅ 成功加载 {_businessInfoList.Count} 条商家群聊信息（已自动修复不可见控制字符）。";
-                            return;
-                        }
+                        SaveBusinessInfo();
                     }
-                    StatusTextBlock.Text = $"✅ 成功加载 {_businessInfoList.Count} 条商家群聊信息。";
+                    return;
                 }
-                catch (Exception ex)
+            }
+
+            Exception? backupError = null;
+            if (File.Exists(backupPath))
+            {
+                if (TryLoadBusinessInfoFile(
+                        backupPath,
+                        out List<BusinessInfo> backupItems,
+                        out _,
+                        out backupError))
                 {
-                    StatusTextBlock.Text = $"❌ 加载 businfo.json 失败: {ex.Message}";
-                    _businessInfoList = new List<BusinessInfo>();
+                    ReplaceBusinessInfoList(backupItems);
+                    try
+                    {
+                        if (File.Exists(busInfoPath))
+                        {
+                            string corruptPath = busInfoPath + ".corrupt-" + DateTime.Now.ToString("yyyyMMdd-HHmmss");
+                            File.Move(busInfoPath, corruptPath, overwrite: true);
+                        }
+                        File.Copy(backupPath, busInfoPath, overwrite: true);
+                    }
+                    catch (Exception recoveryError)
+                    {
+                        DebugLogManager.Log("BusInfo", $"恢复 businfo.json 备份失败：{recoveryError}");
+                    }
+
+                    StatusTextBlock.Text = $"⚠️ businfo.json 不可用，已从备份恢复 {backupItems.Count} 条商家信息。";
+                    return;
                 }
+            }
+
+            ReplaceBusinessInfoList(Array.Empty<BusinessInfo>());
+            if (File.Exists(busInfoPath) || File.Exists(backupPath))
+            {
+                Exception? finalError = loadError ?? backupError;
+                StatusTextBlock.Text = $"❌ 加载 businfo.json 失败: {finalError?.Message ?? "未知错误"}";
             }
             else
             {
@@ -8674,41 +8954,45 @@ namespace moshushou
                         businessStoreName = storeName?.Trim() ?? string.Empty;
                     }
 
-                    var existingInfo = _businessInfoList.FirstOrDefault(b => b.StoreName == businessStoreName);
-                    if (existingInfo == null && !string.Equals(storeName, businessStoreName, StringComparison.Ordinal))
+                    lock (_businessInfoLock)
                     {
-                        // 兼容旧数据：历史上可能存了复合键
-                        existingInfo = _businessInfoList.FirstOrDefault(b => b.StoreName == storeName);
-                    }
-
-                    if (existingInfo != null && !string.IsNullOrWhiteSpace(existingInfo.GroupName))
-                    {
-                        //StatusTextBlock.Text = $"[OCR] 商家 '{storeName}' 已有群名，本次识别结果被忽略。";
-                        return;
-                    }
-
-                    BusinessInfo targetInfo = existingInfo;
-                    if (existingInfo != null)
-                    {
-                        existingInfo.StoreName = businessStoreName;
-                        existingInfo.GroupName = ocrResult.GroupName;
-                        existingInfo.Source = ocrResult.Source;
-                    }
-                    else
-                    {
-                        targetInfo = new BusinessInfo
+                        BusinessInfo? existingInfo = FindBusinessInfoLocked(businessStoreName);
+                        if (existingInfo == null && !string.Equals(storeName, businessStoreName, StringComparison.Ordinal))
                         {
-                            StoreName = businessStoreName,
-                            GroupName = ocrResult.GroupName,
-                            Source = ocrResult.Source
-                        };
-                        _businessInfoList.Add(targetInfo);
-                    }
+                            // 兼容旧数据：历史上可能存了复合键
+                            existingInfo = FindBusinessInfoLocked(storeName);
+                        }
 
-                    _businessInfoList.RemoveAll(b =>
-                        b != targetInfo &&
-                        (string.Equals(b.StoreName, businessStoreName, StringComparison.Ordinal) ||
-                         string.Equals(b.StoreName, storeName, StringComparison.Ordinal)));
+                        if (existingInfo != null && !string.IsNullOrWhiteSpace(existingInfo.GroupName))
+                        {
+                            return;
+                        }
+
+                        BusinessInfo targetInfo;
+                        if (existingInfo != null)
+                        {
+                            existingInfo.StoreName = businessStoreName;
+                            existingInfo.GroupName = ocrResult.GroupName;
+                            existingInfo.Source = ocrResult.Source;
+                            targetInfo = existingInfo;
+                        }
+                        else
+                        {
+                            targetInfo = new BusinessInfo
+                            {
+                                StoreName = businessStoreName,
+                                GroupName = ocrResult.GroupName,
+                                Source = ocrResult.Source
+                            };
+                            _businessInfoList.Add(targetInfo);
+                        }
+
+                        _businessInfoList.RemoveAll(b =>
+                            b != targetInfo &&
+                            (string.Equals(b.StoreName, businessStoreName, StringComparison.Ordinal) ||
+                             string.Equals(b.StoreName, storeName, StringComparison.Ordinal)));
+                        RebuildBusinessInfoIndexLocked();
+                    }
 
                     SaveBusinessInfo();
 

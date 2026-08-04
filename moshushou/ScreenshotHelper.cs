@@ -5,6 +5,8 @@ using System.Drawing.Imaging;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.Encodings.Web;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
@@ -55,6 +57,7 @@ namespace moshushou
         private ImageOcr? _ocrEngine;
         private bool _disposed;
         private static long _ocrRequestSeq = 0;
+        private static long _ocrFailureDebugSeq = 0;
         private static int _ocrActiveCount = 0;
         private const int OCR_TIMEOUT_MS = 8000;
         private const int DETECTION_CACHE_TTL_MS = 2000;
@@ -84,7 +87,31 @@ namespace moshushou
             public List<YoloResult> Results { get; init; } = new List<YoloResult>();
         }
 
+        private sealed class GroupTitleOcrSample
+        {
+            public DateTime CapturedAt { get; init; }
+            public IntPtr Hwnd { get; init; }
+            public bool IsWework { get; init; }
+            public int WindowWidth { get; init; }
+            public int WindowHeight { get; init; }
+            public Rectangle GroupBox { get; init; }
+            public float YoloConfidence { get; init; }
+            public string DetectionSummary { get; init; } = string.Empty;
+            public string RawText { get; init; } = string.Empty;
+            public string CleanedText { get; init; } = string.Empty;
+            public byte[] GroupPngBytes { get; init; } = Array.Empty<byte>();
+        }
+
         private DetectionCacheEntry? _detectionCache;
+        private readonly object _lastGroupTitleOcrSampleSync = new object();
+        private GroupTitleOcrSample? _lastGroupTitleOcrSample;
+        private static readonly JsonSerializerOptions FailedOcrDebugJsonOptions = new JsonSerializerOptions
+        {
+            WriteIndented = true,
+            Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping
+        };
+
+        public string FailedOcrDebugDirectory => Path.Combine(_baseDirectory, "OCR_Failure_Debug");
 
 
         public ScreenshotHelper(string baseStorageDirectory, SearchConfig config, Action<string> logAction = null)
@@ -489,6 +516,17 @@ namespace moshushou
                             g.DrawImage(bitmap, new Rectangle(0, 0, bbox.Width, bbox.Height), bbox, GraphicsUnit.Pixel);
                         string ocrText = await PerformAdaptiveOcrAsync(crop, $"GetTitle/{(isWework ? "WeWork" : "WeChat")}");
                         string cleaned = CleanGroupName(ocrText);
+                        RememberGroupTitleOcrSample(
+                            targetHwnd,
+                            isWework,
+                            width,
+                            height,
+                            bbox,
+                            target.Confidence,
+                            BuildDetectionSummary(yoloResults),
+                            ocrText,
+                            cleaned,
+                            crop);
                         _logAction?.Invoke($"🏷️ YOLO 识别窗口标题: '{cleaned}' (置信度:{target.Confidence:P0})");
                         return cleaned;
                         }
@@ -1320,6 +1358,297 @@ namespace moshushou
                 ObjectDisposedException.ThrowIf(_disposed, this);
                 return _ocrEngine ??= new ImageOcr();
             }
+        }
+
+        /// <summary>
+        /// 自动发送失败后采集当前群名区域。仅保存群名小图，不保存聊天正文。
+        /// </summary>
+        public async Task<string?> CaptureFailedGroupOcrDebugAsync(
+            IntPtr targetHwnd,
+            bool isWework,
+            string? storeName,
+            string? expectedGroupName,
+            string? failureStage,
+            string? retryPhase,
+            CancellationToken token = default)
+        {
+            if (!_config.EnableFailedOcrDebugCapture || _disposed)
+            {
+                return null;
+            }
+
+            try
+            {
+                return await Task.Run(async () =>
+                {
+                    token.ThrowIfCancellationRequested();
+
+                    GroupTitleOcrSample? originalSample = GetRecentGroupTitleOcrSample(
+                        targetHwnd,
+                        isWework,
+                        TimeSpan.FromSeconds(20));
+                    if (originalSample != null)
+                    {
+                        return SaveFailedOcrDebugRecord(
+                            targetHwnd,
+                            isWework,
+                            storeName,
+                            expectedGroupName,
+                            failureStage,
+                            retryPhase,
+                            originalSample.CapturedAt,
+                            originalSample.WindowWidth,
+                            originalSample.WindowHeight,
+                            originalSample.GroupBox,
+                            originalSample.YoloConfidence,
+                            originalSample.DetectionSummary,
+                            originalSample.RawText,
+                            originalSample.CleanedText,
+                            originalSample.GroupPngBytes,
+                            usedOriginalOcrSample: true);
+                    }
+
+                    if (_yoloDetector == null ||
+                        targetHwnd == IntPtr.Zero ||
+                        !GetWindowRect(targetHwnd, out RECT rect))
+                    {
+                        return null;
+                    }
+
+                    int width = rect.Right - rect.Left;
+                    int height = rect.Bottom - rect.Top;
+                    if (width <= 0 || height <= 0 ||
+                        IsDesktopPixelSize(rect) ||
+                        IsSystemWindowClass(targetHwnd))
+                    {
+                        return null;
+                    }
+
+                    token.ThrowIfCancellationRequested();
+                    using var windowBitmap = new Bitmap(width, height, PixelFormat.Format32bppArgb);
+                    using (var graphics = Graphics.FromImage(windowBitmap))
+                    {
+                        graphics.CopyFromScreen(
+                            rect.Left,
+                            rect.Top,
+                            0,
+                            0,
+                            new Size(width, height),
+                            CopyPixelOperation.SourceCopy);
+                    }
+
+                    List<YoloResult> detections = _yoloDetector.Detect(windowBitmap);
+                    CacheDetections(targetHwnd, rect, detections);
+                    YoloResult? groupDetection = detections
+                        .Where(item => item.LabelName == YoloWindowDetector.Label_GroupName)
+                        .OrderByDescending(item => item.Confidence)
+                        .FirstOrDefault();
+
+                    string rawOcrText = string.Empty;
+                    string cleanedOcrText = string.Empty;
+                    Rectangle? capturedGroupBox = null;
+                    byte[]? groupPngBytes = null;
+                    DateTime capturedAt = DateTime.Now;
+
+                    if (groupDetection != null)
+                    {
+                        Rectangle validBox = Rectangle.Intersect(
+                            new Rectangle(0, 0, width, height),
+                            groupDetection.BBox);
+                        if (validBox.Width > 0 && validBox.Height > 0)
+                        {
+                            capturedGroupBox = validBox;
+                            using var groupBitmap = new Bitmap(validBox.Width, validBox.Height, PixelFormat.Format32bppArgb);
+                            using (var groupGraphics = Graphics.FromImage(groupBitmap))
+                            {
+                                groupGraphics.DrawImage(
+                                    windowBitmap,
+                                    new Rectangle(0, 0, validBox.Width, validBox.Height),
+                                    validBox,
+                                    GraphicsUnit.Pixel);
+                            }
+
+                            rawOcrText = await PerformAdaptiveOcrAsync(
+                                groupBitmap,
+                                $"FailureDebug/{SanitizeDebugToken(storeName ?? "未命名商家", 40)}",
+                                token);
+                            cleanedOcrText = CleanGroupName(rawOcrText) ?? string.Empty;
+                            groupPngBytes = ImageToBytes(groupBitmap);
+                        }
+                    }
+
+                    return SaveFailedOcrDebugRecord(
+                        targetHwnd,
+                        isWework,
+                        storeName,
+                        expectedGroupName,
+                        failureStage,
+                        retryPhase,
+                        capturedAt,
+                        width,
+                        height,
+                        capturedGroupBox,
+                        groupDetection?.Confidence,
+                        BuildDetectionSummary(detections),
+                        rawOcrText,
+                        cleanedOcrText,
+                        groupPngBytes,
+                        usedOriginalOcrSample: false);
+                }, token);
+            }
+            catch (OperationCanceledException)
+            {
+                return null;
+            }
+            catch (Exception ex)
+            {
+                _logAction?.Invoke($"⚠️ [失败OCR采集] 保存失败: {ex.Message}");
+                return null;
+            }
+        }
+
+        private void RememberGroupTitleOcrSample(
+            IntPtr hwnd,
+            bool isWework,
+            int windowWidth,
+            int windowHeight,
+            Rectangle groupBox,
+            float yoloConfidence,
+            string detectionSummary,
+            string? rawText,
+            string? cleanedText,
+            Bitmap groupBitmap)
+        {
+            if (!_config.EnableFailedOcrDebugCapture || _disposed)
+            {
+                return;
+            }
+
+            try
+            {
+                var sample = new GroupTitleOcrSample
+                {
+                    CapturedAt = DateTime.Now,
+                    Hwnd = hwnd,
+                    IsWework = isWework,
+                    WindowWidth = windowWidth,
+                    WindowHeight = windowHeight,
+                    GroupBox = groupBox,
+                    YoloConfidence = yoloConfidence,
+                    DetectionSummary = detectionSummary ?? string.Empty,
+                    RawText = rawText ?? string.Empty,
+                    CleanedText = cleanedText ?? string.Empty,
+                    GroupPngBytes = ImageToBytes(groupBitmap)
+                };
+
+                lock (_lastGroupTitleOcrSampleSync)
+                {
+                    _lastGroupTitleOcrSample = sample;
+                }
+            }
+            catch (Exception ex)
+            {
+                _logAction?.Invoke($"⚠️ [失败OCR采集] 暂存标题样本失败: {ex.Message}");
+            }
+        }
+
+        private GroupTitleOcrSample? GetRecentGroupTitleOcrSample(
+            IntPtr hwnd,
+            bool isWework,
+            TimeSpan maxAge)
+        {
+            lock (_lastGroupTitleOcrSampleSync)
+            {
+                GroupTitleOcrSample? sample = _lastGroupTitleOcrSample;
+                if (sample == null ||
+                    sample.Hwnd != hwnd ||
+                    sample.IsWework != isWework ||
+                    DateTime.Now - sample.CapturedAt > maxAge)
+                {
+                    return null;
+                }
+
+                return sample;
+            }
+        }
+
+        private string SaveFailedOcrDebugRecord(
+            IntPtr targetHwnd,
+            bool isWework,
+            string? storeName,
+            string? expectedGroupName,
+            string? failureStage,
+            string? retryPhase,
+            DateTime sampleCapturedAt,
+            int windowWidth,
+            int windowHeight,
+            Rectangle? groupBox,
+            float? groupYoloConfidence,
+            string detectionSummary,
+            string rawOcrText,
+            string cleanedOcrText,
+            byte[]? groupPngBytes,
+            bool usedOriginalOcrSample)
+        {
+            DateTime recordedAt = DateTime.Now;
+            long sequence = Interlocked.Increment(ref _ocrFailureDebugSeq);
+            string safeStoreName = SanitizeDebugToken(storeName ?? "未命名商家", 40);
+            string safePhase = SanitizeDebugToken(retryPhase ?? "unknown", 16);
+            string filePrefix = $"{recordedAt:HHmmss_fff}_{sequence:D5}_{safePhase}_{safeStoreName}";
+            string dateDirectory = Path.Combine(FailedOcrDebugDirectory, recordedAt.ToString("yyyyMMdd"));
+            Directory.CreateDirectory(dateDirectory);
+
+            string imageFileName = string.Empty;
+            if (groupPngBytes is { Length: > 0 })
+            {
+                imageFileName = filePrefix + ".png";
+                File.WriteAllBytes(Path.Combine(dateDirectory, imageFileName), groupPngBytes);
+            }
+
+            bool ocrMatchesExpected =
+                !string.IsNullOrWhiteSpace(expectedGroupName) &&
+                !string.IsNullOrWhiteSpace(cleanedOcrText) &&
+                IsFuzzyMatch(expectedGroupName, cleanedOcrText);
+            object? groupBoxValue = groupBox.HasValue
+                ? new
+                {
+                    X = groupBox.Value.X,
+                    Y = groupBox.Value.Y,
+                    Width = groupBox.Value.Width,
+                    Height = groupBox.Value.Height
+                }
+                : null;
+
+            var debugRecord = new
+            {
+                RecordedAt = recordedAt.ToString("yyyy-MM-dd HH:mm:ss.fff"),
+                OcrSampleCapturedAt = sampleCapturedAt.ToString("yyyy-MM-dd HH:mm:ss.fff"),
+                UsedOriginalOcrSample = usedOriginalOcrSample,
+                StoreName = storeName ?? string.Empty,
+                ExpectedGroupName = expectedGroupName ?? string.Empty,
+                OcrRawText = rawOcrText ?? string.Empty,
+                OcrCleanedText = cleanedOcrText ?? string.Empty,
+                OcrMatchesExpected = ocrMatchesExpected,
+                App = isWework ? "企业微信" : "微信",
+                FailureStage = failureStage ?? string.Empty,
+                RetryPhase = retryPhase ?? string.Empty,
+                WindowHandle = targetHwnd.ToInt64(),
+                WindowSize = new { Width = windowWidth, Height = windowHeight },
+                GroupBox = groupBoxValue,
+                GroupYoloConfidence = groupYoloConfidence,
+                DetectionSummary = detectionSummary ?? string.Empty,
+                GroupScreenshot = imageFileName
+            };
+
+            string metadataPath = Path.Combine(dateDirectory, filePrefix + ".json");
+            string json = JsonSerializer.Serialize(debugRecord, FailedOcrDebugJsonOptions);
+            File.WriteAllText(metadataPath, json, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+
+            _logAction?.Invoke(
+                $"🧪 [失败OCR采集] 商家='{storeName}', 预期='{expectedGroupName}', " +
+                $"OCR='{cleanedOcrText}', 原始样本={(usedOriginalOcrSample ? "是" : "否")}, " +
+                $"阶段={retryPhase}/{failureStage}, 文件={metadataPath}");
+            return metadataPath;
         }
 
         private void ResetOcrEngine(string reason)
