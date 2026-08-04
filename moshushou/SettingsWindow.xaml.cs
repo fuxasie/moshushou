@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Windows;
 using System.Windows.Controls;
+using moshushou.Input;
 
 namespace moshushou
 {
@@ -37,6 +38,14 @@ namespace moshushou
             // 初始化基础控件
             EnableOsdCheckBox.IsChecked = _config.EnableOsdWindow;
             SkipNextOnCtrlSpaceCheckBox.IsChecked = _config.SkipNextOnCtrlSpace;
+            AllowInputFallbackCheckBox.IsChecked = _config.AllowSendInputFallback;
+            InputBackendComboBox.SelectedIndex = string.Equals(
+                _config.InputBackend,
+                InputBackendFactory.SendInputMode,
+                StringComparison.OrdinalIgnoreCase)
+                ? 1
+                : 0;
+            RefreshInputBackendStatus();
 
             // 初始化解析模式下拉
             ModeComboBox.ItemsSource = _parseModeOptions;
@@ -147,6 +156,79 @@ namespace moshushou
         {
             _config.SkipNextOnCtrlSpace = false;
             _config.Save();
+        }
+
+        private void CheckVirtualHidButton_Click(object sender, RoutedEventArgs e)
+        {
+            RefreshInputBackendStatus();
+        }
+
+        private void SaveInputBackendButton_Click(object sender, RoutedEventArgs e)
+        {
+            if (InputBackendComboBox.SelectedItem is ComboBoxItem item && item.Tag is string mode)
+            {
+                _config.InputBackend = mode;
+            }
+            else
+            {
+                _config.InputBackend = InputBackendFactory.VirtualHidMode;
+            }
+
+            _config.AllowSendInputFallback = AllowInputFallbackCheckBox.IsChecked == true;
+            _config.Save();
+
+            MessageBox.Show(
+                this,
+                "键鼠模拟设置已保存，重启软件后生效。企业微信验证时建议关闭 SendInput 回退。",
+                "键鼠模拟设置",
+                MessageBoxButton.OK,
+                MessageBoxImage.Information);
+        }
+
+        private void UninstallVirtualHidButton_Click(object sender, RoutedEventArgs e)
+        {
+            object originalContent = UninstallVirtualHidButton.Content;
+            UninstallVirtualHidButton.IsEnabled = false;
+            UninstallVirtualHidButton.Content = "正在卸载...";
+            Dispatcher.Invoke(
+                System.Windows.Threading.DispatcherPriority.Render,
+                new Action(() => { }));
+            try
+            {
+                if (DriverInstallationManager.UninstallVirtualHidDriver(
+                        _config,
+                        this,
+                        _mainWindow.PrepareForVirtualHidDriverUninstall))
+                {
+                    InputBackendComboBox.SelectedIndex = 1;
+                    AllowInputFallbackCheckBox.IsChecked = true;
+                }
+            }
+            finally
+            {
+                UninstallVirtualHidButton.Content = originalContent;
+                UninstallVirtualHidButton.IsEnabled = true;
+                RefreshInputBackendStatus();
+            }
+        }
+
+        private void RefreshInputBackendStatus()
+        {
+            try
+            {
+                bool available = VirtualHidBackend.IsCompatibleDevicePresent();
+                InputBackendStatusTextBlock.Text = available
+                    ? "已检测到兼容的 Virtual HID 控制设备。"
+                    : "未检测到 Virtual HID；安装驱动前无法使用该模式。";
+                InputBackendStatusTextBlock.Foreground = available
+                    ? System.Windows.Media.Brushes.ForestGreen
+                    : System.Windows.Media.Brushes.DarkOrange;
+            }
+            catch (Exception ex)
+            {
+                InputBackendStatusTextBlock.Text = $"Virtual HID 检测失败：{ex.Message}";
+                InputBackendStatusTextBlock.Foreground = System.Windows.Media.Brushes.Firebrick;
+            }
         }
 
         // ====== 解析设置事件 ======

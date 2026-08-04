@@ -49,8 +49,42 @@ namespace moshushou
         private readonly Action<string> _logAction;
         private readonly SearchConfig _config;
         private readonly YoloWindowDetector _yoloDetector;
+        private readonly SemaphoreSlim _ocrSemaphore = new SemaphoreSlim(1, 1);
+        private readonly object _ocrEngineSync = new object();
+        private readonly object _detectionCacheSync = new object();
+        private ImageOcr? _ocrEngine;
+        private bool _disposed;
         private static long _ocrRequestSeq = 0;
         private static int _ocrActiveCount = 0;
+        private const int OCR_TIMEOUT_MS = 8000;
+        private const int DETECTION_CACHE_TTL_MS = 2000;
+
+        private sealed class OcrTextRegion
+        {
+            public string Text { get; init; } = string.Empty;
+            public int Left { get; init; }
+            public int Top { get; init; }
+            public int Right { get; init; }
+            public int Bottom { get; init; }
+        }
+
+        private sealed class OcrRunResult
+        {
+            public string Text { get; init; } = string.Empty;
+            public List<OcrTextRegion> Regions { get; init; } = new List<OcrTextRegion>();
+            public bool TimedOut { get; init; }
+            public bool Canceled { get; init; }
+        }
+
+        private sealed class DetectionCacheEntry
+        {
+            public IntPtr Hwnd { get; init; }
+            public RECT WindowRect { get; init; }
+            public DateTime CreatedUtc { get; init; }
+            public List<YoloResult> Results { get; init; } = new List<YoloResult>();
+        }
+
+        private DetectionCacheEntry? _detectionCache;
 
 
         public ScreenshotHelper(string baseStorageDirectory, SearchConfig config, Action<string> logAction = null)
@@ -144,6 +178,88 @@ namespace moshushou
             }
 
             return string.Join(" | ", list);
+        }
+
+        private void CacheDetections(IntPtr hwnd, RECT rect, IEnumerable<YoloResult> results)
+        {
+            var snapshot = results.Select(r => new YoloResult
+            {
+                LabelId = r.LabelId,
+                LabelName = r.LabelName,
+                Confidence = r.Confidence,
+                BBox = r.BBox
+            }).ToList();
+
+            lock (_detectionCacheSync)
+            {
+                _detectionCache = new DetectionCacheEntry
+                {
+                    Hwnd = hwnd,
+                    WindowRect = rect,
+                    CreatedUtc = DateTime.UtcNow,
+                    Results = snapshot
+                };
+            }
+        }
+
+        private bool TryGetCachedDetections(IntPtr hwnd, RECT rect, out List<YoloResult> results)
+        {
+            lock (_detectionCacheSync)
+            {
+                DetectionCacheEntry? cache = _detectionCache;
+                bool sameRect = cache != null &&
+                                cache.WindowRect.Left == rect.Left &&
+                                cache.WindowRect.Top == rect.Top &&
+                                cache.WindowRect.Right == rect.Right &&
+                                cache.WindowRect.Bottom == rect.Bottom;
+                bool fresh = cache != null &&
+                             (DateTime.UtcNow - cache.CreatedUtc).TotalMilliseconds <= DETECTION_CACHE_TTL_MS;
+
+                if (cache != null && cache.Hwnd == hwnd && sameRect && fresh)
+                {
+                    results = cache.Results;
+                    return true;
+                }
+            }
+
+            results = new List<YoloResult>();
+            return false;
+        }
+
+        private (bool success, int x, int y) GetInputCoordinatesFromDetections(
+            IEnumerable<YoloResult> results,
+            int screenX,
+            int screenY)
+        {
+            var chatBox = results
+                .Where(r => r.LabelName == YoloWindowDetector.Label_ChatBox)
+                .OrderByDescending(r => r.Confidence)
+                .FirstOrDefault();
+            if (chatBox == null) return (false, 0, 0);
+
+            int inputCenterX = chatBox.BBox.X + chatBox.BBox.Width / 2;
+            int inputCenterY = chatBox.BBox.Y + (int)(chatBox.BBox.Height * 0.75);
+            int clickX = screenX + inputCenterX + Random.Shared.Next(-5, 6);
+            int clickY = screenY + inputCenterY + Random.Shared.Next(-5, 6);
+            return (true, clickX, clickY);
+        }
+
+        private static bool IsSameDetection(
+            YoloResult first,
+            Rectangle firstScreenBBox,
+            YoloResult second,
+            Rectangle secondScreenBBox,
+            int maxCenterDistance = 30)
+        {
+            if (first.LabelName != second.LabelName) return false;
+
+            int firstCenterX = firstScreenBBox.X + firstScreenBBox.Width / 2;
+            int firstCenterY = firstScreenBBox.Y + firstScreenBBox.Height / 2;
+            int secondCenterX = secondScreenBBox.X + secondScreenBBox.Width / 2;
+            int secondCenterY = secondScreenBBox.Y + secondScreenBBox.Height / 2;
+            int deltaX = firstCenterX - secondCenterX;
+            int deltaY = firstCenterY - secondCenterY;
+            return deltaX * deltaX + deltaY * deltaY < maxCenterDistance * maxCenterDistance;
         }
 
         // [已禁用] Debug_Yolo 调试目录相关代码
@@ -331,6 +447,7 @@ namespace moshushou
 
                     // 1. YOLO 识别
                     var yoloResults = _yoloDetector.Detect(bitmap);
+                    CacheDetections(targetHwnd, rect, yoloResults);
                     
                     // 2. 保存调试图 [已禁用]
                     // string debugDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Debug_Yolo", DateTime.Now.ToString("yyyyMMdd"));
@@ -370,19 +487,10 @@ namespace moshushou
                         using (var g = Graphics.FromImage(crop))
                         {
                             g.DrawImage(bitmap, new Rectangle(0, 0, bbox.Width, bbox.Height), bbox, GraphicsUnit.Pixel);
-                        // 🔧 [优化] 使用 PreprocessForOcr 替代 ScaleImage，解决纯数字/边缘字符识别问题
-                        using (var processed = PreprocessForOcr(crop, 3))
-                        {
-                            // 📷 [调试] 保存 OCR 识别用的裁切图
-                            //string cropDebugFile = Path.Combine(debugDir, $"Title_Crop_{DateTime.Now:HHmmss_fff}.png");
-                            //processed.Save(cropDebugFile, ImageFormat.Png);
-                            // _logAction?.Invoke($"🖼️ [OCR调试] 标题裁切图已存: {cropDebugFile}");
-
-                            string ocrText = await PerformOcrAsync(processed, $"GetTitle/{(isWework ? "WeWork" : "WeChat")}");
-                            string cleaned = CleanGroupName(ocrText);
-                            _logAction?.Invoke($"🏷️ YOLO 识别窗口标题: '{cleaned}' (置信度:{target.Confidence:P0})");
-                            return cleaned;
-                        }
+                        string ocrText = await PerformAdaptiveOcrAsync(crop, $"GetTitle/{(isWework ? "WeWork" : "WeChat")}");
+                        string cleaned = CleanGroupName(ocrText);
+                        _logAction?.Invoke($"🏷️ YOLO 识别窗口标题: '{cleaned}' (置信度:{target.Confidence:P0})");
+                        return cleaned;
                         }
                     }
                 }
@@ -413,6 +521,16 @@ namespace moshushou
 
                 if (w > 0 && h > 0)
                 {
+                    if (TryGetCachedDetections(hwnd, rect, out var cachedResults))
+                    {
+                        var cachedCoordinates = GetInputCoordinatesFromDetections(cachedResults, screenX, screenY);
+                        if (cachedCoordinates.success)
+                        {
+                            _logAction?.Invoke($"⚡ 复用 YOLO 缓存定位输入框: ({cachedCoordinates.x}, {cachedCoordinates.y})");
+                            return cachedCoordinates;
+                        }
+                    }
+
                     // 🛡️ [防御] 防止截取到桌面
                     if (IsDesktopPixelSize(rect) || IsSystemWindowClass(hwnd))
                     {
@@ -428,6 +546,7 @@ namespace moshushou
                         }
 
                             var results = _yoloDetector.Detect(bitmap);
+                            CacheDetections(hwnd, rect, results);
                             
                             // 调试保存 [已禁用]
                             // string debugDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Debug_Yolo", DateTime.Now.ToString("yyyyMMdd"));
@@ -435,29 +554,11 @@ namespace moshushou
                             // string debugFile = Path.Combine(debugDir, $"InputBox_{DateTime.Now:HHmmss_fff}.png");
                             // _yoloDetector.InferenceWrapper.SaveDebugImage(bitmap, results, debugFile);
 
-                            // 查找 "聊天框" (通常包含输入框)
-                            var chatBox = results.Where(r => r.LabelName == YoloWindowDetector.Label_ChatBox).OrderByDescending(r => r.Confidence).FirstOrDefault();
-                            if (chatBox != null)
+                            var coordinates = GetInputCoordinatesFromDetections(results, screenX, screenY);
+                            if (coordinates.success)
                             {
-                                // 输入框通常在 ChatBox 识别框的底部上方一点点
-                                // 🚀 [优化] 输入框点击：微幅随机 (中心 ±5px)，更拟人化且节省时间
-                                int boxW = chatBox.BBox.Width;
-                                int boxH = chatBox.BBox.Height;
-                                
-                                // 计算输入区域中心点
-                                int inputCenterX = chatBox.BBox.X + boxW / 2;
-                                int inputCenterY = chatBox.BBox.Y + (int)(boxH * 0.75); // 输入框大约在垂直方向 75% 的位置
-                                
-                                Random rnd = new Random();
-                                // 微幅随机偏移 (中心点 ±5 像素)
-                                int offsetX = rnd.Next(-5, 6);
-                                int offsetY = rnd.Next(-5, 6);
-
-                                int clickX = screenX + inputCenterX + offsetX;
-                                int clickY = screenY + inputCenterY + offsetY;
-                                
-                                _logAction?.Invoke($"🎯 YOLO 定位输入框成功(微幅随机): ({clickX}, {clickY})");
-                                return (true, clickX, clickY);
+                                _logAction?.Invoke($"🎯 YOLO 定位输入框成功(微幅随机): ({coordinates.x}, {coordinates.y})");
+                                return coordinates;
                             }
                         }
                     }
@@ -1110,25 +1211,26 @@ namespace moshushou
 
                     // ✅ [优化] 直接在内存中进行 OCR，不保存文件
                     _logAction?.Invoke($"✅ 正在后台 OCR 识别 '{storeName}'...");
-                    Task.Run(async () =>
+                    var bitmapCopy = (Bitmap)bitmap.Clone();
+                    _ = Task.Run(async () =>
                     {
-                        BusinessInfo ocrResult = new BusinessInfo { StoreName = storeName, Source = appIdentifier };
-                        try
+                        using (bitmapCopy)
                         {
-                            using (var processed = PreprocessForOcr(bitmap, 3))
+                            BusinessInfo ocrResult = new BusinessInfo { StoreName = storeName, Source = appIdentifier };
+                            try
                             {
-                                string rawText = await PerformOcrAsync(processed, $"CaptureTop/Inline/{storeName}");
+                                string rawText = await PerformAdaptiveOcrAsync(bitmapCopy, $"CaptureTop/Inline/{storeName}");
                                 ocrResult.GroupName = CleanGroupName(rawText);
                             }
-                        }
-                        catch (Exception ex)
-                        {
-                            ocrResult.GroupName = $"[OCR识别失败: {ex.Message}]";
-                            _logAction?.Invoke($"💥 OCR处理失败 '{storeName}': {ex.Message}");
-                        }
-                        finally
-                        {
-                            onOcrComplete?.Invoke(ocrResult);
+                            catch (Exception ex)
+                            {
+                                ocrResult.GroupName = $"[OCR识别失败: {ex.Message}]";
+                                _logAction?.Invoke($"💥 OCR处理失败 '{storeName}': {ex.Message}");
+                            }
+                            finally
+                            {
+                                onOcrComplete?.Invoke(ocrResult);
+                            }
                         }
                     });
                 }
@@ -1171,11 +1273,8 @@ namespace moshushou
                 {
                     // 依然保持放大策略以确保群名识别准确率 (群名文字通常较小)
                     // 🚀 [优化] 统一使用 PreprocessForOcr
-                    using (var processed = PreprocessForOcr(originalBitmap, 3))
-                    {
-                        string rawText = await PerformOcrAsync(processed, $"CaptureTop/File/{storeName}");
-                        recognizedGroupName = CleanGroupName(rawText);
-                    }
+                    string rawText = await PerformAdaptiveOcrAsync(originalBitmap, $"CaptureTop/File/{storeName}");
+                    recognizedGroupName = CleanGroupName(rawText);
                 } // 离开 using 块，Bitmap 资源释放
 
                 ocrResult.GroupName = recognizedGroupName;
@@ -1214,7 +1313,42 @@ namespace moshushou
 
 
 
-        private async Task<string> PerformOcrAsync(Bitmap bitmap, string traceTag = null, CancellationToken token = default)
+        private ImageOcr GetOrCreateOcrEngine()
+        {
+            lock (_ocrEngineSync)
+            {
+                ObjectDisposedException.ThrowIf(_disposed, this);
+                return _ocrEngine ??= new ImageOcr();
+            }
+        }
+
+        private void ResetOcrEngine(string reason)
+        {
+            ImageOcr? oldEngine;
+            lock (_ocrEngineSync)
+            {
+                oldEngine = _ocrEngine;
+                _ocrEngine = null;
+            }
+
+            if (oldEngine == null) return;
+
+            try
+            {
+                oldEngine.Dispose();
+                LogOcrDebug($"OCR_ENGINE_RESET Reason={reason}");
+            }
+            catch (Exception ex)
+            {
+                LogOcrDebug($"OCR_ENGINE_RESET_WARN Reason={reason}, Error={ex.Message}");
+            }
+        }
+
+        private async Task<OcrRunResult> PerformOcrDetailedAsync(
+            Bitmap bitmap,
+            string? traceTag = null,
+            CancellationToken token = default,
+            int timeoutMs = OCR_TIMEOUT_MS)
         {
             long requestId = Interlocked.Increment(ref _ocrRequestSeq);
             string tag = string.IsNullOrWhiteSpace(traceTag) ? "Generic" : traceTag.Trim();
@@ -1223,131 +1357,189 @@ namespace moshushou
             if (bitmap == null)
             {
                 LogOcrDebug($"#{requestId} FAIL Tag={tag}, Bitmap=null", mirrorToUi: true);
-                return "未识别到文字";
+                return new OcrRunResult();
             }
 
+            bool gateEntered = false;
+            int activeCount = 0;
             int width = bitmap.Width;
             int height = bitmap.Height;
-            var bytes = ImageToBytes(bitmap);
-            int activeCount = Interlocked.Increment(ref _ocrActiveCount);
-            LogOcrDebug($"#{requestId} START Tag={tag}, Size={width}x{height}, Bytes={bytes.Length}, Active={activeCount}, Thread={Environment.CurrentManagedThreadId}");
 
-            var tcs = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
-            var ocr = new ImageOcr();
-            int callbackEntered = 0;
-            int timeoutFlag = 0;
-
-            ocr.Run(bytes, (path, result) =>
+            try
             {
-                long cbDelayMs = totalSw.ElapsedMilliseconds;
-                Interlocked.Exchange(ref callbackEntered, 1);
-                var callbackSw = Stopwatch.StartNew();
+                var queueSw = Stopwatch.StartNew();
+                await _ocrSemaphore.WaitAsync(token);
+                gateEntered = true;
+                long queueMs = queueSw.ElapsedMilliseconds;
+
+                var encodeSw = Stopwatch.StartNew();
+                byte[] bytes = ImageToBytes(bitmap);
+                long encodeMs = encodeSw.ElapsedMilliseconds;
+
+                activeCount = Interlocked.Increment(ref _ocrActiveCount);
+                LogOcrDebug(
+                    $"#{requestId} START Tag={tag}, Size={width}x{height}, Bytes={bytes.Length}, Queue={queueMs}ms, " +
+                    $"Encode={encodeMs}ms, Active={activeCount}, Thread={Environment.CurrentManagedThreadId}");
+
+                var tcs = new TaskCompletionSource<OcrRunResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+                int callbackEntered = 0;
+                int timeoutFlag = 0;
+                ImageOcr ocr = GetOrCreateOcrEngine();
 
                 try
                 {
-                    int itemCount = result?.OcrResult?.SingleResult?.Count ?? 0;
+                    ocr.Run(bytes, (path, result) =>
+                    {
+                        long cbDelayMs = totalSw.ElapsedMilliseconds;
+                        Interlocked.Exchange(ref callbackEntered, 1);
+                        var callbackSw = Stopwatch.StartNew();
+
+                        try
+                        {
+                            int itemCount = result?.OcrResult?.SingleResult?.Count ?? 0;
+                            LogOcrDebug(
+                                $"#{requestId} CALLBACK_BEGIN Tag={tag}, Delay={cbDelayMs}ms, " +
+                                $"TimedOut={(Volatile.Read(ref timeoutFlag) == 1 ? "Y" : "N")}, Items={itemCount}");
+
+                            var regions = new List<OcrTextRegion>(itemCount);
+                            var sb = new StringBuilder();
+
+                            if (result?.OcrResult?.SingleResult != null)
+                            {
+                                foreach (var item in result.OcrResult.SingleResult)
+                                {
+                                    if (item == null || string.IsNullOrEmpty(item.SingleStrUtf8)) continue;
+
+                                    sb.Append(item.SingleStrUtf8);
+                                    regions.Add(new OcrTextRegion
+                                    {
+                                        Text = item.SingleStrUtf8,
+                                        Left = (int)item.Left,
+                                        Top = (int)item.Top,
+                                        Right = (int)item.Right,
+                                        Bottom = (int)item.Bottom
+                                    });
+                                }
+                            }
+
+                            tcs.TrySetResult(new OcrRunResult
+                            {
+                                Text = sb.ToString().Trim(),
+                                Regions = regions
+                            });
+                        }
+                        catch (Exception ex)
+                        {
+                            LogOcrDebug($"#{requestId} CALLBACK_EXCEPTION Tag={tag}, Error={ex.Message}", mirrorToUi: true);
+                            tcs.TrySetException(ex);
+                        }
+                        finally
+                        {
+                            try
+                            {
+                                if (File.Exists(path)) File.Delete(path);
+                            }
+                            catch (Exception fileEx)
+                            {
+                                LogOcrDebug($"#{requestId} CLEANUP_WARN Tag={tag}, DeleteTempFailed={fileEx.Message}");
+                            }
+
+                            LogOcrDebug(
+                                $"#{requestId} CALLBACK_END Tag={tag}, CbCost={callbackSw.ElapsedMilliseconds}ms, Total={totalSw.ElapsedMilliseconds}ms");
+                        }
+                    });
+                }
+                catch
+                {
+                    ResetOcrEngine($"RunException/{tag}");
+                    throw;
+                }
+
+                Task timeoutTask = Task.Delay(timeoutMs);
+                Task? cancelTask = token.CanBeCanceled ? Task.Delay(Timeout.Infinite, token) : null;
+                Task completedTask = cancelTask == null
+                    ? await Task.WhenAny(tcs.Task, timeoutTask)
+                    : await Task.WhenAny(tcs.Task, timeoutTask, cancelTask);
+
+                if (cancelTask != null && completedTask == cancelTask)
+                {
+                    Interlocked.Exchange(ref timeoutFlag, 1);
                     LogOcrDebug(
-                        $"#{requestId} CALLBACK_BEGIN Tag={tag}, Delay={cbDelayMs}ms, TimedOut={(Volatile.Read(ref timeoutFlag) == 1 ? "Y" : "N")}, " +
-                        $"Items={itemCount}, Path={(string.IsNullOrEmpty(path) ? "<null>" : path)}");
-
-                    if (result?.OcrResult?.SingleResult == null)
-                    {
-                        tcs.TrySetResult("未识别到文字");
-                        return;
-                    }
-
-                    var sb = new StringBuilder();
-                    foreach (var item in result.OcrResult.SingleResult)
-                    {
-                        if (item != null && !string.IsNullOrEmpty(item.SingleStrUtf8))
-                        {
-                            sb.Append(item.SingleStrUtf8);
-                        }
-                    }
-
-                    string finalText = sb.ToString().Trim();
-                    tcs.TrySetResult(finalText);
+                        $"#{requestId} CANCELED Tag={tag}, Waited={totalSw.ElapsedMilliseconds}ms, " +
+                        $"CallbackEntered={(Volatile.Read(ref callbackEntered) == 1 ? "Y" : "N")}",
+                        mirrorToUi: true);
+                    ResetOcrEngine($"Canceled/{tag}");
+                    return new OcrRunResult { Canceled = true };
                 }
-                catch (Exception ex)
-                {
-                    LogOcrDebug($"#{requestId} CALLBACK_EXCEPTION Tag={tag}, Error={ex.Message}", mirrorToUi: true);
-                    tcs.TrySetException(ex);
-                }
-                finally
-                {
-                    try
-                    {
-                        if (File.Exists(path))
-                        {
-                            File.Delete(path);
-                        }
-                    }
-                    catch (Exception fileEx)
-                    {
-                        LogOcrDebug($"#{requestId} CLEANUP_WARN Tag={tag}, DeleteTempFailed={fileEx.Message}");
-                    }
 
+                if (completedTask == timeoutTask)
+                {
+                    Interlocked.Exchange(ref timeoutFlag, 1);
+                    LogOcrDebug(
+                    $"#{requestId} TIMEOUT Tag={tag}, Waited={totalSw.ElapsedMilliseconds}ms, " +
+                        $"CallbackEntered={(Volatile.Read(ref callbackEntered) == 1 ? "Y" : "N")}, Size={width}x{height}, Bytes={bytes.Length}",
+                        mirrorToUi: true);
+                    ResetOcrEngine($"Timeout/{tag}");
+                    return new OcrRunResult { TimedOut = true };
+                }
+
+                OcrRunResult ocrResult = await tcs.Task;
+                LogOcrDebug(
+                    $"#{requestId} DONE Tag={tag}, Total={totalSw.ElapsedMilliseconds}ms, TextLen={ocrResult.Text.Length}, Regions={ocrResult.Regions.Count}");
+                return ocrResult;
+            }
+            catch (OperationCanceledException)
+            {
+                return new OcrRunResult { Canceled = true };
+            }
+            finally
+            {
+                if (activeCount > 0)
+                {
                     int remain = Interlocked.Decrement(ref _ocrActiveCount);
-                    LogOcrDebug(
-                        $"#{requestId} CALLBACK_END Tag={tag}, CbCost={callbackSw.ElapsedMilliseconds}ms, Total={totalSw.ElapsedMilliseconds}ms, Active={remain}");
+                    LogOcrDebug($"#{requestId} RELEASE Tag={tag}, Active={remain}, Total={totalSw.ElapsedMilliseconds}ms");
                 }
-            });
 
-            // 设置超时 + 取消等待，防止 OCR 回调长时间未返回
-            Task timeoutTask = Task.Delay(8000);
-            Task? cancelTask = null;
-            Task completedTask;
-            if (token.CanBeCanceled)
-            {
-                cancelTask = Task.Delay(Timeout.Infinite, token);
-                completedTask = await Task.WhenAny(tcs.Task, timeoutTask, cancelTask);
+                if (gateEntered) _ocrSemaphore.Release();
             }
-            else
-            {
-                completedTask = await Task.WhenAny(tcs.Task, timeoutTask);
-            }
+        }
 
-            if (cancelTask != null && completedTask == cancelTask)
-            {
-                Interlocked.Exchange(ref timeoutFlag, 1);
-                LogOcrDebug(
-                    $"#{requestId} CANCELED Tag={tag}, Waited={totalSw.ElapsedMilliseconds}ms, CallbackEntered={(Volatile.Read(ref callbackEntered) == 1 ? "Y" : "N")}, " +
-                    $"Active={Volatile.Read(ref _ocrActiveCount)}, Size={width}x{height}, Bytes={bytes.Length}",
-                    mirrorToUi: true);
-                return "OCR识别取消";
-            }
+        private async Task<string> PerformOcrAsync(Bitmap bitmap, string? traceTag = null, CancellationToken token = default)
+        {
+            OcrRunResult result = await PerformOcrDetailedAsync(bitmap, traceTag, token);
+            if (result.Canceled) return "OCR识别取消";
+            if (result.TimedOut) return "OCR识别超时";
+            return string.IsNullOrWhiteSpace(result.Text) ? "未识别到文字" : result.Text;
+        }
 
-            if (completedTask == timeoutTask)
+        private async Task<string> PerformAdaptiveOcrAsync(Bitmap bitmap, string traceTag, CancellationToken token = default)
+        {
+            int fastScale = GetRecommendedOcrScale(bitmap);
+            using (var processed = PreprocessForOcr(bitmap, fastScale, highQuality: false))
             {
-                Interlocked.Exchange(ref timeoutFlag, 1);
-                LogOcrDebug(
-                    $"#{requestId} TIMEOUT Tag={tag}, Waited={totalSw.ElapsedMilliseconds}ms, CallbackEntered={(Volatile.Read(ref callbackEntered) == 1 ? "Y" : "N")}, " +
-                    $"Active={Volatile.Read(ref _ocrActiveCount)}, Size={width}x{height}, Bytes={bytes.Length}",
-                    mirrorToUi: true);
-
-                _ = tcs.Task.ContinueWith(t =>
+                string text = await PerformOcrAsync(processed, $"{traceTag}/S{fastScale}", token);
+                if (!ShouldRetryOcr(text) || fastScale >= 3 || token.IsCancellationRequested)
                 {
-                    if (t.IsFaulted)
-                    {
-                        LogOcrDebug($"#{requestId} LATE_COMPLETION Tag={tag}, State=Faulted, Total={totalSw.ElapsedMilliseconds}ms");
-                    }
-                    else if (t.IsCanceled)
-                    {
-                        LogOcrDebug($"#{requestId} LATE_COMPLETION Tag={tag}, State=Canceled, Total={totalSw.ElapsedMilliseconds}ms");
-                    }
-                    else
-                    {
-                        LogOcrDebug(
-                            $"#{requestId} LATE_COMPLETION Tag={tag}, State=Success, Total={totalSw.ElapsedMilliseconds}ms, TextLen={t.Result?.Length ?? 0}");
-                    }
-                }, TaskScheduler.Default);
-
-                return "OCR识别超时";
+                    return text;
+                }
             }
 
-            string text = await tcs.Task;
-            LogOcrDebug($"#{requestId} DONE Tag={tag}, Total={totalSw.ElapsedMilliseconds}ms, TextLen={text?.Length ?? 0}");
-            return text;
+            using (var fallback = PreprocessForOcr(bitmap, 3, highQuality: true))
+            {
+                return await PerformOcrAsync(fallback, $"{traceTag}/S3Fallback", token);
+            }
+        }
+
+        private static bool ShouldRetryOcr(string? text)
+        {
+            return string.IsNullOrWhiteSpace(text) || string.Equals(text, "未识别到文字", StringComparison.Ordinal);
+        }
+
+        private static int GetRecommendedOcrScale(Bitmap bitmap)
+        {
+            if (bitmap.Height >= 96) return 1;
+            if (bitmap.Height >= 36) return 2;
+            return 3;
         }
 
         #region 辅助方法
@@ -1446,9 +1638,10 @@ namespace moshushou
                 Bitmap finalBitmap = null;
                 int finalScreenX = 0, finalScreenY = 0;
                 
-                const int stableFrameCount = 3; // 连续检测 3 帧
-                
-                for (int i = 0; i < stableFrameCount; i++)
+                const int maxStableFrameCount = 3;
+                const float singleFrameFastConfidence = 0.65f;
+
+                for (int i = 0; i < maxStableFrameCount; i++)
                 {
                     if (targetHwnd == IntPtr.Zero || !GetWindowRect(targetHwnd, out RECT rect)) 
                     {
@@ -1495,7 +1688,7 @@ namespace moshushou
                     // string frameRawPath = SaveDebugRawImage(bitmap, framePrefix);
                     // string frameAnnPath = SaveDebugAnnotatedImage(bitmap, results, framePrefix);
                     string frameSummary = BuildDetectionSummary(currentFrameTargets.Select(x => x.r), 10);
-                    System.Diagnostics.Debug.WriteLine($"[SearchOCR] 帧{i + 1}/{stableFrameCount}: 候选={currentFrameTargets.Count}, 明细={frameSummary}");
+                    System.Diagnostics.Debug.WriteLine($"[SearchOCR] 帧{i + 1}/{maxStableFrameCount}: 候选={currentFrameTargets.Count}, 明细={frameSummary}");
                     // [已禁用] Debug_Yolo 调试图日志
                     // if (!string.IsNullOrEmpty(frameRawPath) || !string.IsNullOrEmpty(frameAnnPath))
                     // {
@@ -1504,25 +1697,38 @@ namespace moshushou
                     
                     frameResults.Add(currentFrameTargets);
 
-                    // 如果是最后一帧，保留 Bitmap 用于后续 OCR 和坐标计算
-                    if (i == stableFrameCount - 1)
+                    bool singleFrameFastPath = i == 0 &&
+                                               currentFrameTargets.Count == 1 &&
+                                               currentFrameTargets[0].r.Confidence >= singleFrameFastConfidence;
+                    bool stableAfterMultipleFrames = i > 0 && currentFrameTargets.Any(candidate =>
+                        frameResults.Take(frameResults.Count - 1).Any(previousFrame =>
+                            previousFrame.Any(previous => IsSameDetection(
+                                candidate.r,
+                                candidate.Item2,
+                                previous.Result,
+                                previous.ScreenBBox))));
+                    bool keepCurrentFrame = singleFrameFastPath || stableAfterMultipleFrames || i == maxStableFrameCount - 1;
+
+                    // 高置信度单目标走单帧；低置信度目标在两帧稳定后提前结束；仅不稳定场景取第三帧。
+                    if (keepCurrentFrame)
                     {
                         finalBitmap = bitmap;
                         finalScreenX = screenX;
                         finalScreenY = screenY;
+                        System.Diagnostics.Debug.WriteLine(
+                            $"[SearchOCR] 自适应取帧结束: Captured={frameResults.Count}, " +
+                            $"FastPath={singleFrameFastPath}, Stable={stableAfterMultipleFrames}");
+                        break;
                     }
                     else
                     {
                         bitmap.Dispose();
-                        // 帧间隔 (移除延迟，全速检测)
-                        // await Task.Delay(5);
                     }
                 }
 
                 using (finalBitmap) // 确保 verify 完后释放
                 {
                     // --- 稳定性分析 ---
-                    // 必须在最后一帧 (Index=2) 有结果，且该结果在之前的帧 (Index=0,1) 中出现过至少 1 次 (共命中 >=2 帧)
                     var lastFrameTargets = frameResults.Last();
                     if (lastFrameTargets.Count == 0)
                     {
@@ -1538,29 +1744,24 @@ namespace moshushou
                         int appearanceCount = 1; // 最后一帧已出现
                         
                         // 在前几帧中查找匹配 (基于 IoU 或 中心距离)
-                        for (int i = 0; i < stableFrameCount - 1; i++)
+                        for (int i = 0; i < frameResults.Count - 1; i++)
                         {
                             var prevTargets = frameResults[i];
-                            bool matchFound = prevTargets.Any(prev => 
-                            {
-                                // 简单判定：中心点距离 < 30px 且 标签一致
-                                int cx1 = candidate.ScreenBBox.X + candidate.ScreenBBox.Width / 2;
-                                int cy1 = candidate.ScreenBBox.Y + candidate.ScreenBBox.Height / 2;
-                                int cx2 = prev.ScreenBBox.X + prev.ScreenBBox.Width / 2;
-                                int cy2 = prev.ScreenBBox.Y + prev.ScreenBBox.Height / 2;
-                                double dist = Math.Sqrt(Math.Pow(cx1 - cx2, 2) + Math.Pow(cy1 - cy2, 2));
-                                return dist < 30 && prev.Result.LabelName == candidate.Result.LabelName;
-                            });
+                            bool matchFound = prevTargets.Any(prev => IsSameDetection(
+                                candidate.Result,
+                                candidate.ScreenBBox,
+                                prev.Result,
+                                prev.ScreenBBox));
 
                             if (matchFound) appearanceCount++;
                         }
 
                         System.Diagnostics.Debug.WriteLine(
                             $"[SearchOCR] 稳定性候选: Label={candidate.Result.LabelName}, Conf={candidate.Result.Confidence:F2}, " +
-                            $"ScreenBBox={BuildBboxText(candidate.ScreenBBox)}, Appear={appearanceCount}/{stableFrameCount}");
+                            $"ScreenBBox={BuildBboxText(candidate.ScreenBBox)}, Appear={appearanceCount}/{frameResults.Count}");
 
-                        // 判据：至少出现 2 次
-                        if (appearanceCount >= 2)
+                        int requiredAppearanceCount = frameResults.Count == 1 ? 1 : 2;
+                        if (appearanceCount >= requiredAppearanceCount)
                         {
                             if (candidate.Result.Confidence > bestConfidence)
                             {
@@ -1588,49 +1789,42 @@ namespace moshushou
                     {
                         g.DrawImage(finalBitmap, new Rectangle(0, 0, bbox.Width, bbox.Height), bbox, GraphicsUnit.Pixel);
                         
-                        using (var processed = PreprocessForOcr(crop, 3)) 
+                        string ocrText = await PerformAdaptiveOcrAsync(crop, $"SearchVerify/{expectedToken}");
+                        bool match = IsFuzzyMatch(expectedText, ocrText);
+                        System.Diagnostics.Debug.WriteLine(
+                            $"🔍 [FindAndVerify] OCR候选: Label={target.Result.LabelName}, Conf={target.Result.Confidence:F2}, " +
+                            $"BBox={BuildBboxText(bbox)}, OCR='{ocrText}', Expected='{expected}', Match={match}");
+
+                        if (match)
                         {
-                            // [已禁用] Debug_Yolo 调试图保存
-                            // string cropRawPath = SaveDebugRawImage(crop, $"SearchCropRaw_{(isWework ? "WeWork" : "WeChat")}_{expectedToken}");
-                            // string cropProcessedPath = SaveDebugRawImage(processed, $"SearchCropProcessed_{(isWework ? "WeWork" : "WeChat")}_{expectedToken}");
-
-                            string ocrText = await PerformOcrAsync(processed, $"SearchVerify/{expectedToken}");
-                            bool match = IsFuzzyMatch(expectedText, ocrText);
-                            System.Diagnostics.Debug.WriteLine(
-                                $"🔍 [FindAndVerify] OCR候选: Label={target.Result.LabelName}, Conf={target.Result.Confidence:F2}, " +
-                                $"BBox={BuildBboxText(bbox)}, OCR='{ocrText}', Expected='{expected}', Match={match}");
-
-                            if (match)
-                            {
-                                System.Diagnostics.Debug.WriteLine($"✅ [FindAndVerify] 文本匹配成功: '{expectedText}'");
+                            System.Diagnostics.Debug.WriteLine($"✅ [FindAndVerify] 文本匹配成功: '{expectedText}'");
                                 
-                                int marginX = (int)(bbox.Width * 0.2);
-                                int marginY = (int)(bbox.Height * 0.2);
-                                if (marginX < 2) marginX = 2;
-                                if (marginY < 2) marginY = 2;
+                            int marginX = (int)(bbox.Width * 0.2);
+                            int marginY = (int)(bbox.Height * 0.2);
+                            if (marginX < 2) marginX = 2;
+                            if (marginY < 2) marginY = 2;
 
-                                int safeW = bbox.Width - 2 * marginX;
-                                int safeH = bbox.Height - 2 * marginY;
+                            int safeW = bbox.Width - 2 * marginX;
+                            int safeH = bbox.Height - 2 * marginY;
                                 
-                                if (safeW <= 0) safeW = 1;
-                                if (safeH <= 0) safeH = 1;
+                            if (safeW <= 0) safeW = 1;
+                            if (safeH <= 0) safeH = 1;
 
-                                Random rnd = new Random();
-                                int offsetX = marginX + rnd.Next(0, safeW);
-                                int offsetY = marginY + rnd.Next(0, safeH);
+                            Random rnd = new Random();
+                            int offsetX = marginX + rnd.Next(0, safeW);
+                            int offsetY = marginY + rnd.Next(0, safeH);
 
-                                int clickX = finalScreenX + bbox.X + offsetX;
-                                int clickY = finalScreenY + bbox.Y + offsetY;
+                            int clickX = finalScreenX + bbox.X + offsetX;
+                            int clickY = finalScreenY + bbox.Y + offsetY;
 
-                                var matchedScreenBBox = new Rectangle(
-                                    finalScreenX + bbox.X,
-                                    finalScreenY + bbox.Y,
-                                    bbox.Width,
-                                    bbox.Height
-                                );
+                            var matchedScreenBBox = new Rectangle(
+                                finalScreenX + bbox.X,
+                                finalScreenY + bbox.Y,
+                                bbox.Width,
+                                bbox.Height
+                            );
 
-                                return (true, new Point(clickX, clickY), matchedScreenBBox);
-                            }
+                            return (true, new Point(clickX, clickY), matchedScreenBBox);
                         }
                     }
 
@@ -1737,16 +1931,13 @@ namespace moshushou
                         using (var g = Graphics.FromImage(crop))
                         {
                             g.DrawImage(bitmap, new Rectangle(0, 0, bbox.Width, bbox.Height), bbox, GraphicsUnit.Pixel);
-                            using (var processed = PreprocessForOcr(crop, 3))
+                            string ocrText = await PerformAdaptiveOcrAsync(crop, $"ValidatePoint/{expectedToken}");
+                            bool match = IsFuzzyMatch(expectedText, ocrText);
+                            System.Diagnostics.Debug.WriteLine($"🔍 [ValidatePoint] 候选 OCR:'{ocrText}' -> {(match ? "✅ 匹配" : "❌ 不匹配")}");
+                            if (match)
                             {
-                                string ocrText = await PerformOcrAsync(processed, $"ValidatePoint/{expectedToken}");
-                                bool match = IsFuzzyMatch(expectedText, ocrText);
-                                System.Diagnostics.Debug.WriteLine($"🔍 [ValidatePoint] 候选 OCR:'{ocrText}' -> {(match ? "✅ 匹配" : "❌ 不匹配")}");
-                                if (match)
-                                {
-                                    System.Diagnostics.Debug.WriteLine($"✅ [ValidatePoint] 点击点二次校验通过: ({screenPoint.X},{screenPoint.Y})");
-                                    return true;
-                                }
+                                System.Diagnostics.Debug.WriteLine($"✅ [ValidatePoint] 点击点二次校验通过: ({screenPoint.X},{screenPoint.Y})");
+                                return true;
                             }
                         }
                     }
@@ -1804,51 +1995,17 @@ namespace moshushou
                     // OCR
                     using (var scaled = ScaleImage(bitmap, 2)) // 2倍放大通常够了
                     {
-                         string ocrText = await PerformOcrAsync(scaled, $"FindKeyword/{keyword}");
-                         // TODO: 这里 PerformOcrAsync 返回的是拼接字符串，我们需要坐标信息
-                         // 因此 PerformOcrAsync 需要修改，或者我们需要直接调用 ImageOcr 返回详细结果
-                         // 为了不破坏现有结构，直接在这里实例化 ImageOcr
-                         
-                         var tcs = new TaskCompletionSource<Point?>(TaskCreationOptions.RunContinuationsAsynchronously);
-                         var bytes = ImageToBytes(scaled);
-                         var ocr = new ImageOcr();
-                         
-                         ocr.Run(bytes, (path, result) => 
-                         {
-                             try 
-                             {
-                                 if (result?.OcrResult?.SingleResult != null)
-                                 {
-                                     foreach(var item in result.OcrResult.SingleResult)
-                                     {
-                                         if (!string.IsNullOrEmpty(item.SingleStrUtf8) && 
-                                             IsFuzzyMatch(keyword, item.SingleStrUtf8))
-                                         {
-                                             // 找到目标！
-                                             // 坐标转换回屏幕坐标 (注意 Scale 2.0)
-                                             float centerX = (item.Left + item.Right) / 2.0f / 2.0f;
-                                             float centerY = (item.Top + item.Bottom) / 2.0f / 2.0f;
-                                             
-                                             int finalX = screenX + (int)centerX;
-                                             int finalY = screenY + (int)centerY;
-                                             
-                                             tcs.TrySetResult(new Point(finalX, finalY));
-                                             return;
-                                         }
-                                     }
-                                 }
-                                 tcs.TrySetResult(null);
-                             }
-                             catch(Exception ex) { tcs.TrySetException(ex); }
-                             finally 
-                             {
-                                 try { if (File.Exists(path)) File.Delete(path); } catch { }
-                             }
-                         });
-                         
-                         await Task.WhenAny(tcs.Task, Task.Delay(5000));
-                         if (tcs.Task.IsCompleted) return await tcs.Task;
-                         return null;
+                        OcrRunResult ocrResult = await PerformOcrDetailedAsync(
+                            scaled,
+                            $"FindKeyword/{keyword}",
+                            timeoutMs: 5000);
+
+                        OcrTextRegion? match = ocrResult.Regions.FirstOrDefault(item => IsFuzzyMatch(keyword, item.Text));
+                        if (match == null) return null;
+
+                        int finalX = screenX + (match.Left + match.Right) / 4;
+                        int finalY = screenY + (match.Top + match.Bottom) / 4;
+                        return new Point(finalX, finalY);
                     }
                 }
             }
@@ -1903,7 +2060,11 @@ namespace moshushou
                     // _logAction?.Invoke($"🖼️ YOLO 识别图已存: {debugFile}");
 
                     // 3. 筛选 "在线文档"
-                    var popupRect = _yoloDetector.FindOnlineDocPopupBBox(bitmap);
+                    var popupRect = yoloResults
+                        .Where(r => r.LabelName == YoloWindowDetector.Label_OnlineDoc)
+                        .OrderByDescending(r => r.Confidence)
+                        .Select(r => (Rectangle?)r.BBox)
+                        .FirstOrDefault();
                     
                     if (popupRect.HasValue)
                     {
@@ -1914,55 +2075,17 @@ namespace moshushou
                         using (var crop = bitmap.Clone(rectVal, bitmap.PixelFormat))
                         using (var scaled = ScaleImage(crop, 2)) // 2倍放大 OCR
                         {
-                            var tcs = new TaskCompletionSource<Point?>(TaskCreationOptions.RunContinuationsAsynchronously);
-                            var bytes = ImageToBytes(scaled);
-                            var ocr = new ImageOcr();
-
-                            try
+                            OcrRunResult ocrResult = await PerformOcrDetailedAsync(
+                                scaled,
+                                $"FindPopup/{keyword}",
+                                timeoutMs: 3000);
+                            OcrTextRegion? match = ocrResult.Regions.FirstOrDefault(item => IsFuzzyMatch(keyword, item.Text));
+                            if (match != null)
                             {
-                                ocr.Run(bytes, (path, result) =>
-                                {
-                                    try
-                                    {
-                                        if (result?.OcrResult?.SingleResult != null)
-                                        {
-                                            foreach (var item in result.OcrResult.SingleResult)
-                                            {
-                                                if (!string.IsNullOrEmpty(item.SingleStrUtf8) &&
-                                                    IsFuzzyMatch("使用原文件", item.SingleStrUtf8))
-                                                {
-                                                    // 找到文字！
-                                                    // 坐标转换: OCR坐标 -> crop坐标 -> 全图坐标 -> 屏幕坐标
-                                                    float centerX = (item.Left + item.Right) / 2.0f / 2.0f; // /2.0f 因为缩放了2倍
-                                                    float centerY = (item.Top + item.Bottom) / 2.0f / 2.0f;
-
-                                                    int finalX = screenX + rectVal.X + (int)centerX;
-                                                    int finalY = screenY + rectVal.Y + (int)centerY;
-
-                                                    _logAction?.Invoke($"🎯 OCR 精确定位 '使用原文件': ({finalX}, {finalY})");
-                                                    tcs.TrySetResult(new Point(finalX, finalY));
-                                                    return;
-                                                }
-                                            }
-                                        }
-                                        tcs.TrySetResult(null);
-                                    }
-                                    catch (Exception ex) { tcs.TrySetException(ex); }
-                                    finally
-                                    {
-                                        try { if (File.Exists(path)) File.Delete(path); } catch { }
-                                    }
-                                });
-
-                                await Task.WhenAny(tcs.Task, Task.Delay(3000));
-                                if (tcs.Task.IsCompleted && tcs.Task.Result != null)
-                                {
-                                    return tcs.Task.Result;
-                                }
-                            }
-                            catch (Exception ex)
-                            {
-                                _logAction?.Invoke($"⚠️ OCR 识别异常: {ex.Message}");
+                                int finalX = screenX + rectVal.X + (match.Left + match.Right) / 4;
+                                int finalY = screenY + rectVal.Y + (match.Top + match.Bottom) / 4;
+                                _logAction?.Invoke($"🎯 OCR 精确定位 '{keyword}': ({finalX}, {finalY})");
+                                return new Point(finalX, finalY);
                             }
                         }
                         
@@ -2043,35 +2166,28 @@ namespace moshushou
                     if (!string.IsNullOrEmpty(targetGroupName))
                     {
                         _logAction?.Invoke($"🔍 目标群聊: '{targetGroupName}'，尝试 OCR 匹配...");
-                         foreach (var target in targets)
+                        foreach (var target in targets)
                         {
                             var bbox = target.BBox;
                             using (var crop = new Bitmap(bbox.Width, bbox.Height))
                             using (var g = Graphics.FromImage(crop))
                             {
                                 g.DrawImage(bitmap, new Rectangle(0, 0, bbox.Width, bbox.Height), bbox, GraphicsUnit.Pixel);
-                                // 🚀 [优化] 统一使用 PreprocessForOcr，解决纯数字识别难点
-                                using (var processed = PreprocessForOcr(crop, 3))
+                                string ocrText = await PerformAdaptiveOcrAsync(crop, $"FindGroup/{targetGroupName ?? "Auto"}");
+                                bool match = IsFuzzyMatch(targetGroupName, ocrText);
+
+                                _logAction?.Invoke($"   - [{target.LabelName}] OCR:'{ocrText}' -> {(match ? "✅ 匹配" : "❌ 忽略")}");
+
+                                if (match)
                                 {
-                                    string ocrText = await PerformOcrAsync(processed, $"FindGroup/{targetGroupName ?? "Auto"}");
-                                    bool match = IsFuzzyMatch(targetGroupName, ocrText);
-                                    
-                                    _logAction?.Invoke($"   - [{target.LabelName}] OCR:'{ocrText}' -> {(match ? "✅ 匹配" : "❌ 忽略")}");
-                                    
-                                    if (match)
-                                    {
-                                         // 🚀 [优化] 随机点
-                                     int mX = (int)(bbox.Width * 0.2);
-                                     int mY = (int)(bbox.Height * 0.2);
-                                     if (mX < 2) mX = 2;
-                                     if (mY < 2) mY = 2;
-                                     int sW = bbox.Width - 2 * mX; if (sW <= 0) sW = 1;
-                                     int sH = bbox.Height - 2 * mY; if (sH <= 0) sH = 1;
-                                     
-                                     Random rnd = new Random();
-                                     return new Point(screenX + bbox.X + mX + rnd.Next(0, sW), 
-                                                      screenY + bbox.Y + mY + rnd.Next(0, sH));
-                                    }
+                                    int mX = Math.Max(2, (int)(bbox.Width * 0.2));
+                                    int mY = Math.Max(2, (int)(bbox.Height * 0.2));
+                                    int sW = Math.Max(1, bbox.Width - 2 * mX);
+                                    int sH = Math.Max(1, bbox.Height - 2 * mY);
+
+                                    return new Point(
+                                        screenX + bbox.X + mX + Random.Shared.Next(0, sW),
+                                        screenY + bbox.Y + mY + Random.Shared.Next(0, sH));
                                 }
                             }
                         }
@@ -2135,76 +2251,26 @@ namespace moshushou
                 using (var bitmap = new Bitmap(width, height, PixelFormat.Format32bppArgb))
                 {
                     using (var g = Graphics.FromImage(bitmap)) { g.CopyFromScreen(screenX, screenY, 0, 0, new Size(width, height), CopyPixelOperation.SourceCopy); }
-                    
-                    byte[] bytes;
-                    using (var ms = new MemoryStream()) { bitmap.Save(ms, ImageFormat.Png); bytes = ms.ToArray(); }
 
-                    var tcs = new TaskCompletionSource<System.Drawing.Point?>();
-                    var ocr = new ImageOcr(); // ✅ Fix: Instantiate local ocr
+                    OcrRunResult ocrResult = await PerformOcrDetailedAsync(
+                        bitmap,
+                        $"FindStructure/{anchorKeyword}",
+                        timeoutMs: 2000);
+                    OcrTextRegion? anchorItem = ocrResult.Regions.FirstOrDefault(item =>
+                        item.Text.Contains(anchorKeyword, StringComparison.OrdinalIgnoreCase));
+                    if (anchorItem == null) return null;
 
-                    ocr.Run(bytes, (path, result) =>
-                    {
-                        try
-                        {
-                            if (result?.OcrResult?.SingleResult != null)
-                            {
-                                var items = result.OcrResult.SingleResult;
-                                dynamic anchorItem = null;
-                                foreach (var item in items)
-                                {
-                                    if (item != null && !string.IsNullOrEmpty(item.SingleStrUtf8) && item.SingleStrUtf8.Contains(anchorKeyword))
-                                    {
-                                        anchorItem = item;
-                                        break;
-                                    }
-                                }
+                    OcrTextRegion? targetItem = ocrResult.Regions
+                        .Where(item => !ReferenceEquals(item, anchorItem))
+                        .Where(item => item.Top > anchorItem.Bottom && item.Top < anchorItem.Bottom + 150)
+                        .OrderBy(item => item.Top - anchorItem.Bottom)
+                        .FirstOrDefault();
+                    if (targetItem == null) return null;
 
-                                if (anchorItem != null)
-                                {
-                                    int anchorBottom = (int)anchorItem.Bottom;
-
-                                    dynamic targetItem = null;
-                                    int minDistance = int.MaxValue;
-
-                                    foreach (var item in items)
-                                    {
-                                        if (item == anchorItem) continue;
-                                        if (string.IsNullOrEmpty(item.SingleStrUtf8)) continue;
-
-                                        int itemTop = (int)item.Top;
-
-                                        // 垂直判定: 在下方且距离不远
-                                        if (itemTop > anchorBottom && itemTop < anchorBottom + 150)
-                                        {
-                                            int distance = itemTop - anchorBottom;
-                                            if (distance < minDistance)
-                                            {
-                                                targetItem = item;
-                                                minDistance = distance;
-                                            }
-                                        }
-                                    }
-
-                                    if (targetItem != null)
-                                    {
-                                        int itemX = (int)(targetItem.Left + (targetItem.Right - targetItem.Left) / 2);
-                                        int itemY = (int)(targetItem.Top + (targetItem.Bottom - targetItem.Top) / 2);
-                                        int centerX = screenX + itemX;
-                                        int centerY = screenY + itemY;
-                                        _logAction?.Invoke($"✅ [FindStructure] Found target below '{anchorKeyword}' -> '{targetItem.SingleStrUtf8}'");
-                                        tcs.TrySetResult(new System.Drawing.Point(centerX, centerY));
-                                        return;
-                                    }
-                                }
-                            }
-                            tcs.TrySetResult(null);
-                        }
-                        catch (Exception ex) { tcs.TrySetException(ex); }
-                        finally { try { if (File.Exists(path)) File.Delete(path); } catch {} }
-                    });
-
-                    if (await Task.WhenAny(tcs.Task, Task.Delay(2000)) == tcs.Task) return await tcs.Task;
-                    return null;
+                    int centerX = screenX + (targetItem.Left + targetItem.Right) / 2;
+                    int centerY = screenY + (targetItem.Top + targetItem.Bottom) / 2;
+                    _logAction?.Invoke($"✅ [FindStructure] Found target below '{anchorKeyword}' -> '{targetItem.Text}'");
+                    return new System.Drawing.Point(centerX, centerY);
                 }
             }
             catch (Exception ex)
@@ -2376,6 +2442,22 @@ namespace moshushou
 
         public void Dispose()
         {
+            ImageOcr? ocrToDispose;
+            lock (_ocrEngineSync)
+            {
+                if (_disposed) return;
+                _disposed = true;
+                ocrToDispose = _ocrEngine;
+                _ocrEngine = null;
+            }
+
+            try { ocrToDispose?.Dispose(); } catch { }
+
+            lock (_detectionCacheSync)
+            {
+                _detectionCache = null;
+            }
+
             _yoloDetector?.Dispose();
         }
         
@@ -2415,29 +2497,38 @@ namespace moshushou
         /// <summary>
         /// ✅ [图像预处理] 放大并添加白边，提升 OCR 识别率
         /// </summary>
-        private Bitmap PreprocessForOcr(Bitmap original, int scaleFactor)
+        private Bitmap PreprocessForOcr(Bitmap original, int scaleFactor, bool highQuality = false)
         {
+            const int maxLongEdge = 1800;
+            scaleFactor = Math.Clamp(scaleFactor, 1, 3);
+            int originalLongEdge = Math.Max(original.Width, original.Height);
+            if (originalLongEdge > 0 && originalLongEdge * scaleFactor > maxLongEdge)
+            {
+                scaleFactor = Math.Max(1, maxLongEdge / originalLongEdge);
+            }
+
             int newWidth = original.Width * scaleFactor;
             int newHeight = original.Height * scaleFactor;
-            
-            // 添加 padding (每边 20px)
-            int padding = 20;
+
+            // 小图保留适量白边，避免边缘字符被检测器裁掉。
+            int padding = scaleFactor >= 3 ? 16 : 12;
             int paddedWidth = newWidth + padding * 2;
             int paddedHeight = newHeight + padding * 2;
 
-            var processed = new Bitmap(paddedWidth, paddedHeight, PixelFormat.Format32bppArgb); // 使用 32bppArgb 并在 Graphics 中填充白色背景
+            var processed = new Bitmap(paddedWidth, paddedHeight, PixelFormat.Format24bppRgb);
             
             using (var g = Graphics.FromImage(processed))
             {
-                // 1. 填充纯白背景 (防止透明背景导致的 OCR 干扰)
                 g.Clear(Color.White);
-
-                // 2. 高质量插值放大
-                g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
-                g.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.HighQuality;
-                g.CompositingQuality = System.Drawing.Drawing2D.CompositingQuality.HighQuality;
-
-                // 3. 绘制到中心
+                g.InterpolationMode = highQuality
+                    ? System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic
+                    : System.Drawing.Drawing2D.InterpolationMode.Bilinear;
+                g.PixelOffsetMode = highQuality
+                    ? System.Drawing.Drawing2D.PixelOffsetMode.HighQuality
+                    : System.Drawing.Drawing2D.PixelOffsetMode.Half;
+                g.CompositingQuality = highQuality
+                    ? System.Drawing.Drawing2D.CompositingQuality.HighQuality
+                    : System.Drawing.Drawing2D.CompositingQuality.HighSpeed;
                 g.DrawImage(original, new Rectangle(padding, padding, newWidth, newHeight));
             }
             

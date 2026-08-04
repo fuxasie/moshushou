@@ -18,8 +18,7 @@ using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Interop;
 using System.Windows.Media;
-using WindowsInput;
-using WindowsInput.Native;
+using moshushou.Input;
 
 namespace moshushou
 {
@@ -56,7 +55,7 @@ namespace moshushou
         private int _suppressSelectionOsdCount = 0;
         private bool _ctrlSpaceFallbackActive = false;
 
-        // ✅ 低级键盘钩子：追踪物理 Ctrl 键状态（不受 SendInput 注入事件影响）
+        // ✅ 低级键盘钩子：追踪物理 Ctrl 键状态（排除 SendInput 和本程序 Virtual HID 事件）
         private volatile bool _physicalCtrlPressed = false;
         private IntPtr _keyboardHookHandle = IntPtr.Zero;
         private LowLevelKeyboardProc _keyboardHookDelegate;
@@ -135,7 +134,7 @@ namespace moshushou
         private SearchHelper _searchHelper;
 
         private int _searchInProgress = 0; // ✅ 改用 int 配合 Interlocked
-        private readonly InputSimulator _inputSimulator;
+        private readonly IInputBackend _inputBackend;
 
         private bool _currentItemPasted = false;
         private string _lastPastedStoreName = null;
@@ -340,7 +339,6 @@ namespace moshushou
         {
             InitializeComponent();
             DebugLogManager.Initialize();
-            _inputSimulator = new InputSimulator();
 
             LoadBusinessInfo();
 
@@ -365,6 +363,13 @@ namespace moshushou
             _exportDirectory = Path.Combine(baseDir, "ExportedFiles");
 
             _searchConfig = SearchConfig.Load();
+            DriverInstallationManager.EnsureVirtualHidInstalled(_searchConfig);
+            _inputBackend = InputBackendFactory.Create(_searchConfig, message =>
+            {
+                DebugLogManager.Log("Input", message);
+                Debug.WriteLine($"[Input] {message}");
+            });
+            MouseHelper.Configure(_inputBackend);
             _activeTailMessage = _searchConfig?.FixedMessage ?? string.Empty;
             EmitRecentStoreHistoryToDebugLog();
 
@@ -377,7 +382,7 @@ namespace moshushou
                 });
             });
 
-            _searchHelper = new SearchHelper(_searchConfig, (msg) =>
+            _searchHelper = new SearchHelper(_searchConfig, _inputBackend, (msg) =>
             {
                 DebugLogManager.Log("Search", msg);
                 Application.Current.Dispatcher.Invoke(() =>
@@ -424,6 +429,14 @@ namespace moshushou
         {
             UnregisterGlobalHotkeys();
             UninstallKeyboardHook();
+            try
+            {
+                _inputBackend.ReleaseAll();
+                _inputBackend.Dispose();
+            }
+            catch
+            {
+            }
             if (_source != null)
             {
                 _source.RemoveHook(HwndHook);
@@ -432,12 +445,21 @@ namespace moshushou
             }
         }
 
+        internal void PrepareForVirtualHidDriverUninstall()
+        {
+            if (_inputBackend is VirtualHidBackend virtualHidBackend)
+            {
+                virtualHidBackend.DisconnectForDriverMaintenance();
+                DebugLogManager.Log("Input", "已释放 Virtual HID 控制设备句柄，准备卸载驱动。");
+            }
+        }
+
         #region 低级键盘钩子 - 追踪物理 Ctrl 状态
 
         /// <summary>
         /// 安装低级键盘钩子，用于追踪物理 Ctrl 键的按下/释放状态。
-        /// 通过 LLKHF_INJECTED 标志排除 SendInput 注入的事件，
-        /// 解决 GetAsyncKeyState 被 SendInput 污染的问题。
+        /// 通过 LLKHF_INJECTED 排除 SendInput，并通过 SyntheticInputTracker
+        /// 排除本程序的 Virtual HID 键盘事件。
         /// </summary>
         private void InstallKeyboardHook()
         {
@@ -484,18 +506,24 @@ namespace moshushou
                 var kbs = Marshal.PtrToStructure<KBDLLHOOKSTRUCT>(lParam);
                 bool isInjected = (kbs.flags & LLKHF_INJECTED) != 0;
 
-                // 仅关注物理按键事件（排除 SendInput 注入的事件）
-                if (!isInjected &&
+                int msg = wParam.ToInt32();
+                bool isDown = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
+                bool isUp = msg == WM_KEYUP || msg == WM_SYSKEYUP;
+                bool isOwnVirtualHidEvent = !isInjected &&
+                                            (isDown || isUp) &&
+                                            SyntheticInputTracker.TryConsume(kbs.vkCode, isDown);
+
+                // 仅关注物理按键事件（排除 SendInput 和本程序的 Virtual HID）
+                if (!isInjected && !isOwnVirtualHidEvent &&
                     (kbs.vkCode == (uint)VK_CONTROL_KEY ||
                      kbs.vkCode == (uint)VK_LCONTROL_KEY ||
                      kbs.vkCode == (uint)VK_RCONTROL_KEY))
                 {
-                    int msg = wParam.ToInt32();
-                    if (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN)
+                    if (isDown)
                     {
                         _physicalCtrlPressed = true;
                     }
-                    else if (msg == WM_KEYUP || msg == WM_SYSKEYUP)
+                    else if (isUp)
                     {
                         _physicalCtrlPressed = false;
                     }
@@ -1461,7 +1489,7 @@ namespace moshushou
                     // 关键：强制释放物理按住的 Ctrl 键，防止干扰后续的搜索指令
                     try
                     {
-                        _inputSimulator.Keyboard.KeyUp(VirtualKeyCode.CONTROL);
+                        _inputBackend.KeyUp(InputKey.LeftControl);
                     }
                     catch { }
 
@@ -2416,8 +2444,8 @@ namespace moshushou
             // 2. 🛡️ 净化环境：释放按键
             try
             {
-                _inputSimulator.Keyboard.KeyUp(VirtualKeyCode.CONTROL);
-                _inputSimulator.Keyboard.KeyUp(VirtualKeyCode.RETURN);
+                _inputBackend.KeyUp(InputKey.LeftControl);
+                _inputBackend.KeyUp(InputKey.Enter);
             }
             catch { }
 
@@ -2688,7 +2716,7 @@ namespace moshushou
                         System.Diagnostics.Debug.WriteLine("🎯 [MainWindow] 检测到特殊坐标(-1,-1)，表示'最常使用'，直接按回车");
                         
                         // 直接按回车进入
-                        _inputSimulator.Keyboard.KeyPress(VirtualKeyCode.RETURN);
+                        _inputBackend.KeyPress(InputKey.Enter);
                         try { await Task.Delay(300, token); } catch (TaskCanceledException) { return false; }
                     }
 
@@ -2924,12 +2952,12 @@ namespace moshushou
                         
                         for (int k = 0; k < attemptIndex; k++)
                         {
-                            _inputSimulator.Keyboard.KeyPress(VirtualKeyCode.DOWN);
+                            _inputBackend.KeyPress(InputKey.DownArrow);
                             try { await Task.Delay(50, token); } catch { return false; }
                         }
 
                         // 3. 回车进入
-                        _inputSimulator.Keyboard.KeyPress(VirtualKeyCode.RETURN);
+                        _inputBackend.KeyPress(InputKey.Enter);
                         
                         // 等待响应
                         try { await Task.Delay(300, token); } catch { return false; }
@@ -2974,7 +3002,7 @@ namespace moshushou
                             
                             // 🛠️ [容错] 如果不幸打开了弹窗，尝试按 ESC 关闭，以便下次搜索能正常进行
                             // (特别是搜索页面)
-                            _inputSimulator.Keyboard.KeyPress(VirtualKeyCode.ESCAPE);
+                            _inputBackend.KeyPress(InputKey.Escape);
                             try { await Task.Delay(100, token); } catch (TaskCanceledException) { return false; }
                         }
                     } // End Loop
@@ -3035,8 +3063,8 @@ namespace moshushou
             // 这是手动模式成功的关键，防止物理按键（Ctrl/Enter）干扰自动化的 SearchCurrentItemAsync
             try
             {
-                _inputSimulator.Keyboard.KeyUp(VirtualKeyCode.CONTROL);
-                _inputSimulator.Keyboard.KeyUp(VirtualKeyCode.RETURN);
+                _inputBackend.KeyUp(InputKey.LeftControl);
+                _inputBackend.KeyUp(InputKey.Enter);
             }
             catch { }
 
@@ -3067,8 +3095,8 @@ namespace moshushou
             // 1. 🛡️ 释放物理按键，防止干扰
             try
             {
-                _inputSimulator.Keyboard.KeyUp(VirtualKeyCode.CONTROL);
-                _inputSimulator.Keyboard.KeyUp(VirtualKeyCode.RETURN);
+                _inputBackend.KeyUp(InputKey.LeftControl);
+                _inputBackend.KeyUp(InputKey.Enter);
             }
             catch { }
 
@@ -3357,9 +3385,8 @@ namespace moshushou
             // 释放注入层 Ctrl，避免发送 Enter 时被识别为 Ctrl+Enter
             try
             {
-                _inputSimulator.Keyboard.KeyUp(VirtualKeyCode.LCONTROL);
-                _inputSimulator.Keyboard.KeyUp(VirtualKeyCode.RCONTROL);
-                _inputSimulator.Keyboard.KeyUp(VirtualKeyCode.CONTROL);
+                _inputBackend.KeyUp(InputKey.LeftControl);
+                _inputBackend.KeyUp(InputKey.RightControl);
             }
             catch
             {
@@ -3393,7 +3420,7 @@ namespace moshushou
             {
                 try
                 {
-                    _inputSimulator.Keyboard.KeyDown(VirtualKeyCode.CONTROL);
+                    _inputBackend.KeyDown(InputKey.LeftControl);
                     Debug.WriteLine("[RestoreCtrl] ✅ 已恢复 Ctrl 注入");
 
                     // 启动异步清理：用户松开物理 Ctrl 后自动发送配套 KeyUp，防止 Ctrl 卡住
@@ -3406,7 +3433,7 @@ namespace moshushou
                             {
                                 try
                                 {
-                                    _inputSimulator.Keyboard.KeyUp(VirtualKeyCode.CONTROL);
+                                    _inputBackend.KeyUp(InputKey.LeftControl);
                                     Debug.WriteLine("[RestoreCtrl] 🧹 用户已松开，自动清理注入的 Ctrl");
                                 }
                                 catch { }
@@ -3416,7 +3443,7 @@ namespace moshushou
                         // 超时兜底：强制释放
                         try
                         {
-                            _inputSimulator.Keyboard.KeyUp(VirtualKeyCode.CONTROL);
+                            _inputBackend.KeyUp(InputKey.LeftControl);
                             Debug.WriteLine("[RestoreCtrl] ⏰ 超时兜底释放 Ctrl");
                         }
                         catch { }
@@ -4615,15 +4642,15 @@ namespace moshushou
 
             try
             {
-                _inputSimulator.Keyboard.ModifiedKeyStroke(VirtualKeyCode.CONTROL, VirtualKeyCode.VK_A);
+                _inputBackend.KeyChord(InputKey.LeftControl, InputKey.A);
                 await Task.Delay(clearDelayMs, token);
-                _inputSimulator.Keyboard.KeyPress(VirtualKeyCode.BACK);
+                _inputBackend.KeyPress(InputKey.Backspace);
                 await Task.Delay(clearDelayMs, token);
 
                 // 二次清空：兼容输入法/富文本偶发未全清的情况
-                _inputSimulator.Keyboard.ModifiedKeyStroke(VirtualKeyCode.CONTROL, VirtualKeyCode.VK_A);
+                _inputBackend.KeyChord(InputKey.LeftControl, InputKey.A);
                 await Task.Delay(clearDelayMs, token);
-                _inputSimulator.Keyboard.KeyPress(VirtualKeyCode.DELETE);
+                _inputBackend.KeyPress(InputKey.Delete);
                 await Task.Delay(clearDelayMs, token);
                 return true;
             }
@@ -4643,7 +4670,7 @@ namespace moshushou
             try
             {
                 // 模拟按下 Enter 键
-                _inputSimulator.Keyboard.KeyPress(VirtualKeyCode.RETURN);
+                _inputBackend.KeyPress(InputKey.Enter);
             }
             catch (Exception ex)
             {
@@ -6181,7 +6208,7 @@ namespace moshushou
         {
             try
             {
-                _inputSimulator.Keyboard.ModifiedKeyStroke(VirtualKeyCode.CONTROL, VirtualKeyCode.VK_V);
+                _inputBackend.KeyChord(InputKey.LeftControl, InputKey.V);
             }
             catch (Exception ex)
             {
@@ -6193,7 +6220,7 @@ namespace moshushou
         {
             try
             {
-                _inputSimulator.Keyboard.ModifiedKeyStroke(VirtualKeyCode.MENU, VirtualKeyCode.VK_S);
+                _inputBackend.KeyChord(InputKey.LeftAlt, InputKey.S);
             }
             catch (Exception ex)
             {

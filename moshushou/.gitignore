@@ -1,0 +1,15 @@
+# .NET / Visual Studio build output
+bin/
+obj/
+artifacts/
+*.user
+
+# Local release and source snapshots
+backups/
+
+# Restored SDK/WDK packages
+drivers/.packages/
+
+# Driver helper build output
+drivers/MoshushouVirtualHid/SigningTool/bin/
+drivers/MoshushouVirtualHid/SigningTool/obj/

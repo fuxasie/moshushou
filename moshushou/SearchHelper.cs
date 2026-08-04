@@ -7,8 +7,7 @@ using System.Threading;
 using System.Windows;
 using FlaUI.Core.AutomationElements;
 using FlaUI.UIA3;
-using WindowsInput;
-using WindowsInput.Native;
+using moshushou.Input;
 
 namespace moshushou
 {
@@ -38,14 +37,14 @@ namespace moshushou
 
         private static readonly Dictionary<string, IntPtr> _windowHandleCache = new Dictionary<string, IntPtr>();
 
-        private readonly InputSimulator _inputSimulator;
+        private readonly IInputBackend _inputBackend;
         private readonly SearchConfig _config;
         private readonly Action<string> _logAction;
 
-        public SearchHelper(SearchConfig config, Action<string> logAction = null)
+        public SearchHelper(SearchConfig config, IInputBackend inputBackend, Action<string> logAction = null)
         {
-            _inputSimulator = new InputSimulator();
             _config = config;
+            _inputBackend = inputBackend ?? throw new ArgumentNullException(nameof(inputBackend));
             _logAction = logAction;
         }
 
@@ -386,7 +385,7 @@ namespace moshushou
 
             // 1. 激活搜索框
             System.Diagnostics.Debug.WriteLine($"⌨️ [SearchSeq] Step1: 发送 Ctrl+F...");
-            _inputSimulator.Keyboard.ModifiedKeyStroke(VirtualKeyCode.CONTROL, VirtualKeyCode.VK_F);
+            _inputBackend.KeyChord(InputKey.LeftControl, InputKey.F);
             await Task.Delay(150, token);
 
             IntPtr fgAfterCtrlF = GetForegroundWindow();
@@ -394,21 +393,21 @@ namespace moshushou
 
             // 2. 防御性清空
             System.Diagnostics.Debug.WriteLine($"⌨️ [SearchSeq] Step2: 防御性清空(Backspace)...");
-            _inputSimulator.Keyboard.KeyPress(VirtualKeyCode.BACK);
+            _inputBackend.KeyPress(InputKey.Backspace);
             await Task.Delay(20, token);
 
             // 3. 全选并删除
             System.Diagnostics.Debug.WriteLine($"⌨️ [SearchSeq] Step3: 全选删除(Ctrl+A → Backspace)...");
-            _inputSimulator.Keyboard.ModifiedKeyStroke(VirtualKeyCode.CONTROL, VirtualKeyCode.VK_A);
+            _inputBackend.KeyChord(InputKey.LeftControl, InputKey.A);
             await Task.Delay(30, token);
-            _inputSimulator.Keyboard.KeyPress(VirtualKeyCode.BACK);
+            _inputBackend.KeyPress(InputKey.Backspace);
             await Task.Delay(30, token);
 
             if (token.IsCancellationRequested) return;
 
             // 4. 粘贴新内容
             System.Diagnostics.Debug.WriteLine($"⌨️ [SearchSeq] Step4: 粘贴(Ctrl+V)...");
-            _inputSimulator.Keyboard.ModifiedKeyStroke(VirtualKeyCode.CONTROL, VirtualKeyCode.VK_V);
+            _inputBackend.KeyChord(InputKey.LeftControl, InputKey.V);
 
             // ✅ [优化] 粘贴后等待列表渲染
             await Task.Delay(200, token);

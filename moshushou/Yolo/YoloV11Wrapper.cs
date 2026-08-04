@@ -22,6 +22,9 @@ namespace moshushou.Yolo
     {
         private readonly InferenceSession _session;
         private readonly string[] _labels;
+        private readonly object _inferenceSync = new object();
+        private readonly float[] _inputBuffer;
+        private readonly Bitmap _resizedBuffer;
         private const int ModelInputSize = 640;
 
         public YoloV11Wrapper(string modelPath)
@@ -29,7 +32,11 @@ namespace moshushou.Yolo
             if (!File.Exists(modelPath))
                 throw new FileNotFoundException("Model file not found", modelPath);
 
-            var options = new SessionOptions();
+            using var options = new SessionOptions
+            {
+                GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL,
+                ExecutionMode = ExecutionMode.ORT_SEQUENTIAL
+            };
             // 可以根据需要配置 options，例如开启 CUDA
              try
             {
@@ -38,6 +45,8 @@ namespace moshushou.Yolo
             catch {}
 
             _session = new InferenceSession(modelPath, options);
+            _inputBuffer = new float[3 * ModelInputSize * ModelInputSize];
+            _resizedBuffer = new Bitmap(ModelInputSize, ModelInputSize, PixelFormat.Format24bppRgb);
             
             // 按照 YAML 定义的类别顺序
             _labels = new string[] 
@@ -55,23 +64,23 @@ namespace moshushou.Yolo
         {
             if (bitmap == null) return new List<YoloResult>();
 
-            // 1. 预处理
-            var (tensor, scaleX, scaleY, padX, padY) = Preprocess(bitmap);
-
-            // 2. 推理
-            var inputs = new List<NamedOnnxValue>
+            lock (_inferenceSync)
             {
-                NamedOnnxValue.CreateFromTensor("images", tensor)
-            };
+                // 1. 预处理
+                var (tensor, scaleX, scaleY, padX, padY) = Preprocess(bitmap);
 
-            using var results = _session.Run(inputs);
-            
-            // YOLOv8/11 output shape: [1, 4 + num_classes, 8400]
-            // 4 boxes (xc, yc, w, h) + 6 classes = 10 channels
-            var output = results.First().AsTensor<float>();
-            
-            // 3. 后处理
-            return Postprocess(output, scaleX, scaleY, padX, padY, confThreshold, iouThreshold);
+                // 2. 推理
+                var inputs = new List<NamedOnnxValue>
+                {
+                    NamedOnnxValue.CreateFromTensor("images", tensor)
+                };
+
+                using var results = _session.Run(inputs);
+                var output = results.First().AsTensor<float>();
+
+                // 3. 后处理
+                return Postprocess(output, scaleX, scaleY, padX, padY, confThreshold, iouThreshold);
+            }
         }
 
         private (DenseTensor<float> tensor, float scaleX, float scaleY, int padX, int padY) Preprocess(Bitmap image)
@@ -89,39 +98,44 @@ namespace moshushou.Yolo
             int padY = (ModelInputSize - newH) / 2;
             
             // Create inputs
-            var tensor = new DenseTensor<float>(new[] { 1, 3, ModelInputSize, ModelInputSize });
+            var tensor = new DenseTensor<float>(_inputBuffer, new[] { 1, 3, ModelInputSize, ModelInputSize });
 
-            using (var resized = new Bitmap(ModelInputSize, ModelInputSize, PixelFormat.Format24bppRgb))
-            using (var g = Graphics.FromImage(resized))
+            using (var g = Graphics.FromImage(_resizedBuffer))
             {
                 g.Clear(Color.FromArgb(114, 114, 114)); // YOLO padding color
                 g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.Bilinear;
                 g.DrawImage(image, new Rectangle(padX, padY, newW, newH));
                 
                 // Lock bits for fast access
-                BitmapData inputData = resized.LockBits(new Rectangle(0, 0, ModelInputSize, ModelInputSize), ImageLockMode.ReadOnly, PixelFormat.Format24bppRgb);
+                BitmapData inputData = _resizedBuffer.LockBits(new Rectangle(0, 0, ModelInputSize, ModelInputSize), ImageLockMode.ReadOnly, PixelFormat.Format24bppRgb);
                 
-                unsafe
+                try
                 {
-                    byte* ptr = (byte*)inputData.Scan0;
-                    int stride = inputData.Stride;
-                    
-                    // Parallel loop for speedup could be used here, but keeping simple for now
-                    for (int y = 0; y < ModelInputSize; y++)
+                    unsafe
                     {
-                        byte* row = ptr + (y * stride);
-                        for (int x = 0; x < ModelInputSize; x++)
+                        byte* ptr = (byte*)inputData.Scan0;
+                        int stride = inputData.Stride;
+
+                        int planeSize = ModelInputSize * ModelInputSize;
+                        for (int y = 0; y < ModelInputSize; y++)
                         {
-                            // BGR layout in Bitmap, RGB expected by model
-                            // Normalization 0-255 -> 0.0-1.0
-                            tensor[0, 0, y, x] = row[x * 3 + 2] / 255.0f; // R
-                            tensor[0, 1, y, x] = row[x * 3 + 1] / 255.0f; // G
-                            tensor[0, 2, y, x] = row[x * 3 + 0] / 255.0f; // B
+                            byte* row = ptr + y * stride;
+                            int rowOffset = y * ModelInputSize;
+                            for (int x = 0; x < ModelInputSize; x++)
+                            {
+                                int pixelOffset = x * 3;
+                                int tensorOffset = rowOffset + x;
+                                _inputBuffer[tensorOffset] = row[pixelOffset + 2] / 255.0f;
+                                _inputBuffer[planeSize + tensorOffset] = row[pixelOffset + 1] / 255.0f;
+                                _inputBuffer[planeSize * 2 + tensorOffset] = row[pixelOffset] / 255.0f;
+                            }
                         }
                     }
                 }
-                
-                resized.UnlockBits(inputData);
+                finally
+                {
+                    _resizedBuffer.UnlockBits(inputData);
+                }
             }
 
             return (tensor, 1.0f / scale, 1.0f / scale, padX, padY);
@@ -195,18 +209,21 @@ namespace moshushou.Yolo
         {
             var result = new List<YoloResult>();
             var sortedBoxes = boxes.OrderByDescending(b => b.Confidence).ToList();
+            var suppressed = new bool[sortedBoxes.Count];
 
-            while (sortedBoxes.Count > 0)
+            for (int i = 0; i < sortedBoxes.Count; i++)
             {
-                var current = sortedBoxes[0];
-                result.Add(current);
-                sortedBoxes.RemoveAt(0);
+                if (suppressed[i]) continue;
 
-                for (int i = sortedBoxes.Count - 1; i >= 0; i--)
+                var current = sortedBoxes[i];
+                result.Add(current);
+
+                for (int j = i + 1; j < sortedBoxes.Count; j++)
                 {
-                    if (CalculateIoU(current.BBox, sortedBoxes[i].BBox) > iouThreshold)
+                    if (suppressed[j] || current.LabelId != sortedBoxes[j].LabelId) continue;
+                    if (CalculateIoU(current.BBox, sortedBoxes[j].BBox) > iouThreshold)
                     {
-                        sortedBoxes.RemoveAt(i);
+                        suppressed[j] = true;
                     }
                 }
             }
@@ -260,6 +277,7 @@ namespace moshushou.Yolo
 
         public void Dispose()
         {
+            _resizedBuffer?.Dispose();
             _session?.Dispose();
         }
     }

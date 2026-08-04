@@ -78,6 +78,17 @@ namespace moshushou
     public class SearchConfig
     {
 
+        /// <summary>
+        /// 输入后端：VirtualHid（推荐）或 SendInput（兼容模式）。
+        /// </summary>
+        public string InputBackend { get; set; } = "VirtualHid";
+
+        /// <summary>
+        /// Virtual HID 驱动未安装时是否允许临时回退到 SendInput。
+        /// 正式验证企业微信环境时建议设为 false，避免无提示地改变输入路径。
+        /// </summary>
+        public bool AllowSendInputFallback { get; set; } = true;
+
         // 新增：智能激活的超时时间（毫秒）
         public int ActivationTimeoutMs { get; set; } = 2000; // 1秒内没激活就算失败
 

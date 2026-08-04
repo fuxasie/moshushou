@@ -2,6 +2,7 @@
 using System.Drawing;
 using System.Runtime.InteropServices;
 using System.Threading.Tasks;
+using moshushou.Input;
 
 namespace moshushou
 {
@@ -10,9 +11,12 @@ namespace moshushou
     /// </summary>
     public static class MouseHelper
     {
-        [DllImport("user32.dll")]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool SetCursorPos(int x, int y);
+        private static IInputBackend? _inputBackend;
+
+        public static void Configure(IInputBackend inputBackend)
+        {
+            _inputBackend = inputBackend ?? throw new ArgumentNullException(nameof(inputBackend));
+        }
 
         [DllImport("user32.dll")]
         private static extern short GetAsyncKeyState(int vKey);
@@ -28,9 +32,6 @@ namespace moshushou
         }
 
         [DllImport("user32.dll")]
-        private static extern void mouse_event(int dwFlags, int dx, int dy, int cButtons, int dwExtraInfo);
-
-        [DllImport("user32.dll")]
         [return: MarshalAs(UnmanagedType.Bool)]
         private static extern bool GetCursorPos(out POINT lpPoint);
 
@@ -40,9 +41,6 @@ namespace moshushou
             public int X;
             public int Y;
         }
-
-        private const int MOUSEEVENTF_LEFTDOWN = 0x02;
-        private const int MOUSEEVENTF_LEFTUP = 0x04;
 
         private static readonly Random _random = new Random();
 
@@ -70,9 +68,9 @@ namespace moshushou
             await MoveMouseSmoothlyAsync(targetX, targetY, moveDurationBase);
             await Task.Delay(_random.Next(4, 10));
 
-            mouse_event(MOUSEEVENTF_LEFTDOWN, targetX, targetY, 0, 0);
+            InputBackend.MouseButton(InputMouseButton.Left, true);
             await Task.Delay(_random.Next(10, 20));
-            mouse_event(MOUSEEVENTF_LEFTUP, targetX, targetY, 0, 0);
+            InputBackend.MouseButton(InputMouseButton.Left, false);
         }
 
         /// <summary>
@@ -85,9 +83,9 @@ namespace moshushou
                 return;
             }
 
-            mouse_event(MOUSEEVENTF_LEFTDOWN, point.X, point.Y, 0, 0);
+            InputBackend.MouseButton(InputMouseButton.Left, true);
             await Task.Delay(_random.Next(10, 20));
-            mouse_event(MOUSEEVENTF_LEFTUP, point.X, point.Y, 0, 0);
+            InputBackend.MouseButton(InputMouseButton.Left, false);
         }
 
         /// <summary>
@@ -102,7 +100,7 @@ namespace moshushou
             double distance = Math.Sqrt(Math.Pow(targetX - startX, 2) + Math.Pow(targetY - startY, 2));
             if (distance < 4)
             {
-                SetCursorPos(targetX, targetY);
+                InputBackend.MoveMouseAbsolute(targetX, targetY);
                 return;
             }
 
@@ -135,14 +133,17 @@ namespace moshushou
                 double x = uuu * startX + 3 * uu * t * p1x + 3 * u * tt * p2x + ttt * targetX;
                 double y = uuu * startY + 3 * uu * t * p1y + 3 * u * tt * p2y + ttt * targetY;
 
-                SetCursorPos((int)x, (int)y);
+                InputBackend.MoveMouseAbsolute((int)x, (int)y);
                 if (i < steps)
                 {
                     await Task.Delay(_random.Next(1, 3));
                 }
             }
 
-            SetCursorPos(targetX, targetY);
+            InputBackend.MoveMouseAbsolute(targetX, targetY);
         }
+
+        private static IInputBackend InputBackend =>
+            _inputBackend ?? throw new InvalidOperationException("MouseHelper has not been configured with an input backend.");
     }
 }

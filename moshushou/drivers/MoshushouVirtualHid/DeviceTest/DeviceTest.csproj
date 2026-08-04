@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="..\..\..\Input\IInputBackend.cs" Link="Input\IInputBackend.cs" />
+    <Compile Include="..\..\..\Input\SyntheticInputTracker.cs" Link="Input\SyntheticInputTracker.cs" />
+    <Compile Include="..\..\..\Input\VirtualHidBackend.cs" Link="Input\VirtualHidBackend.cs" />
+  </ItemGroup>
+</Project>

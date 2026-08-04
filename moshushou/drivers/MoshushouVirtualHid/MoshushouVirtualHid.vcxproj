@@ -1,0 +1,110 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="Current" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{BC9D4F5B-24D4-4B63-B558-E8944EB685D7}</ProjectGuid>
+    <RootNamespace>MoshushouVirtualHid</RootNamespace>
+    <Keyword>Win32Proj</Keyword>
+    <UMDF_VERSION_MAJOR>2</UMDF_VERSION_MAJOR>
+    <UMDF_VERSION_MINOR>15</UMDF_VERSION_MINOR>
+    <WindowsTargetPlatformVersion>10.0.28000.0</WindowsTargetPlatformVersion>
+    <Configuration Condition="'$(Configuration)' == ''">Debug</Configuration>
+    <Platform Condition="'$(Platform)' == ''">x64</Platform>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+
+  <PropertyGroup Label="Configuration" Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v145</PlatformToolset>
+    <DriverType>UMDF</DriverType>
+    <DriverTargetPlatform>Windows Driver</DriverTargetPlatform>
+    <TargetVersion>Windows10</TargetVersion>
+  </PropertyGroup>
+
+  <PropertyGroup Label="Configuration" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v145</PlatformToolset>
+    <DriverType>UMDF</DriverType>
+    <DriverTargetPlatform>Windows Driver</DriverTargetPlatform>
+    <TargetVersion>Windows10</TargetVersion>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+
+  <PropertyGroup>
+    <TargetName>MoshushouVirtualHid</TargetName>
+    <OutDir>$(ProjectDir)artifacts\$(Configuration)\$(Platform)\</OutDir>
+    <IntDir>$(ProjectDir)obj\$(Configuration)\$(Platform)\</IntDir>
+    <MoshushouWdkRoot Condition="'$(WDKContentRoot)' != ''">$(WDKContentRoot)</MoshushouWdkRoot>
+    <MoshushouWdkRoot Condition="'$(MoshushouWdkRoot)' == '' and Exists('D:\Windows Kits\10\Include\wdf\umdf\2.15\wdf.h')">D:\Windows Kits\10\</MoshushouWdkRoot>
+    <MoshushouSdkRoot Condition="'$(WindowsSdkDir)' != ''">$(WindowsSdkDir)</MoshushouSdkRoot>
+    <MoshushouSdkRoot Condition="'$(MoshushouSdkRoot)' == '' and Exists('D:\Windows Kits\10\Include\10.0.26100.0\um\windows.h')">D:\Windows Kits\10\</MoshushouSdkRoot>
+    <MoshushouKitVersion>10.0.28000.0</MoshushouKitVersion>
+    <MoshushouUmdfVersion>2.15</MoshushouUmdfVersion>
+  </PropertyGroup>
+
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <WarningLevel>Level4</WarningLevel>
+      <TreatWarningAsError>false</TreatWarningAsError>
+      <PreprocessorDefinitions>_UNICODE;UNICODE;WINVER=0x0A00;_WIN32_WINNT=0x0A00;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(ProjectDir);$(MoshushouWdkRoot)Include\wdf\umdf\$(MoshushouUmdfVersion);$(MoshushouWdkRoot)Include\$(MoshushouKitVersion)\km;$(MoshushouSdkRoot)Include\$(MoshushouKitVersion)\shared;$(MoshushouSdkRoot)Include\$(MoshushouKitVersion)\um;$(MoshushouSdkRoot)Include\$(MoshushouKitVersion)\ucrt;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <ExceptionHandling>false</ExceptionHandling>
+      <CompileAs>CompileAsC</CompileAs>
+      <SDLCheck>true</SDLCheck>
+    </ClCompile>
+    <Link>
+      <AdditionalLibraryDirectories>$(MoshushouWdkRoot)Lib\wdf\umdf\x64\$(MoshushouUmdfVersion);$(WindowsSDK_LibraryPath_x64);$(UniversalCRT_LibraryPath_x64);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>WdfDriverStubUm.lib;ntdll.lib;mincore.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <SubSystem>Windows</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+    </Link>
+    <DriverSign>
+      <FileDigestAlgorithm>sha256</FileDigestAlgorithm>
+    </DriverSign>
+  </ItemDefinitionGroup>
+
+  <ItemGroup>
+    <ClCompile Include="Driver.c" />
+    <ClCompile Include="HidQueue.c" />
+    <ClCompile Include="UmdfHidUtil.c" />
+    <ResourceCompile Include="MoshushouVirtualHid.rc" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ClInclude Include="Driver.h" />
+    <ClInclude Include="Protocol.h" />
+    <ClInclude Include="ReportDescriptor.h" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Inf Include="MoshushouVirtualHid.inx" />
+    <FilesToPackage Include="$(TargetPath)" Condition="'$(ConfigurationType)'=='DynamicLibrary'" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Windows.WDK.x64" Version="10.0.28000.2526" />
+  </ItemGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+
+  <Target Name="PrepareDriverPackage" AfterTargets="Build">
+    <MakeDir Directories="$(OutDir)package" />
+    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(OutDir)package" />
+    <Copy SourceFiles="$(TargetDir)$(TargetName).pdb" DestinationFolder="$(OutDir)package" Condition="Exists('$(TargetDir)$(TargetName).pdb')" />
+    <Copy SourceFiles="$(ProjectDir)MoshushouVirtualHid.inx" DestinationFiles="$(OutDir)package\MoshushouVirtualHid.inf" />
+  </Target>
+</Project>

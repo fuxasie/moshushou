@@ -7,15 +7,47 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <UseWPF>true</UseWPF>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
   </PropertyGroup>
 
   <ItemGroup>
     <None Remove="search_config.json" />
   </ItemGroup>
 
+  <PropertyGroup>
+    <DriverInstallerRoot>$(MSBuildProjectDirectory)\drivers\MoshushouVirtualHid\Installer</DriverInstallerRoot>
+    <DriverPackageRoot>$(MSBuildProjectDirectory)\drivers\MoshushouVirtualHid\artifacts\Release\x64\package</DriverPackageRoot>
+  </PropertyGroup>
+
   <ItemGroup>
     <Compile Remove="artifacts\**\*.cs" />
+    <Compile Remove="drivers\**\*.cs" />
     <Compile Remove="publish\**\*.cs" />
+  </ItemGroup>
+
+  <Target Name="BuildVirtualHidInstaller" BeforeTargets="Build">
+    <Exec Command="powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;$(DriverInstallerRoot)\build.ps1&quot; -Configuration Release" />
+  </Target>
+
+  <ItemGroup>
+    <Content Include="$(DriverInstallerRoot)\artifacts\Release\x64\Moshushou.DriverInstaller.exe">
+      <Link>Driver\Moshushou.DriverInstaller.exe</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+      <Visible>false</Visible>
+    </Content>
+    <Content Include="$(DriverPackageRoot)\MoshushouVirtualHid.dll;$(DriverPackageRoot)\MoshushouVirtualHid.inf;$(DriverPackageRoot)\MoshushouVirtualHid.cat">
+      <Link>Driver\package\%(Filename)%(Extension)</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+      <Visible>false</Visible>
+    </Content>
+    <Content Include="$(DriverPackageRoot)\MoshushouVirtualHidTest.cer" Condition="Exists('$(DriverPackageRoot)\MoshushouVirtualHidTest.cer')">
+      <Link>Driver\package\MoshushouVirtualHidTest.cer</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+      <Visible>false</Visible>
+    </Content>
   </ItemGroup>
 
   <ItemGroup>
