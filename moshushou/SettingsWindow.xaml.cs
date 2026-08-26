@@ -41,6 +41,8 @@ namespace moshushou
             EnableOsdCheckBox.IsChecked = _config.EnableOsdWindow;
             SkipNextOnCtrlSpaceCheckBox.IsChecked = _config.SkipNextOnCtrlSpace;
             EnableFailedOcrDebugCaptureCheckBox.IsChecked = _config.EnableFailedOcrDebugCapture;
+            EnableGroupMergeCheckBox.IsChecked = _config.EnableGroupSmallStoreSummary;
+            GroupSummaryMinCountTextBox.Text = Math.Max(1, _config.GroupSummaryMinStoreCount).ToString();
             AllowInputFallbackCheckBox.IsChecked = _config.AllowSendInputFallback;
             InputBackendComboBox.SelectedIndex = string.Equals(
                 _config.InputBackend,
@@ -159,6 +161,53 @@ namespace moshushou
         {
             _config.SkipNextOnCtrlSpace = false;
             _config.Save();
+        }
+
+        private async void SaveGroupMergeSettingsButton_Click(object sender, RoutedEventArgs e)
+        {
+            bool enabled = EnableGroupMergeCheckBox.IsChecked == true;
+            if (!int.TryParse(GroupSummaryMinCountTextBox.Text?.Trim(), out int minCount) || minCount < 1)
+            {
+                MessageBox.Show(this, "请输入有效的商家数量，至少为 1。", "同群汇总", MessageBoxButton.OK, MessageBoxImage.Warning);
+                return;
+            }
+
+            if (minCount > 200)
+            {
+                minCount = 200;
+            }
+
+            _config.EnableGroupSmallStoreSummary = enabled;
+            _config.GroupSummaryMinStoreCount = minCount;
+            GroupSummaryMinCountTextBox.Text = minCount.ToString();
+            _config.Save();
+
+            SaveGroupMergeSettingsButton.IsEnabled = false;
+            try
+            {
+                MainWindow.GroupMergeResult result = await _mainWindow.ApplyGroupSmallStoreSummariesAsync();
+                if (!enabled)
+                {
+                    MessageBox.Show(
+                        this,
+                        "设置已保存，不再自动追加同群汇总文件。",
+                        "同群汇总",
+                        MessageBoxButton.OK,
+                        MessageBoxImage.Information);
+                    return;
+                }
+
+                MessageBox.Show(
+                    this,
+                    result.Message,
+                    "同群汇总",
+                    MessageBoxButton.OK,
+                    result.Success ? MessageBoxImage.Information : MessageBoxImage.Warning);
+            }
+            finally
+            {
+                SaveGroupMergeSettingsButton.IsEnabled = true;
+            }
         }
 
         // ====== 调试采集事件 ======

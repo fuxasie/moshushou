@@ -44,6 +44,46 @@ namespace moshushou
 
     public partial class MainWindow : Window, IDisposable
     {
+        internal sealed class GroupMergeResult
+        {
+            public bool Success { get; init; }
+            public string Message { get; init; } = string.Empty;
+            public string FilePath { get; init; } = string.Empty;
+            public int StoreCount { get; init; }
+            public int RowCount { get; init; }
+        }
+
+        private sealed class GroupMergeStoreSnapshot
+        {
+            public string StoreName { get; init; } = string.Empty;
+            public List<string> Rows { get; init; } = new List<string>();
+        }
+
+        private sealed class GroupMergeRuntimeInfo
+        {
+            public string MergedStoreName { get; init; } = string.Empty;
+            public string GroupName { get; init; } = string.Empty;
+            public string Source { get; init; } = string.Empty;
+            public List<GroupMergeStoreSnapshot> Members { get; init; } = new List<GroupMergeStoreSnapshot>();
+
+            public int StoreCount => Members.Count;
+            public int RowCount => Members.Sum(member => member.Rows.Count);
+            public List<string> CombinedRows => Members.SelectMany(member => member.Rows).ToList();
+        }
+
+        private sealed class StoreDisplayUnit
+        {
+            public string StoreName { get; init; } = string.Empty;
+            public List<string> Rows { get; init; } = new List<string>();
+            public GroupMergeRuntimeInfo? MergeInfo { get; init; }
+        }
+
+        private const int SmallStoreMergeItemLimit = 100;
+        private readonly Dictionary<string, GroupMergeRuntimeInfo> _mergedGroups =
+            new Dictionary<string, GroupMergeRuntimeInfo>(StringComparer.OrdinalIgnoreCase);
+        private readonly HashSet<string> _suppressedGroupSummaries =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
         private Dictionary<string, List<string>> _storeData = new Dictionary<string, List<string>>();
         private Dictionary<string, string> _exportedFilePaths = new Dictionary<string, string>();
         private Point _startPoint;
@@ -205,6 +245,7 @@ namespace moshushou
         // 当前已加载文件快照（用于调试窗口内重新解析）
         private string _lastLoadedFilePath = string.Empty;
         private int _lastLoadedColumnCount = 0;
+        private List<string> _lastLoadedHeaders = new List<string>();
         private string _activeTailMessage = string.Empty;
         private int _activeIssueSegmentStartCount = 30;
 
@@ -807,6 +848,92 @@ namespace moshushou
             _settingsWindow.Show();
         }
 
+        internal IReadOnlyList<string> GetAvailableGroupNames()
+        {
+            HashSet<string> loadedStoreNames;
+            lock (_dataLock)
+            {
+                loadedStoreNames = _storeData.Keys
+                    .Select(NormalizeStoreNameForBusinessInfo)
+                    .Where(name => !string.IsNullOrWhiteSpace(name))
+                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            }
+
+            lock (_businessInfoLock)
+            {
+                return _businessInfoList
+                    .Where(info => info != null &&
+                                   !string.IsNullOrWhiteSpace(info.GroupName) &&
+                                   loadedStoreNames.Contains(NormalizeStoreNameForBusinessInfo(info.StoreName ?? string.Empty)))
+                    .Select(info => info.GroupName.Trim())
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .OrderBy(name => name, StringComparer.CurrentCultureIgnoreCase)
+                    .ToList();
+            }
+        }
+
+        internal async Task<GroupMergeResult> ApplyGroupSmallStoreSummariesAsync()
+        {
+            return await Dispatcher.InvokeAsync(() =>
+            {
+                int originalCount;
+                lock (_dataLock)
+                {
+                    originalCount = _storeData.Count;
+                }
+
+                if (originalCount == 0)
+                {
+                    return new GroupMergeResult { Message = "请先加载 Excel。" };
+                }
+
+                ProcessAndDisplayData();
+
+                List<GroupMergeRuntimeInfo> summaries;
+                lock (_dataLock)
+                {
+                    summaries = _mergedGroups.Values.ToList();
+                }
+
+                if (summaries.Count == 0)
+                {
+                    int minCount = GetGroupSummaryMinStoreCount();
+                    return new GroupMergeResult
+                    {
+                        Message = $"当前没有同群名且单个商家少于 {SmallStoreMergeItemLimit} 条、数量多于 {minCount} 个的群可追加汇总文件。"
+                    };
+                }
+
+                int storeCount = summaries.Sum(item => item.StoreCount);
+                int rowCount = summaries.Sum(item => item.RowCount);
+                List<string> filePaths = new List<string>();
+                lock (_dataLock)
+                {
+                    foreach (GroupMergeRuntimeInfo item in summaries)
+                    {
+                        if (_exportedFilePaths.TryGetValue(item.MergedStoreName, out string? filePath) &&
+                            !string.IsNullOrWhiteSpace(filePath))
+                        {
+                            filePaths.Add(filePath);
+                        }
+                    }
+                }
+
+                string fileSummary = filePaths.Count > 0
+                    ? "\n" + string.Join("\n", filePaths)
+                    : string.Empty;
+
+                return new GroupMergeResult
+                {
+                    Success = true,
+                    FilePath = filePaths.Count == 1 ? filePaths[0] : string.Empty,
+                    StoreCount = storeCount,
+                    RowCount = rowCount,
+                    Message = $"已为 {summaries.Count} 个群追加少于{SmallStoreMergeItemLimit}条商家汇总文件（共 {storeCount} 个商家、{rowCount} 条）。{fileSummary}"
+                };
+            });
+        }
+
         private void OpenDebugLogWindowButton_Click(object sender, RoutedEventArgs e)
         {
             if (_debugLogWindow == null || !_debugLogWindow.IsLoaded)
@@ -1273,16 +1400,7 @@ namespace moshushou
                 return Math.Max(1, GetDefaultSegmentSize());
             }
 
-            List<string>? rows = null;
-            lock (_dataLock)
-            {
-                if (_storeData.TryGetValue(storeName, out var foundRows) && foundRows != null)
-                {
-                    rows = foundRows.ToList();
-                }
-            }
-
-            if (rows == null || rows.Count == 0)
+            if (!TryGetStoreRowsSnapshot(storeName, out List<string>? rows) || rows == null || rows.Count == 0)
             {
                 return Math.Max(1, GetDefaultSegmentSize());
             }
@@ -1323,6 +1441,55 @@ namespace moshushou
             System.Threading.Thread.Sleep(100); // 给系统一点反应时间
 
             return GetForegroundWindow() == targetHwnd;
+        }
+
+        private async Task<bool> WaitForForegroundWindowStableAsync(IntPtr targetHwnd, CancellationToken token)
+        {
+            if (targetHwnd == IntPtr.Zero) return false;
+
+            const int maxActivationAttempts = 3;
+            const int requiredStablePolls = 4;
+            const int pollDelayMs = 125;
+
+            for (int activationAttempt = 0; activationAttempt < maxActivationAttempts; activationAttempt++)
+            {
+                token.ThrowIfCancellationRequested();
+
+                if (GetForegroundWindow() != targetHwnd && !RobustActivateWindow(targetHwnd))
+                {
+                    System.Diagnostics.Debug.WriteLine(
+                        $"[WindowStable] 激活失败 {activationAttempt + 1}/{maxActivationAttempts}: Target={targetHwnd}, Foreground={GetForegroundWindow()}");
+                }
+
+                int stablePolls = 0;
+                for (int poll = 0; poll < requiredStablePolls + 2; poll++)
+                {
+                    token.ThrowIfCancellationRequested();
+
+                    bool hasValidRect = GetWindowRect(targetHwnd, out RECT rect) &&
+                                        rect.Right > rect.Left &&
+                                        rect.Bottom > rect.Top;
+                    bool isStable = GetForegroundWindow() == targetHwnd &&
+                                    !IsIconic(targetHwnd) &&
+                                    hasValidRect;
+
+                    stablePolls = isStable ? stablePolls + 1 : 0;
+                    if (stablePolls >= requiredStablePolls)
+                    {
+                        System.Diagnostics.Debug.WriteLine(
+                            $"[WindowStable] 目标窗口已稳定置前: Hwnd={targetHwnd}, Polls={stablePolls}");
+                        return true;
+                    }
+
+                    await Task.Delay(pollDelayMs, token);
+                }
+
+                await Task.Delay(150, token);
+            }
+
+            System.Diagnostics.Debug.WriteLine(
+                $"[WindowStable] 目标窗口在超时内未稳定: Target={targetHwnd}, Foreground={GetForegroundWindow()}");
+            return false;
         }
 
 
@@ -1834,11 +2001,6 @@ namespace moshushou
 
                 var autoLoopUiTask = await Application.Current.Dispatcher.InvokeAsync(async () =>
                 {
-                    if (WindowState == WindowState.Minimized) WindowState = WindowState.Normal;
-                    this.Activate();
-                    this.Focus();
-                    SetForegroundWindow(_windowHandle);
-
                     if (success)
                     {
                         string? successStoreName = _currentSelectedNode?.StoreName;
@@ -1863,15 +2025,15 @@ namespace moshushou
                             RecordStoreSendHistory(_currentSelectedNode.StoreName, "自动化发送", false, failureStageLabel);
                         }
                         bool shouldVerifyLayout = true;
-                        bool isLayoutValid = true;
+                        ScreenshotHelper.ChatWindowLayoutStatus layoutStatus = ScreenshotHelper.ChatWindowLayoutStatus.Unavailable;
                         bool? matchedAppIsWework = null;
                         IntPtr matchedHwnd = IntPtr.Zero;
                         IntPtr lastCheckedHwnd = IntPtr.Zero;
 
                         if (shouldVerifyLayout)
                         {
-                            // 任何失败在进入重试处理前都必须做布局验证。
-                            // 规则：布局正常 -> 允许移动到重试区；布局异常 -> 立即停止自动化。
+                            // 任何失败在进入重试处理前都尝试做布局验证。
+                            // 只有稳定置前后连续截图确认异常才停机；窗口切换中的瞬态不可用进入正常重试。
                             TreeViewNode activeNode = _currentSelectedNode;
                             bool? preferredAppIsWework = null;
                             if (activeNode != null)
@@ -1912,9 +2074,8 @@ namespace moshushou
                                 $"[AutoLoop] 布局验证策略: Source明确={(preferredAppIsWework.HasValue ? "是" : "否")}, " +
                                 $"仅当前应用={(preferredAppIsWework.HasValue ? "是" : "否")}");
 
-                            // VerifyChatWindowLayoutAsync 内部已包含 3 次重试，这里不再重复外层轮询。
+                            // VerifyChatWindowLayoutAsync 内部会过滤非前台截图并累计稳定异常帧。
                             const int layoutRoundsPerApp = 1;
-                            isLayoutValid = false;
 
                             foreach (bool appIsWework in appCandidates.Distinct())
                             {
@@ -1975,16 +2136,32 @@ namespace moshushou
 
                                     for (int round = 0; round < layoutRoundsPerApp; round++)
                                     {
-                                        RobustActivateWindow(targetHwnd);
-                                        await Task.Delay(300);
-
-                                        bool oneRoundValid = await Task.Run(async () => await _screenshotHelper.VerifyChatWindowLayoutAsync(targetHwnd, appIsWework));
-                                        if (oneRoundValid)
+                                        bool windowStable = await WaitForForegroundWindowStableAsync(targetHwnd, token);
+                                        if (!windowStable)
                                         {
-                                            isLayoutValid = true;
+                                            System.Diagnostics.Debug.WriteLine(
+                                                $"[AutoLoop] 布局验证跳过瞬态窗口: App={appName}, Hwnd={targetHwnd}, Foreground={GetForegroundWindow()}");
+                                            continue;
+                                        }
+
+                                        var oneRoundStatus = await Task.Run(
+                                            async () => await _screenshotHelper.VerifyChatWindowLayoutAsync(targetHwnd, appIsWework));
+                                        if (oneRoundStatus == ScreenshotHelper.ChatWindowLayoutStatus.Valid)
+                                        {
+                                            layoutStatus = ScreenshotHelper.ChatWindowLayoutStatus.Valid;
                                             matchedAppIsWework = appIsWework;
                                             matchedHwnd = targetHwnd;
                                             break;
+                                        }
+
+                                        if (oneRoundStatus == ScreenshotHelper.ChatWindowLayoutStatus.Invalid)
+                                        {
+                                            layoutStatus = ScreenshotHelper.ChatWindowLayoutStatus.Invalid;
+                                        }
+                                        else
+                                        {
+                                            System.Diagnostics.Debug.WriteLine(
+                                                $"[AutoLoop] 布局验证结果为瞬态不可用: App={appName}, Hwnd={targetHwnd}");
                                         }
 
                                         if (round < layoutRoundsPerApp - 1)
@@ -1993,18 +2170,16 @@ namespace moshushou
                                         }
                                     }
 
-                                    if (isLayoutValid) break;
+                                    if (layoutStatus == ScreenshotHelper.ChatWindowLayoutStatus.Valid) break;
                                 }
 
-                                if (isLayoutValid) break;
+                                if (layoutStatus == ScreenshotHelper.ChatWindowLayoutStatus.Valid) break;
                             }
                         }
 
-                        if (!isLayoutValid)
+                        if (layoutStatus == ScreenshotHelper.ChatWindowLayoutStatus.Invalid)
                         {
-                            // 🛑 布局验证失败 -> 认为是严重异常 (窗口关闭/退出登录/被挡住)
-                            // 此时直接停止自动化，不进入重试区
-                            this.Activate();
+                            // 已在目标窗口稳定置前后连续取得异常截图，确认是真实布局异常。
                             _lastLayoutVerifiedHwnd = IntPtr.Zero;
                             _lastLayoutVerifiedIsWework = null;
                              
@@ -2014,10 +2189,20 @@ namespace moshushou
                         }
                         else
                         {
-                            string matchedAppName = matchedAppIsWework == true ? "企业微信" : "微信";
-                            System.Diagnostics.Debug.WriteLine($"[AutoLoop] 布局验证通过: App={matchedAppName}, Hwnd={matchedHwnd}");
-                            _lastLayoutVerifiedHwnd = matchedHwnd;
-                            _lastLayoutVerifiedIsWework = matchedAppIsWework;
+                            if (layoutStatus == ScreenshotHelper.ChatWindowLayoutStatus.Valid)
+                            {
+                                string matchedAppName = matchedAppIsWework == true ? "企业微信" : "微信";
+                                System.Diagnostics.Debug.WriteLine($"[AutoLoop] 布局验证通过: App={matchedAppName}, Hwnd={matchedHwnd}");
+                                _lastLayoutVerifiedHwnd = matchedHwnd;
+                                _lastLayoutVerifiedIsWework = matchedAppIsWework;
+                            }
+                            else
+                            {
+                                _lastLayoutVerifiedHwnd = IntPtr.Zero;
+                                _lastLayoutVerifiedIsWework = null;
+                                System.Diagnostics.Debug.WriteLine(
+                                    $"[AutoLoop] 布局验证未获得稳定截图，按窗口切换瞬态处理并进入正常重试: LastHwnd={lastCheckedHwnd}");
+                            }
 
                             var node = _currentSelectedNode;
                             if (node != null)
@@ -2108,6 +2293,12 @@ namespace moshushou
                             }
                         }
                     }
+
+                    // 布局截图完成后再恢复工具窗口，避免它遮挡微信/企微并污染截图。
+                    if (WindowState == WindowState.Minimized) WindowState = WindowState.Normal;
+                    this.Activate();
+                    this.Focus();
+                    SetForegroundWindow(_windowHandle);
                 });
                 await autoLoopUiTask;
 
@@ -3853,23 +4044,98 @@ namespace moshushou
             await Task.Delay(8);
             SimulatePaste();
 
+            bool isWework = IsCurrentNodeWework();
             if (autoSend)
             {
-                // 按用户要求：快捷键发送仅使用 Enter 单键，不再 Alt+S 双保险
-                const int enterDelayMs = 8;
-                await Task.Delay(enterDelayMs);
-                SimulateEnter();
-                DebugLogManager.Log("CtrlSpace", $"文件发送延迟: {enterDelayMs}ms, 文件={Path.GetFileName(filePath)}");
+                bool sentByOriginalFilePopup = false;
+                if (isWework)
+                {
+                    sentByOriginalFilePopup = await TryClickWeworkOriginalFilePopupAsync(GetForegroundWindow());
+                }
+
+                if (!sentByOriginalFilePopup)
+                {
+                    // 按用户要求：快捷键发送仅使用 Enter 单键，不再 Alt+S 双保险
+                    const int enterDelayMs = 8;
+                    await Task.Delay(enterDelayMs);
+                    SimulateEnter();
+                    DebugLogManager.Log("CtrlSpace", $"文件发送延迟: {enterDelayMs}ms, 文件={Path.GetFileName(filePath)}");
+                }
+                else
+                {
+                    DebugLogManager.Log("CtrlSpace", $"企业微信已点“使用原文件”，文件={Path.GetFileName(filePath)}");
+                }
+
                 StatusTextBlock.Text = $"✅ [Ctrl+Space] 已发送文件: {storeName}";
             }
             else
             {
-                StatusTextBlock.Text = $"📋 [Ctrl+Space] 已粘贴文件: {storeName}";
+                StatusTextBlock.Text = isWework
+                    ? $"📋 [Ctrl+Space] 已粘贴文件至企业微信: {storeName}"
+                    : $"📋 [Ctrl+Space] 已粘贴文件: {storeName}";
             }
 
             _currentItemPasted = true;
             _lastPastedStoreName = storeName;
             return true;
+        }
+
+        private bool IsCurrentNodeWework()
+        {
+            if ("企业微信".Equals(_currentSelectedNode?.Source, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            if (_currentSelectedNode != null &&
+                TryResolveRootNode(_currentSelectedNode, out TreeViewNode rootNode) &&
+                rootNode != null)
+            {
+                return "企业微信".Equals(rootNode.Source, StringComparison.OrdinalIgnoreCase);
+            }
+
+            return false;
+        }
+
+        private async Task<bool> TryClickWeworkOriginalFilePopupAsync(IntPtr targetHwnd, CancellationToken token = default)
+        {
+            if (targetHwnd == IntPtr.Zero)
+            {
+                targetHwnd = GetForegroundWindow();
+            }
+
+            if (targetHwnd == IntPtr.Zero)
+            {
+                return false;
+            }
+
+            for (int k = 0; k < 5; k++)
+            {
+                if (token.IsCancellationRequested)
+                {
+                    return false;
+                }
+
+                System.Drawing.Point? clickPoint = await _screenshotHelper.FindPopupTextPositionAsync(targetHwnd, "使用原文件");
+                if (clickPoint != null)
+                {
+                    await MouseHelper.HumanLikeClickAsync((int)clickPoint.Value.X, (int)clickPoint.Value.Y, 90);
+                    Application.Current.Dispatcher.Invoke(() =>
+                        StatusTextBlock.Text = "⚡ 已点击“使用原文件”（企业微信文件发送）");
+                    return true;
+                }
+
+                try
+                {
+                    await Task.Delay(300, token);
+                }
+                catch (OperationCanceledException)
+                {
+                    return false;
+                }
+            }
+
+            return false;
         }
 
         private async Task<bool> PasteTextPayloadForCtrlSpaceAsync(string storeName, string payload, bool autoSend, string? segmentTag = null)
@@ -3934,15 +4200,10 @@ namespace moshushou
             payload = string.Empty;
             trackingCount = 0;
 
-            List<string> trackingNumbers;
-            lock (_dataLock)
+            if (!TryGetStoreRowsSnapshot(storeName, out List<string> trackingNumbers))
             {
-                if (!_storeData.TryGetValue(storeName, out trackingNumbers))
-                {
-                    StatusTextBlock.Text = "❌ 未找到商家数据";
-                    return false;
-                }
-                trackingNumbers = trackingNumbers.ToList();
+                StatusTextBlock.Text = "❌ 未找到商家数据";
+                return false;
             }
 
             trackingCount = trackingNumbers.Count;
@@ -4177,15 +4438,10 @@ namespace moshushou
             // But for looking up data, we use the full key.
             
             // 1. 准备数据
-            List<string> trackingNumbers;
-            lock (_dataLock)
+            if (!TryGetStoreRowsSnapshot(storeName, out List<string> trackingNumbers))
             {
-                if (!_storeData.TryGetValue(storeName, out trackingNumbers))
-                {
-                    StatusTextBlock.Text = "❌ 未找到商家数据";
-                    return false;
-                }
-                trackingNumbers = trackingNumbers.ToList();
+                StatusTextBlock.Text = "❌ 未找到商家数据";
+                return false;
             }
 
             var payloadMode = ResolveStorePayloadMode(storeName, trackingNumbers);
@@ -4341,15 +4597,27 @@ namespace moshushou
             {
                 StatusTextBlock.Text = "🚀 正在发送文件...";
                 await Task.Delay(500); // 文件加载稍慢
-                SimulateAltS();
-                await Task.Delay(50);
-                SimulateEnter();
+                bool sentByOriginalFilePopup = false;
+                if (IsCurrentNodeWework())
+                {
+                    sentByOriginalFilePopup = await TryClickWeworkOriginalFilePopupAsync(GetForegroundWindow());
+                }
+
+                if (!sentByOriginalFilePopup)
+                {
+                    SimulateAltS();
+                    await Task.Delay(50);
+                    SimulateEnter();
+                }
+
                 MarkStoreAsSent(storeName);
                 StatusTextBlock.Text = $"✅ [快捷] 文件已发送: {storeName}";
             }
             else
             {
-                StatusTextBlock.Text = $"📋 [快捷] 文件已粘贴: {storeName}";
+                StatusTextBlock.Text = IsCurrentNodeWework()
+                    ? $"📋 [快捷] 已粘贴文件至企业微信: {storeName}"
+                    : $"📋 [快捷] 文件已粘贴: {storeName}";
             }
 
             _currentItemPasted = true;
@@ -5144,14 +5412,12 @@ namespace moshushou
             }
 
             StorePayloadMode payloadMode = StorePayloadMode.Normal;
-            lock (_dataLock)
+            if (TryGetStoreRowsSnapshot(storeName, out var rowsForMode))
             {
-                if (_storeData.TryGetValue(storeName, out var rowsForMode))
-                {
-                    payloadMode = ResolveStorePayloadMode(storeName, rowsForMode);
-                }
+                payloadMode = ResolveStorePayloadMode(storeName, rowsForMode);
             }
-            bool shouldAppendFixedMessage = payloadMode == StorePayloadMode.Normal;
+            bool shouldAppendFixedMessage = payloadMode == StorePayloadMode.Normal &&
+                                            !TryGetMergedGroup(storeName, out _);
             string displayStoreName = storeName;
             Log($"[MODE] payloadMode={payloadMode}, shouldAppendFixedMessage={shouldAppendFixedMessage}");
 
@@ -5285,15 +5551,10 @@ namespace moshushou
             }
 
             // 2. 数据准备
-            List<string> trackingNumbers;
-            lock (_dataLock)
+            if (!TryGetStoreRowsSnapshot(storeName, out List<string> trackingNumbers))
             {
-                if (!_storeData.TryGetValue(storeName, out trackingNumbers))
-                {
-                    Log("❌ 未找到商家数据");
-                    return false;
-                }
-                trackingNumbers = trackingNumbers.ToList();
+                Log("❌ 未找到商家数据");
+                return false;
             }
 
             var payloadMode = ResolveStorePayloadMode(storeName, trackingNumbers);
@@ -5439,15 +5700,10 @@ namespace moshushou
             Log($"分段执行模式: {(shouldAutoSend ? "发送" : "仅粘贴")} (isAutoMode={isAutoMode}, autoSendChecked={autoSendChecked})");
 
             // 1. 获取数据 (复制)
-            List<string> trackingNumbers;
-            lock (_dataLock)
+            if (!TryGetStoreRowsSnapshot(storeName, out List<string> trackingNumbers))
             {
-                if (!_storeData.TryGetValue(storeName, out trackingNumbers))
-                {
-                    Log("❌ 未找到商家数据");
-                    return false;
-                }
-                trackingNumbers = trackingNumbers.ToList();
+                Log("❌ 未找到商家数据");
+                return false;
             }
 
             StorePayloadMode payloadMode = ResolveStorePayloadMode(storeName, trackingNumbers);
@@ -6069,13 +6325,16 @@ namespace moshushou
                 return;
             }
 
-            int itemCount = 0;
-            lock (_dataLock)
+            if (TryGetMergedGroup(node.StoreName, out GroupMergeRuntimeInfo mergeInfo))
             {
-                if (_storeData.TryGetValue(node.StoreName, out var rows))
-                {
-                    itemCount = rows.Count;
-                }
+                node.Header = BuildGroupSummaryHeaderText(mergeInfo);
+                return;
+            }
+
+            int itemCount = 0;
+            if (TryGetStoreRowsSnapshot(node.StoreName, out var rows))
+            {
+                itemCount = rows.Count;
             }
 
             node.Header = BuildStoreHeaderText(node.StoreName, itemCount, node.Strategy);
@@ -6232,12 +6491,9 @@ namespace moshushou
 
             int totalSegments = Math.Max(1, node.Children.Count);
             int itemCount = 0;
-            lock (_dataLock)
+            if (TryGetStoreRowsSnapshot(node.StoreName, out var rows))
             {
-                if (_storeData.TryGetValue(node.StoreName, out var rows))
-                {
-                    itemCount = rows.Count;
-                }
+                itemCount = rows.Count;
             }
 
             node.Header = BuildStoreHeaderText(node.StoreName, itemCount, node.Strategy);
@@ -6362,11 +6618,13 @@ namespace moshushou
             {
                 _storeData.Clear();
                 _exportedFilePaths.Clear();
+                _lastLoadedHeaders.Clear();
             }
             
             // ✅ 清空运行时状态集合
             _failedStores.Clear();
             _manualReviewStores.Clear();
+            _suppressedGroupSummaries.Clear();
             lock (_segmentFailureLock) { _segmentFailureInfos.Clear(); }
             lock (_sentStoreLock) { _sentStores.Clear(); }
             
@@ -6436,6 +6694,12 @@ namespace moshushou
                     int colCount = worksheet.Dimension.End.Column;
                     _lastLoadedFilePath = filePath;
                     _lastLoadedColumnCount = colCount;
+                    lock (_dataLock)
+                    {
+                        _lastLoadedHeaders = Enumerable.Range(1, colCount)
+                            .Select(column => GetSafeText(worksheet.Cells[1, column].Value).Trim())
+                            .ToList();
+                    }
                     
                     // 🔍 [DEBUG] 输出检测到的列数，帮助调试
                     System.Diagnostics.Debug.WriteLine($"[DEBUG] Excel 检测: rowCount={rowCount}, colCount={colCount}");
@@ -6878,6 +7142,7 @@ namespace moshushou
                     StringComparer.OrdinalIgnoreCase);
             }
 
+            List<string> headerSnapshot;
             lock (_dataLock)
             {
                 sortedStores = _storeData
@@ -6889,7 +7154,7 @@ namespace moshushou
                         return new { Kvp = kvp, Info = info };
                     })
                     .OrderByDescending(x => !string.IsNullOrEmpty(x.Info?.GroupName))
-                    .ThenByDescending(x => x.Kvp.Value.Count > 100)
+                    .ThenByDescending(x => x.Kvp.Value.Count > SmallStoreMergeItemLimit)
                     .ThenBy(x =>
                     {
                         var src = x.Info?.Source;
@@ -6901,19 +7166,31 @@ namespace moshushou
                     .ThenByDescending(x => x.Kvp.Value.Count)
                     .Select(x => x.Kvp)
                     .ToList();
+                headerSnapshot = _lastLoadedHeaders.ToList();
+                ClearMergedGroupRuntimeLocked();
             }
+
+            List<GroupMergeRuntimeInfo> summaryGroups = CollectSmallStoreSummaryGroups(sortedStores, infoMap);
+            lock (_dataLock)
+            {
+                foreach (GroupMergeRuntimeInfo summaryGroup in summaryGroups)
+                {
+                    _mergedGroups[summaryGroup.MergedStoreName] = summaryGroup;
+                }
+            }
+
+            var displayUnits = BuildDisplayUnitsWithGroupSummaries(sortedStores, summaryGroups);
 
             if (_currentFilter.Count > 0)
             {
-                sortedStores = sortedStores.Where(kvp => _currentFilter.Any(filter => kvp.Key.Contains(filter, StringComparison.OrdinalIgnoreCase))).ToList();
+                displayUnits = displayUnits.Where(MatchesCurrentFilter).ToList();
             }
 
-            var normalList = new List<KeyValuePair<string, List<string>>>();
-            var failedList = new List<KeyValuePair<string, List<string>>>();
-
-            foreach (var item in sortedStores)
+            var normalList = new List<StoreDisplayUnit>();
+            var failedList = new List<StoreDisplayUnit>();
+            foreach (StoreDisplayUnit item in displayUnits)
             {
-                if (_failedStores.Contains(item.Key))
+                if (IsDisplayUnitFailed(item))
                     failedList.Add(item);
                 else
                     normalList.Add(item);
@@ -7067,10 +7344,20 @@ namespace moshushou
                 return parentNode;
             }
 
-            // 1. 正常列表
-            foreach (var kvp in normalList)
+            TreeViewNode CreateDisplayNode(StoreDisplayUnit unit)
             {
-                _treeViewCollection.Add(CreateNode(kvp.Key, kvp.Value));
+                if (unit.MergeInfo != null)
+                {
+                    return CreateMergedGroupNode(unit.MergeInfo, headerSnapshot);
+                }
+
+                return CreateNode(unit.StoreName, unit.Rows);
+            }
+
+            // 1. 正常列表
+            foreach (StoreDisplayUnit unit in normalList)
+            {
+                _treeViewCollection.Add(CreateDisplayNode(unit));
             }
 
             // 2. 分隔符
@@ -7083,10 +7370,12 @@ namespace moshushou
             _treeViewCollection.Add(_failureNode);
 
             // 3. 失败/重试列表
-            foreach (var kvp in failedList)
+            foreach (StoreDisplayUnit unit in failedList)
             {
-                _treeViewCollection.Add(CreateNode(kvp.Key, kvp.Value));
+                _treeViewCollection.Add(CreateDisplayNode(unit));
             }
+
+            LogGroupSummaryDetails(summaryGroups);
 
             Application.Current.Dispatcher.Invoke(() =>
             {
@@ -7094,7 +7383,14 @@ namespace moshushou
                 RebuildFlatNodeList();
 
                 string filterInfo = _currentFilter.Count > 0 ? $"（已筛选 {_currentFilter.Count} 个关键词）" : "";
-                StatusTextBlock.Text = $"处理完成，共显示 {sortedStores.Count} 个商家{filterInfo}";
+                int summaryGroupCount = displayUnits.Count(item => item.MergeInfo != null);
+                int summaryStoreCount = displayUnits
+                    .Where(item => item.MergeInfo != null)
+                    .Sum(item => item.MergeInfo!.StoreCount);
+                string summaryInfo = summaryGroupCount > 0
+                    ? $"，已为 {summaryGroupCount} 个群的 {summaryStoreCount} 个少于{SmallStoreMergeItemLimit}条商家追加汇总文件"
+                    : "";
+                StatusTextBlock.Text = $"处理完成，共显示 {displayUnits.Count} 个列表项{filterInfo}{summaryInfo}";
                 UpdateListProgressStatus();
             });
         }
@@ -7259,6 +7555,465 @@ namespace moshushou
             return filePath;
         }
 
+        private void ClearMergedGroupRuntimeLocked()
+        {
+            foreach (string mergedStoreName in _mergedGroups.Keys.ToList())
+            {
+                _exportedFilePaths.Remove(mergedStoreName);
+            }
+
+            _mergedGroups.Clear();
+        }
+
+        private int GetGroupSummaryMinStoreCount()
+        {
+            int minCount = _searchConfig?.GroupSummaryMinStoreCount ?? 5;
+            if (minCount < 1)
+            {
+                return 5;
+            }
+
+            return Math.Min(minCount, 200);
+        }
+
+        private List<GroupMergeRuntimeInfo> CollectSmallStoreSummaryGroups(
+            List<KeyValuePair<string, List<string>>> stores,
+            Dictionary<string, BusinessInfo> infoMap)
+        {
+            var result = new List<GroupMergeRuntimeInfo>();
+            if (_searchConfig?.EnableGroupSmallStoreSummary != true ||
+                stores == null ||
+                stores.Count == 0)
+            {
+                return result;
+            }
+
+            int minCount = GetGroupSummaryMinStoreCount();
+            var buckets = new Dictionary<string, List<GroupMergeStoreSnapshot>>(StringComparer.OrdinalIgnoreCase);
+            var sources = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var item in stores)
+            {
+                if (item.Value == null || item.Value.Count <= 0 || item.Value.Count >= SmallStoreMergeItemLimit)
+                {
+                    continue;
+                }
+
+                string infoKey = NormalizeStoreNameForBusinessInfo(item.Key);
+                if (!infoMap.TryGetValue(infoKey, out BusinessInfo? info) ||
+                    info == null ||
+                    string.IsNullOrWhiteSpace(info.GroupName))
+                {
+                    continue;
+                }
+
+                string groupName = info.GroupName.Trim();
+                if (_suppressedGroupSummaries.Contains(groupName))
+                {
+                    continue;
+                }
+
+                if (!buckets.TryGetValue(groupName, out List<GroupMergeStoreSnapshot>? members))
+                {
+                    members = new List<GroupMergeStoreSnapshot>();
+                    buckets[groupName] = members;
+                    sources[groupName] = new List<string>();
+                }
+
+                members.Add(new GroupMergeStoreSnapshot
+                {
+                    StoreName = item.Key,
+                    Rows = item.Value.ToList()
+                });
+                sources[groupName].Add(info.Source ?? string.Empty);
+            }
+
+            foreach (var bucket in buckets)
+            {
+                // 设置项“多于 N 个”：只有超过阈值才追加汇总文件。
+                if (bucket.Value.Count <= minCount)
+                {
+                    continue;
+                }
+
+                // 保持主列表发送顺序，不按条数/店名重排。
+                List<GroupMergeStoreSnapshot> members = bucket.Value.ToList();
+                string source = PickPreferredSource(sources[bucket.Key]);
+                result.Add(new GroupMergeRuntimeInfo
+                {
+                    MergedStoreName = BuildGroupSummaryStoreName(bucket.Key),
+                    GroupName = bucket.Key,
+                    Source = source,
+                    Members = members
+                });
+            }
+
+            return result;
+        }
+
+        private List<StoreDisplayUnit> BuildDisplayUnitsWithGroupSummaries(
+            List<KeyValuePair<string, List<string>>> stores,
+            List<GroupMergeRuntimeInfo> summaryGroups)
+        {
+            var units = new List<StoreDisplayUnit>();
+            foreach (var item in stores)
+            {
+                units.Add(new StoreDisplayUnit
+                {
+                    StoreName = item.Key,
+                    Rows = item.Value
+                });
+            }
+
+            if (summaryGroups == null || summaryGroups.Count == 0)
+            {
+                return units;
+            }
+
+            var insertions = new List<(int Index, StoreDisplayUnit Unit, int Order)>();
+            for (int order = 0; order < summaryGroups.Count; order++)
+            {
+                GroupMergeRuntimeInfo summary = summaryGroups[order];
+                int lastIndex = -1;
+                for (int i = 0; i < units.Count; i++)
+                {
+                    if (summary.Members.Any(member =>
+                            string.Equals(member.StoreName, units[i].StoreName, StringComparison.Ordinal)))
+                    {
+                        lastIndex = i;
+                    }
+                }
+
+                insertions.Add((
+                    lastIndex >= 0 ? lastIndex + 1 : units.Count,
+                    new StoreDisplayUnit
+                    {
+                        StoreName = summary.MergedStoreName,
+                        Rows = summary.CombinedRows,
+                        MergeInfo = summary
+                    },
+                    order));
+            }
+
+            foreach (var insertion in insertions
+                         .OrderByDescending(item => item.Index)
+                         .ThenByDescending(item => item.Order))
+            {
+                units.Insert(insertion.Index, insertion.Unit);
+            }
+
+            return units;
+        }
+
+        private static string BuildGroupSummaryStoreName(string groupName)
+        {
+            string safeGroupName = string.IsNullOrWhiteSpace(groupName) ? "未命名群聊" : groupName.Trim();
+            return $"{safeGroupName}（少于{SmallStoreMergeItemLimit}条汇总）";
+        }
+
+        private string BuildGroupSummaryHeaderText(GroupMergeRuntimeInfo mergeInfo)
+        {
+            string prefix = string.Empty;
+            if (_manualReviewStores.Contains(mergeInfo.MergedStoreName))
+            {
+                prefix = "❌ [需人工] ";
+            }
+
+            return $"{prefix}📎 {mergeInfo.GroupName}（少于{SmallStoreMergeItemLimit}条汇总 / {mergeInfo.StoreCount}家） ({mergeInfo.RowCount}条)";
+        }
+
+        private static string PickPreferredSource(IEnumerable<string> sources)
+        {
+            List<string> values = sources
+                .Select(item => item?.Trim() ?? string.Empty)
+                .Where(item => !string.IsNullOrWhiteSpace(item))
+                .ToList();
+            if (values.Any(item => string.Equals(item, "企业微信", StringComparison.OrdinalIgnoreCase)))
+            {
+                return "企业微信";
+            }
+
+            if (values.Any(item => string.Equals(item, "微信", StringComparison.OrdinalIgnoreCase)))
+            {
+                return "微信";
+            }
+
+            return values.FirstOrDefault() ?? string.Empty;
+        }
+
+        private bool MatchesCurrentFilter(StoreDisplayUnit unit)
+        {
+            if (_currentFilter.Count == 0)
+            {
+                return true;
+            }
+
+            bool Matches(string? text) =>
+                !string.IsNullOrWhiteSpace(text) &&
+                _currentFilter.Any(filter => text.Contains(filter, StringComparison.OrdinalIgnoreCase));
+
+            if (Matches(unit.StoreName))
+            {
+                return true;
+            }
+
+            if (unit.MergeInfo == null)
+            {
+                return false;
+            }
+
+            if (Matches(unit.MergeInfo.GroupName) || Matches(unit.MergeInfo.MergedStoreName))
+            {
+                return true;
+            }
+
+            return unit.MergeInfo.Members.Any(member => Matches(member.StoreName));
+        }
+
+        private bool IsDisplayUnitFailed(StoreDisplayUnit unit)
+        {
+            return _failedStores.Contains(unit.StoreName);
+        }
+
+        private bool TryGetStoreRowsSnapshot(string storeName, out List<string> rows)
+        {
+            rows = null!;
+            if (string.IsNullOrWhiteSpace(storeName))
+            {
+                return false;
+            }
+
+            lock (_dataLock)
+            {
+                if (_mergedGroups.TryGetValue(storeName, out GroupMergeRuntimeInfo? merged) &&
+                    merged != null)
+                {
+                    rows = merged.CombinedRows;
+                    return rows.Count > 0;
+                }
+
+                if (_storeData.TryGetValue(storeName, out var foundRows) && foundRows != null)
+                {
+                    rows = foundRows.ToList();
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private bool TryGetMergedGroup(string storeName, out GroupMergeRuntimeInfo mergeInfo)
+        {
+            mergeInfo = null!;
+            if (string.IsNullOrWhiteSpace(storeName))
+            {
+                return false;
+            }
+
+            lock (_dataLock)
+            {
+                if (_mergedGroups.TryGetValue(storeName, out GroupMergeRuntimeInfo? found) && found != null)
+                {
+                    mergeInfo = found;
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private TreeViewNode CreateMergedGroupNode(GroupMergeRuntimeInfo mergeInfo, IReadOnlyList<string> headerSnapshot)
+        {
+            var parentNode = new TreeViewNode
+            {
+                Header = BuildGroupSummaryHeaderText(mergeInfo),
+                StoreName = mergeInfo.MergedStoreName,
+                Strategy = SendStrategy.FileExcel,
+                GroupName = mergeInfo.GroupName,
+                Source = mergeInfo.Source
+            };
+
+            try
+            {
+                string filePath = CreateMergedGroupExcelFile(mergeInfo, headerSnapshot);
+                lock (_dataLock)
+                {
+                    _exportedFilePaths[mergeInfo.MergedStoreName] = filePath;
+                }
+
+                parentNode.Children.Add(new TreeViewNode
+                {
+                    Text = "(汇总文件，单击复制名称，拖拽可导出文件)",
+                    RawData = filePath,
+                    Strategy = SendStrategy.FileExcel,
+                    Source = parentNode.Source,
+                    GroupName = parentNode.GroupName
+                });
+            }
+            catch (Exception ex)
+            {
+                parentNode.Children.Add(new TreeViewNode { Text = $"(文件创建失败: {ex.Message})" });
+            }
+
+            return parentNode;
+        }
+
+        private string CreateMergedGroupExcelFile(GroupMergeRuntimeInfo mergeInfo, IReadOnlyList<string> headerSnapshot)
+        {
+            StorePayloadMode payloadMode = ResolveStorePayloadMode(
+                mergeInfo.Members[0].StoreName,
+                mergeInfo.Members[0].Rows);
+            string safeGroupName = TruncateWithEllipsis(SanitizeFileNamePart(mergeInfo.GroupName, "未命名群聊"), 80);
+            string fileName = $"{safeGroupName}少于{SmallStoreMergeItemLimit}条商家汇总（{mergeInfo.StoreCount}个商家）.xlsx";
+            string filePath = Path.Combine(_exportDirectory, fileName);
+
+            Directory.CreateDirectory(_exportDirectory);
+            if (File.Exists(filePath))
+            {
+                try
+                {
+                    File.Delete(filePath);
+                }
+                catch (IOException ioEx)
+                {
+                    throw new InvalidOperationException($"无法覆盖合并文件，请先关闭 Excel 中打开的文件：{fileName}", ioEx);
+                }
+            }
+
+            using (var package = new ExcelPackage())
+            {
+                string worksheetName = SanitizeWorksheetName(mergeInfo.GroupName, "合并明细");
+                var worksheet = package.Workbook.Worksheets.Add(worksheetName);
+                WriteMergedGroupWorksheet(worksheet, mergeInfo.Members, headerSnapshot, payloadMode);
+                package.SaveAs(new FileInfo(filePath));
+            }
+
+            return filePath;
+        }
+
+        private void LogGroupSummaryDetails(IReadOnlyList<GroupMergeRuntimeInfo> summaryGroups)
+        {
+            if (summaryGroups == null || summaryGroups.Count == 0)
+            {
+                int minCount = GetGroupSummaryMinStoreCount();
+                DebugLogManager.Log(
+                    "同群汇总",
+                    $"本次没有生成汇总文件（需同群少于{SmallStoreMergeItemLimit}条商家多于 {minCount} 个）。");
+                return;
+            }
+
+            int totalStores = summaryGroups.Sum(item => item.StoreCount);
+            int totalRows = summaryGroups.Sum(item => item.RowCount);
+            DebugLogManager.Log(
+                "同群汇总",
+                $"共有 {summaryGroups.Count} 个群名生成汇总文件，合计 {totalStores} 个商家、{totalRows} 条。");
+
+            int index = 1;
+            IEnumerable<GroupMergeRuntimeInfo> orderedGroups = summaryGroups
+                .OrderBy(item => item.GroupName, StringComparer.CurrentCultureIgnoreCase);
+            foreach (GroupMergeRuntimeInfo group in orderedGroups)
+            {
+                string fileName = "未生成";
+                lock (_dataLock)
+                {
+                    if (_exportedFilePaths.TryGetValue(group.MergedStoreName, out string? filePath) &&
+                        !string.IsNullOrWhiteSpace(filePath))
+                    {
+                        fileName = Path.GetFileName(filePath);
+                    }
+                }
+
+                string memberDetails = string.Join(
+                    "、",
+                    group.Members.Select(member => $"{member.StoreName}({member.Rows.Count}条)"));
+                DebugLogManager.Log(
+                    "同群汇总",
+                    $"{index}/{summaryGroups.Count} 群名={group.GroupName} | 来源={group.Source} | 商家数={group.StoreCount} | 条数={group.RowCount} | 文件={fileName} | 商家明细={memberDetails}");
+                index++;
+            }
+        }
+
+        private static void WriteMergedGroupWorksheet(
+            ExcelWorksheet worksheet,
+            IReadOnlyList<GroupMergeStoreSnapshot> stores,
+            IReadOnlyList<string> sourceHeaders,
+            StorePayloadMode payloadMode)
+        {
+            int columnCount;
+            if (payloadMode == StorePayloadMode.Normal)
+            {
+                columnCount = 2;
+            }
+            else if (payloadMode == StorePayloadMode.CustomMessage)
+            {
+                columnCount = 4;
+            }
+            else
+            {
+                int dataColumnCount = stores
+                    .SelectMany(store => store.Rows)
+                    .Select(GetTabColumnCount)
+                    .DefaultIfEmpty(5)
+                    .Max();
+                columnCount = Math.Max(dataColumnCount, sourceHeaders.Count);
+            }
+
+            string[] defaultHeaders = payloadMode switch
+            {
+                StorePayloadMode.Normal => new[] { "运单号", "店铺" },
+                StorePayloadMode.CustomMessage => new[] { "运单号", string.Empty, "店铺", "网点" },
+                _ => new[] { "运单号", "问题件类型", "问题件原因", "店铺", "业务员" }
+            };
+
+            for (int column = 1; column <= columnCount; column++)
+            {
+                string sourceHeader = column <= sourceHeaders.Count ? sourceHeaders[column - 1] : string.Empty;
+                string fallbackHeader = column <= defaultHeaders.Length ? defaultHeaders[column - 1] : $"列{column}";
+                worksheet.Cells[1, column].Value = string.IsNullOrWhiteSpace(sourceHeader) ? fallbackHeader : sourceHeader;
+            }
+
+            using (var headerRange = worksheet.Cells[1, 1, 1, columnCount])
+            {
+                headerRange.Style.Font.Bold = true;
+                headerRange.Style.Fill.PatternType = OfficeOpenXml.Style.ExcelFillStyle.Solid;
+                headerRange.Style.Fill.BackgroundColor.SetColor(System.Drawing.Color.LightGray);
+                headerRange.Style.HorizontalAlignment = OfficeOpenXml.Style.ExcelHorizontalAlignment.Center;
+                headerRange.AutoFilter = true;
+            }
+
+            int outputRow = 2;
+            foreach (GroupMergeStoreSnapshot store in stores)
+            {
+                foreach (string row in store.Rows)
+                {
+                    if (payloadMode == StorePayloadMode.Normal)
+                    {
+                        worksheet.Cells[outputRow, 1].Value = row;
+                        worksheet.Cells[outputRow, 2].Value = store.StoreName;
+                    }
+                    else
+                    {
+                        string[] parts = (row ?? string.Empty).Split('\t');
+                        for (int column = 0; column < Math.Min(parts.Length, columnCount); column++)
+                        {
+                            worksheet.Cells[outputRow, column + 1].Value = parts[column];
+                        }
+                    }
+                    outputRow++;
+                }
+            }
+
+            worksheet.View.FreezePanes(2, 1);
+            for (int column = 1; column <= columnCount; column++)
+            {
+                worksheet.Column(column).AutoFit(12);
+                if (worksheet.Column(column).Width > 45)
+                {
+                    worksheet.Column(column).Width = 45;
+                }
+            }
+        }
+
         #endregion
 
         #region 筛选、删除、TreeView交互
@@ -7334,6 +8089,46 @@ namespace moshushou
                 // 1. 记录删除前的索引，用于恢复焦点
                 // 如果当前没有选中项（极少情况），默认尝试选中第一个(0)
                 int indexToRestore = _currentSelectedIndex >= 0 ? _currentSelectedIndex : 0;
+
+                if (TryGetMergedGroup(storeName, out GroupMergeRuntimeInfo mergeInfo))
+                {
+                    _suppressedGroupSummaries.Add(mergeInfo.GroupName);
+                    lock (_dataLock)
+                    {
+                        _exportedFilePaths.Remove(storeName);
+                    }
+                    _failedStores.Remove(storeName);
+                    _manualReviewStores.Remove(storeName);
+                    lock (_segmentFailureLock)
+                    {
+                        _segmentFailureInfos.Remove(storeName);
+                    }
+                    lock (_sentStoreLock)
+                    {
+                        _sentStores.Remove(storeName);
+                    }
+
+                    SaveFileState();
+                    ProcessAndDisplayData();
+                    Application.Current.Dispatcher.InvokeAsync(() =>
+                    {
+                        if (_flatNodeList.Count > 0)
+                        {
+                            if (indexToRestore >= _flatNodeList.Count)
+                            {
+                                indexToRestore = _flatNodeList.Count - 1;
+                            }
+
+                            if (indexToRestore < 0) indexToRestore = 0;
+                            var nodeToSelect = _flatNodeList[indexToRestore];
+                            FocusAndSelectItem(nodeToSelect);
+                            _currentSelectedNode = nodeToSelect;
+                        }
+                    }, System.Windows.Threading.DispatcherPriority.Loaded);
+
+                    StatusTextBlock.Text = $"已移除群聊“{mergeInfo.GroupName}”的汇总文件项";
+                    return;
+                }
 
                 lock (_dataLock)
                 {
@@ -7797,12 +8592,9 @@ namespace moshushou
                         targetNode.Source = source;
 
                         var trackingCount = 0;
-                        lock (_dataLock)
+                        if (TryGetStoreRowsSnapshot(storeName, out var rows))
                         {
-                            if (_storeData.ContainsKey(storeName))
-                            {
-                                trackingCount = _storeData[storeName].Count;
-                            }
+                            trackingCount = rows.Count;
                         }
 
                         string displayStoreName = storeName;
@@ -7845,6 +8637,14 @@ namespace moshushou
 
             string groupName = sourceNode.GroupName?.Trim() ?? string.Empty;
             bool hasGroupName = !string.IsNullOrWhiteSpace(groupName);
+
+            // 汇总文件项始终按群名搜索/发送，确保微信和企业微信都能进到对应群。
+            if (TryGetMergedGroup(sourceNode.StoreName, out _) && hasGroupName)
+            {
+                copyText = groupName;
+                copyType = "群名";
+                return true;
+            }
 
             if (!_isStoreMode && hasGroupName)
             {
@@ -7900,11 +8700,9 @@ namespace moshushou
                 {
                     if (_isAutoRunning || Volatile.Read(ref _clipboardSearchGuard) > 0) return;
 
-                    List<string> trackingNumbers;
-                    lock (_dataLock)
+                    if (!TryGetStoreRowsSnapshot(storeName, out List<string> trackingNumbers))
                     {
-                        if (!_storeData.TryGetValue(storeName, out trackingNumbers)) throw new Exception("未找到商家数据");
-                        trackingNumbers = trackingNumbers.ToList();
+                        throw new Exception("未找到商家数据");
                     }
 
                     var payloadMode = ResolveStorePayloadMode(storeName, trackingNumbers);
@@ -8479,6 +9277,12 @@ namespace moshushou
             }
 
             string storeName = _currentSelectedNode.StoreName; // 节点键（可能为 "商家名##话术"）
+            if (TryGetMergedGroup(storeName, out _))
+            {
+                StatusTextBlock.Text = "⚠️ 这是同群汇总文件项，请到商家信息窗口编辑原始商家。";
+                return;
+            }
+
             string businessStoreName = NormalizeStoreNameForBusinessInfo(storeName);
             if (string.IsNullOrWhiteSpace(businessStoreName))
             {

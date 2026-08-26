@@ -162,6 +162,26 @@ namespace moshushou
         /// </summary>
         public bool EnableFailedOcrDebugCapture { get; set; } = false;
 
+        /// <summary>
+        /// 兼容旧配置。新逻辑改用 EnableGroupSmallStoreSummary。
+        /// </summary>
+        public bool EnableAutoMergeSmallStoresByGroup { get; set; } = false;
+
+        /// <summary>
+        /// 兼容旧配置。新逻辑不再按指定群名合并列表项。
+        /// </summary>
+        public string AutoMergeGroupName { get; set; } = "";
+
+        /// <summary>
+        /// 加载 Excel 后，是否在同群少量商家下方自动追加汇总文件项。默认启用。
+        /// </summary>
+        public bool EnableGroupSmallStoreSummary { get; set; } = true;
+
+        /// <summary>
+        /// 同一群名下、单个商家少于 100 条的商家多于该数量时，追加汇总文件。默认 5（即 6 个及以上）。
+        /// </summary>
+        public int GroupSummaryMinStoreCount { get; set; } = 5;
+
         // ... Load 和 Save 方法保持不变 ...
         private static readonly string ConfigPath = Path.Combine(
             AppDomain.CurrentDomain.BaseDirectory, "search_config.json");
@@ -176,6 +196,44 @@ namespace moshushou
                     if (loadedConfig != null)
                     {
                         bool changed = false;
+
+                        string normalizedAutoMergeGroupName = loadedConfig.AutoMergeGroupName?.Trim() ?? string.Empty;
+                        if (!string.Equals(loadedConfig.AutoMergeGroupName, normalizedAutoMergeGroupName, StringComparison.Ordinal))
+                        {
+                            loadedConfig.AutoMergeGroupName = normalizedAutoMergeGroupName;
+                            changed = true;
+                        }
+
+                        bool summaryEnabledSpecified = false;
+                        try
+                        {
+                            using JsonDocument doc = JsonDocument.Parse(json);
+                            if (doc.RootElement.ValueKind == JsonValueKind.Object)
+                            {
+                                summaryEnabledSpecified = doc.RootElement.TryGetProperty("EnableGroupSmallStoreSummary", out _);
+                            }
+                        }
+                        catch
+                        {
+                            summaryEnabledSpecified = false;
+                        }
+
+                        if (!summaryEnabledSpecified)
+                        {
+                            loadedConfig.EnableGroupSmallStoreSummary = true;
+                            changed = true;
+                        }
+
+                        if (loadedConfig.GroupSummaryMinStoreCount < 1)
+                        {
+                            loadedConfig.GroupSummaryMinStoreCount = 5;
+                            changed = true;
+                        }
+                        else if (loadedConfig.GroupSummaryMinStoreCount > 200)
+                        {
+                            loadedConfig.GroupSummaryMinStoreCount = 200;
+                            changed = true;
+                        }
 
                         // 企业微信文本限制：分段条数上限统一收敛为 30
                         if (loadedConfig.SegmentSize <= 0 || loadedConfig.SegmentSize > 30)

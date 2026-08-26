@@ -112,6 +112,40 @@
                                 <DropShadowEffect ShadowDepth="1" BlurRadius="6" Opacity="0.06"/>
                             </Border.Effect>
                             <StackPanel>
+                                <TextBlock Text="📎  同群少量商家汇总文件" Style="{StaticResource SectionHeader}" Margin="0,0,0,8"/>
+                                <CheckBox x:Name="EnableGroupMergeCheckBox"
+                                          Content="加载 Excel 后自动在符合条件的群下方追加汇总文件"
+                                          Margin="0,0,0,8"/>
+                                <TextBlock Text="同群少于 100 条的商家多于几个时生成汇总"
+                                           Style="{StaticResource FieldLabel}"
+                                           Margin="0,0,0,6"/>
+                                <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                                    <TextBlock Text="多于" VerticalAlignment="Center" Style="{StaticResource FieldLabel}" Margin="0,0,6,0"/>
+                                    <TextBox x:Name="GroupSummaryMinCountTextBox"
+                                             Width="56"
+                                             Style="{StaticResource FieldBox}"/>
+                                    <TextBlock Text="个商家（默认 5，可保存）"
+                                               VerticalAlignment="Center"
+                                               Style="{StaticResource FieldLabel}"
+                                               Margin="6,0,0,0"/>
+                                </StackPanel>
+                                <TextBlock Text="商家仍各自独立显示。当同一群名下少于 100 条的商家超过上述数量时，只在该群列表下方追加一个汇总文件项（可按文件发送，含企业微信）。达到 100 条的商家不进入汇总。"
+                                           Style="{StaticResource HintText}"
+                                           Margin="0,0,0,10"/>
+                                <Button x:Name="SaveGroupMergeSettingsButton"
+                                        Content="保存并立即生成汇总"
+                                        Style="{StaticResource PrimaryBtn}"
+                                        HorizontalAlignment="Left"
+                                        Click="SaveGroupMergeSettingsButton_Click"/>
+                            </StackPanel>
+                        </Border>
+
+                        <Border Background="White" BorderBrush="#E2E8F0" BorderThickness="1"
+                                CornerRadius="8" Padding="14,12" Margin="0,0,0,10">
+                            <Border.Effect>
+                                <DropShadowEffect ShadowDepth="1" BlurRadius="6" Opacity="0.06"/>
+                            </Border.Effect>
+                            <StackPanel>
                                 <TextBlock Text="⌨  快捷键与发送" Style="{StaticResource SectionHeader}" Margin="0,0,0,10"/>
                                 <CheckBox x:Name="SkipNextOnCtrlSpaceCheckBox"
                                           Content="Ctrl+空格 粘贴后不自动跳下一项"

@@ -19,6 +19,13 @@ namespace moshushou
 {
     public class ScreenshotHelper : IDisposable
     {
+        public enum ChatWindowLayoutStatus
+        {
+            Valid,
+            Invalid,
+            Unavailable
+        }
+
         #region Win32 API Imports
         [DllImport("user32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
@@ -29,6 +36,21 @@ namespace moshushou
 
         [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
         private static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetForegroundWindow();
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool IsWindow(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool IsWindowVisible(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool IsIconic(IntPtr hWnd);
 
         [StructLayout(LayoutKind.Sequential)]
         public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
@@ -627,26 +649,59 @@ namespace moshushou
         /// 4. 顺序必须是：GroupName (上) -> ChatInfo (中) -> ChatBox (下)
         /// 5. 失败则认为窗口异常 (退出登录/遮挡/界面错乱)
         /// </summary>
-        public async Task<bool> VerifyChatWindowLayoutAsync(IntPtr hwnd, bool isWework)
+        public async Task<ChatWindowLayoutStatus> VerifyChatWindowLayoutAsync(IntPtr hwnd, bool isWework)
         {
-            if (_yoloDetector == null) return true; // 没有 YOLO 只能盲信
-            if (hwnd == IntPtr.Zero) return false;
+            if (_yoloDetector == null) return ChatWindowLayoutStatus.Valid;
+            if (hwnd == IntPtr.Zero) return ChatWindowLayoutStatus.Unavailable;
 
             string appName = isWework ? "企业微信" : "微信";
-            int maxRetries = 3;
-            for (int i = 0; i < maxRetries; i++)
+            const int maxAttempts = 6;
+            const int requiredInvalidCaptures = 3;
+            int invalidCaptureCount = 0;
+
+            for (int i = 0; i < maxAttempts; i++)
             {
                 try
                 {
                     LogLayoutDebug(
-                        $"🔎 [布局验证] 开始第{i + 1}/{maxRetries}次: App={appName}, Hwnd={hwnd}, " +
+                        $"🔎 [布局验证] 开始第{i + 1}/{maxAttempts}次: App={appName}, Hwnd={hwnd}, " +
                         $"ConfTh={LAYOUT_YOLO_CONF_THRESHOLD:F2}, IouTh={LAYOUT_YOLO_IOU_THRESHOLD:F2}");
 
-                    if (!GetWindowRect(hwnd, out RECT rect)) return false;
+                    if (!IsWindow(hwnd) || !IsWindowVisible(hwnd) || IsIconic(hwnd))
+                    {
+                        invalidCaptureCount = 0;
+                        LogLayoutDebug($"⏳ [布局验证] 目标窗口当前不可截图，等待窗口恢复: Hwnd={hwnd}");
+                        if (i < maxAttempts - 1) await Task.Delay(350);
+                        continue;
+                    }
+
+                    IntPtr foregroundHwnd = GetForegroundWindow();
+                    if (foregroundHwnd != hwnd)
+                    {
+                        invalidCaptureCount = 0;
+                        LogLayoutDebug($"⏳ [布局验证] 目标窗口尚未置前，跳过本次截图: Target={hwnd}, Foreground={foregroundHwnd}");
+                        if (i < maxAttempts - 1) await Task.Delay(350);
+                        continue;
+                    }
+
+                    if (!GetWindowRect(hwnd, out RECT rect))
+                    {
+                        invalidCaptureCount = 0;
+                        LogLayoutDebug($"⏳ [布局验证] 暂时无法获取窗口尺寸: Hwnd={hwnd}");
+                        if (i < maxAttempts - 1) await Task.Delay(350);
+                        continue;
+                    }
+
                     int w = rect.Right - rect.Left;
                     int h = rect.Bottom - rect.Top;
-                    
-                    if (w <= 0 || h <= 0) return false;
+                    if (w <= 0 || h <= 0)
+                    {
+                        invalidCaptureCount = 0;
+                        LogLayoutDebug($"⏳ [布局验证] 窗口尺寸尚未稳定: {w}x{h}");
+                        if (i < maxAttempts - 1) await Task.Delay(350);
+                        continue;
+                    }
+
                     LogLayoutDebug($"📐 [布局验证] 第{i + 1}次窗口尺寸: {w}x{h}, Rect=({rect.Left},{rect.Top},{rect.Right},{rect.Bottom})");
 
                     using (var bitmap = new Bitmap(w, h, PixelFormat.Format32bppArgb))
@@ -657,11 +712,7 @@ namespace moshushou
                         }
 
                         var results = _yoloDetector.Detect(bitmap, LAYOUT_YOLO_CONF_THRESHOLD, LAYOUT_YOLO_IOU_THRESHOLD);
-                        
-                        string debugPrefix = $"LayoutVerify_{(isWework ? "WeWork" : "WeChat")}_R{i + 1}";
-                        // [已禁用] Debug_Yolo 调试图保存
-                        // string layoutRawPath = SaveDebugRawImage(bitmap, debugPrefix);
-                        // string layoutAnnPath = SaveDebugAnnotatedImage(bitmap, results, debugPrefix);
+
                         string layoutSummary = BuildDetectionSummary(results, 12);
                         string labelStats = BuildLayoutLabelStats(results);
                         LogLayoutDebug($"🧾 [布局验证] 第{i + 1}次YOLO结果: {layoutSummary}");
@@ -669,69 +720,62 @@ namespace moshushou
                         LogLayoutDebug($"📌 [布局验证] GroupTop={BuildTopCandidatesText(results, YoloWindowDetector.Label_GroupName)}");
                         LogLayoutDebug($"📌 [布局验证] InfoTop={BuildTopCandidatesText(results, YoloWindowDetector.Label_ChatInfo)}");
                         LogLayoutDebug($"📌 [布局验证] BoxTop={BuildTopCandidatesText(results, YoloWindowDetector.Label_ChatBox)}");
-                        // [已禁用] Debug_Yolo 调试图日志
-                        // if (!string.IsNullOrEmpty(layoutRawPath) || !string.IsNullOrEmpty(layoutAnnPath))
-                        // {
-                        //     LogLayoutDebug($"🖼️ [布局验证] 第{i + 1}次调试图: Raw={layoutRawPath}, Ann={layoutAnnPath}");
-                        // }
 
-                        // 获取置信度最高的组件
                         var groupName = results.Where(r => r.LabelName == YoloWindowDetector.Label_GroupName).OrderByDescending(r => r.Confidence).FirstOrDefault();
                         var chatInfo = results.Where(r => r.LabelName == YoloWindowDetector.Label_ChatInfo).OrderByDescending(r => r.Confidence).FirstOrDefault();
                         var chatBox = results.Where(r => r.LabelName == YoloWindowDetector.Label_ChatBox).OrderByDescending(r => r.Confidence).FirstOrDefault();
 
-                        // [已禁用] Debug_Yolo 布局数据保存
-                        // string layoutDataPath = SaveLayoutDebugDataFile(appName, hwnd, rect, i + 1, maxRetries, results, groupName, chatInfo, chatBox);
-                        // if (!string.IsNullOrEmpty(layoutDataPath))
-                        // {
-                        //     LogLayoutDebug($"📝 [布局验证] 第{i + 1}次布局数据: {layoutDataPath}");
-                        // }
-
-                        // 规则1: 核心组件必须存在
                         if (groupName == null || chatInfo == null || chatBox == null)
                         {
+                            invalidCaptureCount++;
                             string groupInfo = groupName != null ? $"{groupName.Confidence:F2}@{BuildBboxText(groupName.BBox)}" : "null";
                             string chatInfoText = chatInfo != null ? $"{chatInfo.Confidence:F2}@{BuildBboxText(chatInfo.BBox)}" : "null";
                             string boxInfo = chatBox != null ? $"{chatBox.Confidence:F2}@{BuildBboxText(chatBox.BBox)}" : "null";
-                            LogLayoutDebug($"❌ [布局验证] 核心组件缺失 (第{i+1}次): Group={groupInfo}, Info={chatInfoText}, Box={boxInfo}");
-                             if (i < maxRetries - 1) 
-                             {
-                                 await Task.Delay(500);
-                                 continue;
-                             }
-                             return false;
-                        }
-
-                        // 规则2: Y轴顺序检查 (上 -> 下)
-                        // GroupName.Y < ChatInfo.Y < ChatBox.Y
-                        int groupY = groupName.BBox.Y + groupName.BBox.Height / 2;
-                        int infoY = chatInfo.BBox.Y + chatInfo.BBox.Height / 2;
-                        int boxY = chatBox.BBox.Y + chatBox.BBox.Height / 2;
-
-                        if (groupY < infoY && infoY < boxY)
-                        {
-                            LogLayoutDebug($"✅ [布局验证] 窗口布局正常 (Group -> Info -> Box), Y轴中心: Group={groupY}, Info={infoY}, Box={boxY}");
-                            return true;
+                            LogLayoutDebug(
+                                $"❌ [布局验证] 核心组件缺失 (有效异常截图 {invalidCaptureCount}/{requiredInvalidCaptures}): " +
+                                $"Group={groupInfo}, Info={chatInfoText}, Box={boxInfo}");
                         }
                         else
                         {
-                            LogLayoutDebug($"❌ [布局验证] 组件顺序错误: GroupY={groupY}, InfoY={infoY}, BoxY={boxY}");
-                            if (i < maxRetries - 1) 
-                            { 
-                                await Task.Delay(500); 
-                                continue; 
+                            int groupY = groupName.BBox.Y + groupName.BBox.Height / 2;
+                            int infoY = chatInfo.BBox.Y + chatInfo.BBox.Height / 2;
+                            int boxY = chatBox.BBox.Y + chatBox.BBox.Height / 2;
+
+                            if (groupY < infoY && infoY < boxY)
+                            {
+                                LogLayoutDebug($"✅ [布局验证] 窗口布局正常 (Group -> Info -> Box), Y轴中心: Group={groupY}, Info={infoY}, Box={boxY}");
+                                return ChatWindowLayoutStatus.Valid;
                             }
-                            return false;
+
+                            invalidCaptureCount++;
+                            LogLayoutDebug(
+                                $"❌ [布局验证] 组件顺序错误 (有效异常截图 {invalidCaptureCount}/{requiredInvalidCaptures}): " +
+                                $"GroupY={groupY}, InfoY={infoY}, BoxY={boxY}");
+                        }
+
+                        if (invalidCaptureCount >= requiredInvalidCaptures)
+                        {
+                            LogLayoutDebug($"🛑 [布局验证] 已连续取得 {invalidCaptureCount} 张有效异常截图，确认布局异常。");
+                            return ChatWindowLayoutStatus.Invalid;
                         }
                     }
                 }
                 catch (Exception ex)
                 {
-                    LogLayoutDebug($"💥 [布局验证] 发生异常: {ex.Message}");
-                    return false;
+                    invalidCaptureCount = 0;
+                    LogLayoutDebug($"💥 [布局验证] 第{i + 1}次截图或识别异常: {ex.Message}");
+                }
+
+                if (i < maxAttempts - 1)
+                {
+                    await Task.Delay(500);
                 }
             }
-            return false;
+
+            LogLayoutDebug(
+                $"⏳ [布局验证] 未取得足够的稳定异常截图，按瞬态不可用处理: " +
+                $"InvalidCaptures={invalidCaptureCount}/{requiredInvalidCaptures}");
+            return ChatWindowLayoutStatus.Unavailable;
         }
 
 
